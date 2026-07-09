@@ -48,6 +48,7 @@ androidrun --publish
 
 Then open the release URL, download `AgentRemote-v…-release.apk` on the phone, and install (sideload; signed with the Android debug keystore).
 
+Only the **newest 3** releases are kept; older ones (and their tags) are deleted automatically (`ANDROIDRUN_RELEASE_KEEP=3`, set `0` to keep all).
 ### Configure
 
 1. Settings → set **LAN** and **Tailnet** base URLs (`ws://host:2419`), secret, host cwd.
