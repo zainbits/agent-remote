@@ -284,8 +284,13 @@ class GrokAcpClient : AgentBackend {
             "tool_call" -> {
                 events.emit(
                     AgentEvent.ToolCall(
-                        title = update.optString("title").ifBlank { update.optString("kind", "tool") },
-                        status = update.optString("status").ifBlank { null },
+                        toolCallId = update.optString("toolCallId").ifBlank { null },
+                        title = update.optString("title").ifBlank {
+                            update.optString("kind", "tool")
+                        },
+                        status = update.optString("status").ifBlank { "pending" },
+                        kind = toolKind(update),
+                        detail = toolDetail(update),
                     ),
                 )
             }
@@ -293,8 +298,11 @@ class GrokAcpClient : AgentBackend {
             "tool_call_update" -> {
                 events.emit(
                     AgentEvent.ToolUpdate(
+                        toolCallId = update.optString("toolCallId").ifBlank { null },
                         title = update.optString("title").ifBlank { null },
                         status = update.optString("status").ifBlank { null },
+                        kind = toolKind(update),
+                        detail = toolDetail(update),
                     ),
                 )
             }
@@ -314,6 +322,107 @@ class GrokAcpClient : AgentBackend {
                 }
             }
         }
+    }
+
+    private fun toolKind(update: JSONObject): String? {
+        val metaTool = update.optJSONObject("_meta")?.optJSONObject("x.ai/tool")
+        val kind = metaTool?.optString("name")
+            ?.ifBlank { null }
+            ?: metaTool?.optString("kind")?.ifBlank { null }
+            ?: update.optString("kind").ifBlank { null }
+        return kind
+    }
+
+    /**
+     * Compact expandable body: input path/command + truncated output.
+     */
+    private fun toolDetail(update: JSONObject): String? {
+        val parts = mutableListOf<String>()
+
+        val rawInput = update.optJSONObject("rawInput")
+        if (rawInput != null) {
+            val inputLine = summarizeJsonObject(rawInput, maxLen = 400)
+            if (inputLine.isNotBlank()) parts += "in: $inputLine"
+        }
+
+        val locations = update.optJSONArray("locations")
+        if (locations != null && locations.length() > 0) {
+            val paths = buildString {
+                for (i in 0 until minOf(locations.length(), 4)) {
+                    val loc = locations.optJSONObject(i) ?: continue
+                    val path = loc.optString("path")
+                    if (path.isNotBlank()) {
+                        if (isNotEmpty()) append('\n')
+                        append(path)
+                    }
+                }
+            }
+            if (paths.isNotBlank() && parts.none { it.contains(paths.take(40)) }) {
+                parts += "path: $paths"
+            }
+        }
+
+        val rawOutput = update.opt("rawOutput")
+        when (rawOutput) {
+            is JSONObject -> {
+                val out = extractOutputText(rawOutput)
+                if (out.isNotBlank()) parts += "out:\n${out.take(1200)}"
+            }
+            is String -> if (rawOutput.isNotBlank()) parts += "out:\n${rawOutput.take(1200)}"
+        }
+
+        val content = update.opt("content")
+        if (content is JSONArray) {
+            val texts = buildString {
+                for (i in 0 until content.length()) {
+                    val c = content.optJSONObject(i) ?: continue
+                    val t = c.optString("text").ifBlank {
+                        c.optJSONObject("content")?.optString("text").orEmpty()
+                    }
+                    if (t.isNotBlank()) {
+                        if (isNotEmpty()) append('\n')
+                        append(t)
+                    }
+                }
+            }
+            if (texts.isNotBlank()) parts += texts.take(1200)
+        }
+
+        return parts.joinToString("\n").ifBlank { null }
+    }
+
+    private fun extractOutputText(obj: JSONObject): String {
+        // Nested shapes from Grok tools (ListDir, Read, shell, etc.)
+        obj.optJSONObject("Content")?.optString("content")?.takeIf { it.isNotBlank() }?.let {
+            return it
+        }
+        obj.optString("content").takeIf { it.isNotBlank() }?.let { return it }
+        obj.optString("stdout").takeIf { it.isNotBlank() }?.let { return it }
+        obj.optString("text").takeIf { it.isNotBlank() }?.let { return it }
+        return summarizeJsonObject(obj, maxLen = 800)
+    }
+
+    private fun summarizeJsonObject(obj: JSONObject, maxLen: Int): String {
+        // Prefer common path-like fields
+        val preferred = listOf(
+            "target_file", "target_directory", "path", "command",
+            "query", "pattern", "url", "file_path", "directory",
+        )
+        for (key in preferred) {
+            val v = obj.optString(key)
+            if (v.isNotBlank()) return v.take(maxLen)
+        }
+        val keys = obj.keys().asSequence().toList()
+        val compact = keys.take(6).joinToString(", ") { k ->
+            val v = obj.opt(k)
+            val vs = when (v) {
+                is JSONObject, is JSONArray -> "…"
+                null, JSONObject.NULL -> "null"
+                else -> v.toString().take(80)
+            }
+            "$k=$vs"
+        }
+        return compact.take(maxLen)
     }
 
     /**

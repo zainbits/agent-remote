@@ -8,11 +8,21 @@ enum class ChatRole {
     SYSTEM,
 }
 
+/**
+ * One renderable chat block. Tools are keyed by [toolCallId] so updates merge
+ * instead of flooding the timeline.
+ */
 data class ChatMessage(
     val id: String,
     val role: ChatRole,
     val text: String,
     val streaming: Boolean = false,
+    /** ACP toolCallId when [role] is TOOL. */
+    val toolCallId: String? = null,
+    val toolStatus: String? = null,
+    val toolKind: String? = null,
+    /** Expanded body: input path, output snippet, etc. */
+    val detail: String? = null,
 )
 
 data class SessionSummary(
@@ -40,8 +50,20 @@ sealed class AgentEvent {
     data class UserDelta(val text: String) : AgentEvent()
     data class AssistantDelta(val text: String) : AgentEvent()
     data class ThoughtDelta(val text: String) : AgentEvent()
-    data class ToolCall(val title: String, val status: String?) : AgentEvent()
-    data class ToolUpdate(val title: String?, val status: String?) : AgentEvent()
+    data class ToolCall(
+        val toolCallId: String?,
+        val title: String,
+        val status: String?,
+        val kind: String? = null,
+        val detail: String? = null,
+    ) : AgentEvent()
+    data class ToolUpdate(
+        val toolCallId: String?,
+        val title: String?,
+        val status: String?,
+        val kind: String? = null,
+        val detail: String? = null,
+    ) : AgentEvent()
     data class TurnComplete(val stopReason: String?) : AgentEvent()
     data class Error(val message: String) : AgentEvent()
 }

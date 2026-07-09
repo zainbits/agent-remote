@@ -326,21 +326,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             is AgentEvent.UserDelta -> appendStreaming(ChatRole.USER, event.text)
             is AgentEvent.AssistantDelta -> appendStreaming(ChatRole.ASSISTANT, event.text)
             is AgentEvent.ThoughtDelta -> appendStreaming(ChatRole.THOUGHT, event.text)
-            is AgentEvent.ToolCall -> {
-                appendStatic(
-                    ChatRole.TOOL,
-                    "⚙ ${event.title}" + (event.status?.let { " · $it" } ?: ""),
-                )
-            }
-
-            is AgentEvent.ToolUpdate -> {
-                if (event.status != null || event.title != null) {
-                    appendStatic(
-                        ChatRole.TOOL,
-                        "⚙ ${event.title ?: "tool"}" + (event.status?.let { " · $it" } ?: ""),
-                    )
-                }
-            }
+            is AgentEvent.ToolCall -> upsertTool(
+                toolCallId = event.toolCallId,
+                title = event.title,
+                status = event.status,
+                kind = event.kind,
+                detail = event.detail,
+            )
+            is AgentEvent.ToolUpdate -> upsertTool(
+                toolCallId = event.toolCallId,
+                title = event.title,
+                status = event.status,
+                kind = event.kind,
+                detail = event.detail,
+            )
 
             is AgentEvent.TurnComplete -> {
                 finalizeStreaming()
@@ -412,7 +411,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendStatic(role: ChatRole, text: String) {
-        // When a new role block starts mid-stream, seal previous streaming blobs of other roles.
         _ui.update {
             it.copy(
                 messages = it.messages + ChatMessage(
@@ -421,6 +419,58 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     text = text,
                 ),
             )
+        }
+    }
+
+    /**
+     * Merge tool_call / tool_call_update by ACP toolCallId so the timeline
+     * shows one collapsible row per tool instead of hundreds of status pings.
+     */
+    private fun upsertTool(
+        toolCallId: String?,
+        title: String?,
+        status: String?,
+        kind: String?,
+        detail: String?,
+    ) {
+        val id = toolCallId?.takeIf { it.isNotBlank() }
+        _ui.update { state ->
+            val existingIndex = if (id != null) {
+                state.messages.indexOfLast { it.role == ChatRole.TOOL && it.toolCallId == id }
+            } else {
+                -1
+            }
+            if (existingIndex >= 0) {
+                val prev = state.messages[existingIndex]
+                val merged = prev.copy(
+                    text = title?.takeIf { it.isNotBlank() } ?: prev.text,
+                    toolStatus = status?.takeIf { it.isNotBlank() } ?: prev.toolStatus,
+                    toolKind = kind?.takeIf { it.isNotBlank() } ?: prev.toolKind,
+                    detail = when {
+                        detail.isNullOrBlank() -> prev.detail
+                        prev.detail.isNullOrBlank() -> detail
+                        detail.length >= prev.detail.length -> detail
+                        else -> prev.detail
+                    },
+                    streaming = status == "in_progress" || status == "pending",
+                )
+                state.copy(
+                    messages = state.messages.toMutableList().also { it[existingIndex] = merged },
+                )
+            } else {
+                state.copy(
+                    messages = state.messages + ChatMessage(
+                        id = id ?: UUID.randomUUID().toString(),
+                        role = ChatRole.TOOL,
+                        text = title?.ifBlank { kind ?: "tool" } ?: (kind ?: "tool"),
+                        toolCallId = id,
+                        toolStatus = status,
+                        toolKind = kind,
+                        detail = detail,
+                        streaming = status == "in_progress" || status == "pending",
+                    ),
+                )
+            }
         }
     }
 
