@@ -37,11 +37,23 @@ Sessions on disk live under `~/.grok/sessions/<encoded-cwd>/<session-id>/`.
 
 ## Phone
 
-1. Install AgentRemote.
-2. Settings → set **LAN** and **Tailnet** base URLs (`ws://host:2419`), secret, host cwd.
-3. Switch LAN / Tailnet with the chips.
-4. Home lists prior sessions for that cwd (needs `grokserve` so the session API is up).
-5. Tap a session to resume (`session/load` + history replay), or **+** for a new chat.
+### Install from GitHub release
+
+On the build machine (no phone required):
+
+```zsh
+cd ~/AndroidStudioProjects/AgentRemote
+androidrun --publish
+```
+
+Then open the release URL, download `AgentRemote-v…-release.apk` on the phone, and install (sideload; signed with the Android debug keystore).
+
+### Configure
+
+1. Settings → set **LAN** and **Tailnet** base URLs (`ws://host:2419`), secret, host cwd.
+2. Switch LAN / Tailnet with the chips.
+3. Home lists prior sessions for that cwd (needs `grokserve` so the session API is up).
+4. Tap a session to resume (`session/load` + history replay), or **+** for a new chat.
 
 Permissions for tools are approved on the **host** (`--always-approve`), not in the app.
 
