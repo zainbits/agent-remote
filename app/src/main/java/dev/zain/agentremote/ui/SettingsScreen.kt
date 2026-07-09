@@ -140,8 +140,13 @@ fun SettingsScreen(
                 value = workingDirectory,
                 onValueChange = { workingDirectory = it },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Host working directory") },
-                supportingText = { Text("cwd on the Linux host for Grok sessions") },
+                label = { Text("Host project directory (cwd)") },
+                supportingText = {
+                    Text(
+                        "Absolute path on the Linux host. Default is host \$HOME " +
+                            "(/home/user). Sessions and tools use this directory.",
+                    )
+                },
                 singleLine = true,
             )
 

@@ -53,7 +53,7 @@ class GrokAcpClient : AgentBackend {
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<JSONObject>>()
 
     private val events = MutableSharedFlow<AgentEvent>(
-        extraBufferCapacity = 128,
+        extraBufferCapacity = 256,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
@@ -61,8 +61,45 @@ class GrokAcpClient : AgentBackend {
 
     override fun isConnected(): Boolean = connected.get() && sessionId != null
 
-    override suspend fun connect(baseUrl: String, secret: String, workingDirectory: String) {
-        disconnect()
+    override suspend fun connectNew(baseUrl: String, secret: String, workingDirectory: String) {
+        openAndInitialize(baseUrl, secret, workingDirectory)
+        val newSession = requestRpc(
+            method = "session/new",
+            params = JSONObject()
+                .put("cwd", this.workingDirectory)
+                .put("mcpServers", JSONArray()),
+        )
+        val sid = newSession.optString("sessionId").ifBlank {
+            error("session/new returned no sessionId")
+        }
+        finishConnected(sid)
+    }
+
+    override suspend fun connectLoad(
+        baseUrl: String,
+        secret: String,
+        workingDirectory: String,
+        sessionId: String,
+    ) {
+        openAndInitialize(baseUrl, secret, workingDirectory)
+        requestRpc(
+            method = "session/load",
+            params = JSONObject()
+                .put("sessionId", sessionId)
+                .put("cwd", this.workingDirectory)
+                .put("mcpServers", JSONArray()),
+        )
+        // session/load may put sessionId in result._meta or use the requested id
+        finishConnected(sessionId)
+        events.emit(AgentEvent.TurnComplete(stopReason = "loaded"))
+    }
+
+    private suspend fun openAndInitialize(
+        baseUrl: String,
+        secret: String,
+        workingDirectory: String,
+    ) {
+        disconnectQuiet()
         this.workingDirectory = workingDirectory.ifBlank { "/home/user" }
 
         val url = buildWebSocketUrl(baseUrl, secret)
@@ -110,7 +147,7 @@ class GrokAcpClient : AgentBackend {
         try {
             withTimeout(20_000) { opened.await() }
 
-            requestRpc(
+            val initResult = requestRpc(
                 method = "initialize",
                 params = JSONObject()
                     .put("protocolVersion", 1)
@@ -129,20 +166,20 @@ class GrokAcpClient : AgentBackend {
                     ),
             )
 
-            val newSession = requestRpc(
-                method = "session/new",
-                params = JSONObject()
-                    .put("cwd", this.workingDirectory)
-                    .put("mcpServers", JSONArray()),
-            )
-            val sid = newSession.optString("sessionId").ifBlank {
-                error("session/new returned no sessionId")
+            // Prefer host-reported cwd when settings left blank-ish, but keep client cwd for session.
+            val meta = initResult.optJSONObject("_meta")
+            val hostCwd = meta?.optString("currentWorkingDirectory").orEmpty()
+            if (this.workingDirectory.isBlank() && hostCwd.isNotBlank()) {
+                this.workingDirectory = hostCwd
             }
-            sessionId = sid
-            connected.set(true)
-            events.emit(AgentEvent.ConnectionChanged(ConnectionState.Connected(sid)))
+
+            val caps = initResult.optJSONObject("agentCapabilities")
+            // loadSession is checked by callers of connectLoad; new always works.
+            if (caps != null && !caps.optBoolean("loadSession", true)) {
+                // still allow new sessions
+            }
         } catch (t: Throwable) {
-            disconnect()
+            disconnectQuiet()
             events.emit(
                 AgentEvent.ConnectionChanged(
                     ConnectionState.Error(t.message ?: "Failed to connect"),
@@ -152,13 +189,27 @@ class GrokAcpClient : AgentBackend {
         }
     }
 
+    private suspend fun finishConnected(sid: String) {
+        sessionId = sid
+        connected.set(true)
+        events.emit(
+            AgentEvent.ConnectionChanged(
+                ConnectionState.Connected(sessionId = sid, cwd = workingDirectory),
+            ),
+        )
+    }
+
     override suspend fun disconnect() {
+        disconnectQuiet()
+        events.emit(AgentEvent.ConnectionChanged(ConnectionState.Disconnected))
+    }
+
+    private fun disconnectQuiet() {
         connected.set(false)
         sessionId = null
         failAllPending(IllegalStateException("Disconnected"))
         socket?.close(1000, "client disconnect")
         socket = null
-        events.emit(AgentEvent.ConnectionChanged(ConnectionState.Disconnected))
     }
 
     override suspend fun sendPrompt(text: String) {
@@ -202,7 +253,6 @@ class GrokAcpClient : AgentBackend {
                     "session/update" -> handleSessionUpdate(msg.optJSONObject("params"))
                     "session/request_permission" -> autoApprovePermission(msg)
                     else -> {
-                        // Ignore unknown notifications; respond to requests with empty result if needed.
                         if (msg.has("id")) {
                             respond(msg.getLong("id"), JSONObject())
                         }
@@ -216,6 +266,11 @@ class GrokAcpClient : AgentBackend {
         if (params == null) return
         val update = params.optJSONObject("update") ?: return
         when (update.optString("sessionUpdate")) {
+            "user_message_chunk" -> {
+                val text = update.optJSONObject("content")?.optString("text").orEmpty()
+                if (text.isNotEmpty()) events.emit(AgentEvent.UserDelta(text))
+            }
+
             "agent_message_chunk" -> {
                 val text = update.optJSONObject("content")?.optString("text").orEmpty()
                 if (text.isNotEmpty()) events.emit(AgentEvent.AssistantDelta(text))
@@ -245,7 +300,6 @@ class GrokAcpClient : AgentBackend {
             }
 
             "plan" -> {
-                // Surface plan text if present.
                 val entries = update.optJSONArray("entries")
                 if (entries != null) {
                     val summary = buildString {
@@ -275,7 +329,6 @@ class GrokAcpClient : AgentBackend {
                     .put("outcome", "selected")
                     .put("optionId", "allow-always"),
             )
-        // Fallback shape used by some ACP agents.
         result.put("permissionOutcome", "allow_always")
         respond(msg.getLong("id"), result)
     }
@@ -341,14 +394,12 @@ class GrokAcpClient : AgentBackend {
                 url = "ws://$url"
             }
 
-            // Accept either bare host:port, ws://host:port, or full path already including /ws
             if (!url.contains("/ws")) {
                 url = "$url/ws"
             }
 
             val sep = if (url.contains('?')) '&' else '?'
             return if (secret.isNotBlank()) {
-                // Avoid duplicating server-key if user pasted a full URL with secret.
                 if (url.contains("server-key=")) url else "$url${sep}server-key=$secret"
             } else {
                 url

@@ -11,6 +11,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.zain.agentremote.ui.ChatScreen
+import dev.zain.agentremote.ui.HomeScreen
 import dev.zain.agentremote.ui.SettingsScreen
 import dev.zain.agentremote.ui.theme.AgentRemoteTheme
 
@@ -24,16 +25,25 @@ class MainActivity : ComponentActivity() {
                 val state by vm.ui.collectAsState()
                 val nav = rememberNavController()
 
-                NavHost(navController = nav, startDestination = "chat") {
-                    composable("chat") {
-                        ChatScreen(
-                            state = state,
-                            onDraftChange = vm::onDraftChange,
-                            onSend = vm::send,
-                            onConnect = vm::connect,
-                            onDisconnect = vm::disconnect,
-                            onOpenSettings = { nav.navigate("settings") },
-                        )
+                NavHost(navController = nav, startDestination = "main") {
+                    composable("main") {
+                        when (state.screen) {
+                            AppScreen.HOME -> HomeScreen(
+                                state = state,
+                                onOpenSession = vm::openSession,
+                                onNewSession = vm::openNewSession,
+                                onRefresh = vm::refreshSessions,
+                                onOpenSettings = { nav.navigate("settings") },
+                            )
+                            AppScreen.CHAT -> ChatScreen(
+                                state = state,
+                                onDraftChange = vm::onDraftChange,
+                                onSend = vm::send,
+                                onDisconnect = vm::disconnect,
+                                onBack = vm::goHome,
+                                onOpenSettings = { nav.navigate("settings") },
+                            )
+                        }
                     }
                     composable("settings") {
                         SettingsScreen(

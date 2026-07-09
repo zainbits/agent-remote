@@ -16,8 +16,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -36,6 +36,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.zain.agentremote.ChatUiState
 import dev.zain.agentremote.agent.ChatMessage
@@ -49,8 +50,8 @@ fun ChatScreen(
     state: ChatUiState,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
-    onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onBack: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val listState = rememberLazyListState()
@@ -61,13 +62,22 @@ fun ChatScreen(
     }
 
     val connected = state.connection is ConnectionState.Connected
+    val cwd = when (val c = state.connection) {
+        is ConnectionState.Connected -> c.cwd.ifBlank { state.settings.workingDirectory }
+        else -> state.settings.workingDirectory
+    }
+    val title = state.activeSessionTitle?.takeIf { it.isNotBlank() } ?: "Chat"
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Text("AgentRemote")
+                        Text(
+                            text = title,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
                         Text(
                             text = buildString {
                                 append(state.statusLine)
@@ -78,19 +88,36 @@ fun ChatScreen(
                                         NetworkProfile.TAILNET -> "Tailnet"
                                     },
                                 )
-                                append(" · Grok")
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = cwd,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                            ),
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back to sessions",
                         )
                     }
                 },
                 actions = {
-                    IconButton(onClick = if (connected) onDisconnect else onConnect) {
-                        Icon(
-                            imageVector = if (connected) Icons.Default.LinkOff else Icons.Default.Link,
-                            contentDescription = if (connected) "Disconnect" else "Connect",
-                        )
+                    if (connected) {
+                        IconButton(onClick = onDisconnect) {
+                            Icon(Icons.Default.LinkOff, contentDescription = "Disconnect")
+                        }
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
@@ -117,8 +144,11 @@ fun ChatScreen(
                 if (state.messages.isEmpty()) {
                     item {
                         Text(
-                            text = "Connect to your host Grok agent, then send a prompt.\n" +
-                                "On the host: run  grokserve",
+                            text = if (state.busy) {
+                                "Loading conversation…"
+                            } else {
+                                "Send a prompt to the host agent.\nProject: $cwd"
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(12.dp),

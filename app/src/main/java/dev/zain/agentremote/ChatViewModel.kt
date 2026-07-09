@@ -8,6 +8,8 @@ import dev.zain.agentremote.agent.ChatMessage
 import dev.zain.agentremote.agent.ChatRole
 import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.GrokAcpClient
+import dev.zain.agentremote.agent.SessionIndexClient
+import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.data.AppSettings
 import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
@@ -22,23 +24,35 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 
+enum class AppScreen {
+    HOME,
+    CHAT,
+}
+
 data class ChatUiState(
     val settings: AppSettings = AppSettings(),
+    val screen: AppScreen = AppScreen.HOME,
     val connection: ConnectionState = ConnectionState.Disconnected,
     val messages: List<ChatMessage> = emptyList(),
     val draft: String = "",
     val busy: Boolean = false,
     val statusLine: String = "Disconnected",
+    val sessions: List<SessionSummary> = emptyList(),
+    val sessionsLoading: Boolean = false,
+    val sessionsError: String? = null,
+    val activeSessionTitle: String? = null,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
     private val backend = GrokAcpClient()
+    private val sessionIndex = SessionIndexClient()
 
     private val _ui = MutableStateFlow(ChatUiState())
     val ui: StateFlow<ChatUiState> = _ui.asStateFlow()
 
     private var eventsJob: Job? = null
+    private var streamingUserId: String? = null
     private var streamingAssistantId: String? = null
     private var streamingThoughtId: String? = null
 
@@ -54,13 +68,61 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         eventsJob = viewModelScope.launch {
             backend.events().collect { event -> handleEvent(event) }
         }
+        // Initial session list once settings load
+        viewModelScope.launch {
+            settingsRepo.settings.collect {
+                // only auto-refresh when on home and we have a secret
+                if (_ui.value.screen == AppScreen.HOME &&
+                    _ui.value.settings.agentSecret.isNotBlank() &&
+                    _ui.value.sessions.isEmpty() &&
+                    !_ui.value.sessionsLoading
+                ) {
+                    refreshSessions()
+                    return@collect
+                }
+            }
+        }
     }
 
     fun onDraftChange(value: String) {
         _ui.update { it.copy(draft = value) }
     }
 
-    fun connect() {
+    fun refreshSessions() {
+        val s = _ui.value.settings
+        if (s.agentSecret.isBlank()) {
+            _ui.update {
+                it.copy(
+                    sessionsError = "Set the agent secret in Settings first.",
+                    sessions = emptyList(),
+                )
+            }
+            return
+        }
+        viewModelScope.launch {
+            _ui.update { it.copy(sessionsLoading = true, sessionsError = null) }
+            runCatching {
+                sessionIndex.listSessions(
+                    agentBaseUrl = s.activeBaseUrl,
+                    secret = s.agentSecret,
+                    cwd = s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD },
+                )
+            }.onSuccess { list ->
+                _ui.update {
+                    it.copy(sessions = list, sessionsLoading = false, sessionsError = null)
+                }
+            }.onFailure { e ->
+                _ui.update {
+                    it.copy(
+                        sessionsLoading = false,
+                        sessionsError = e.message ?: "Failed to load sessions",
+                    )
+                }
+            }
+        }
+    }
+
+    fun openNewSession() {
         val s = _ui.value.settings
         if (s.backendKind != BackendKind.GROK_BUILD) {
             pushSystem("Only Grok Build is implemented in this version.")
@@ -71,12 +133,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
-            _ui.update { it.copy(busy = true, statusLine = "Connecting…") }
+            clearChatLocal()
+            _ui.update {
+                it.copy(
+                    screen = AppScreen.CHAT,
+                    busy = true,
+                    statusLine = "Connecting…",
+                    activeSessionTitle = "New chat",
+                    messages = emptyList(),
+                )
+            }
             runCatching {
-                backend.connect(
+                backend.connectNew(
                     baseUrl = s.activeBaseUrl,
                     secret = s.agentSecret,
-                    workingDirectory = s.workingDirectory,
+                    workingDirectory = s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD },
                 )
             }.onFailure { e ->
                 pushSystem("Connect failed: ${e.message ?: e::class.java.simpleName}")
@@ -93,11 +164,71 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun openSession(session: SessionSummary) {
+        val s = _ui.value.settings
+        if (s.agentSecret.isBlank()) {
+            _ui.update { it.copy(sessionsError = "Set the agent secret in Settings first.") }
+            return
+        }
+        viewModelScope.launch {
+            clearChatLocal()
+            _ui.update {
+                it.copy(
+                    screen = AppScreen.CHAT,
+                    busy = true,
+                    statusLine = "Loading session…",
+                    activeSessionTitle = session.title,
+                    messages = emptyList(),
+                )
+            }
+            val cwd = session.cwd.ifBlank {
+                s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
+            }
+            runCatching {
+                backend.connectLoad(
+                    baseUrl = s.activeBaseUrl,
+                    secret = s.agentSecret,
+                    workingDirectory = cwd,
+                    sessionId = session.sessionId,
+                )
+            }.onFailure { e ->
+                pushSystem("Load failed: ${e.message ?: e::class.java.simpleName}")
+                _ui.update {
+                    it.copy(
+                        busy = false,
+                        connection = ConnectionState.Error(e.message ?: "error"),
+                        statusLine = "Error",
+                    )
+                }
+            }.onSuccess {
+                _ui.update { it.copy(busy = false) }
+            }
+        }
+    }
+
+    fun goHome() {
+        viewModelScope.launch {
+            runCatching { backend.disconnect() }
+            clearChatLocal()
+            _ui.update {
+                it.copy(
+                    screen = AppScreen.HOME,
+                    busy = false,
+                    connection = ConnectionState.Disconnected,
+                    statusLine = "Disconnected",
+                    messages = emptyList(),
+                    draft = "",
+                    activeSessionTitle = null,
+                )
+            }
+            refreshSessions()
+        }
+    }
+
     fun disconnect() {
         viewModelScope.launch {
             runCatching { backend.disconnect() }
-            streamingAssistantId = null
-            streamingThoughtId = null
+            clearChatLocal()
             _ui.update {
                 it.copy(
                     busy = false,
@@ -112,7 +243,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val text = _ui.value.draft.trim()
         if (text.isEmpty()) return
         if (!backend.isConnected()) {
-            pushSystem("Not connected. Open Settings, then Connect.")
+            pushSystem("Not connected.")
             return
         }
         _ui.update {
@@ -126,6 +257,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 ),
             )
         }
+        streamingUserId = null
         streamingAssistantId = null
         streamingThoughtId = null
         viewModelScope.launch {
@@ -151,9 +283,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     lanBaseUrl = lanBaseUrl.trim(),
                     tailnetBaseUrl = tailnetBaseUrl.trim(),
                     agentSecret = agentSecret,
-                    workingDirectory = workingDirectory.trim().ifBlank { "/home/user" },
+                    workingDirectory = workingDirectory.trim()
+                        .ifBlank { AppSettings.DEFAULT_CWD },
                     backendKind = BackendKind.GROK_BUILD,
                 )
+            }
+            // Refresh list with new cwd/secret/url
+            if (_ui.value.screen == AppScreen.HOME) {
+                refreshSessions()
             }
         }
     }
@@ -164,18 +301,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun clearChatLocal() {
+        streamingUserId = null
+        streamingAssistantId = null
+        streamingThoughtId = null
+    }
+
     private fun handleEvent(event: AgentEvent) {
         when (event) {
             is AgentEvent.ConnectionChanged -> {
-                val line = when (val s = event.state) {
+                val line = when (val st = event.state) {
                     ConnectionState.Disconnected -> "Disconnected"
                     ConnectionState.Connecting -> "Connecting…"
-                    is ConnectionState.Connected -> "Connected · ${s.sessionId.take(8)}…"
-                    is ConnectionState.Error -> "Error · ${s.message}"
+                    is ConnectionState.Connected -> {
+                        val cwdShort = st.cwd.ifBlank { _ui.value.settings.workingDirectory }
+                            .removePrefix("/home/").let { if (it == st.cwd) st.cwd else "~/$it" }
+                        "Connected · ${st.sessionId.take(8)}… · $cwdShort"
+                    }
+                    is ConnectionState.Error -> "Error · ${st.message}"
                 }
                 _ui.update { it.copy(connection = event.state, statusLine = line, busy = false) }
             }
 
+            is AgentEvent.UserDelta -> appendStreaming(ChatRole.USER, event.text)
             is AgentEvent.AssistantDelta -> appendStreaming(ChatRole.ASSISTANT, event.text)
             is AgentEvent.ThoughtDelta -> appendStreaming(ChatRole.THOUGHT, event.text)
             is AgentEvent.ToolCall -> {
@@ -207,14 +355,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendStreaming(role: ChatRole, delta: String) {
-        val idField = if (role == ChatRole.ASSISTANT) ::streamingAssistantId else ::streamingThoughtId
+        val idField = when (role) {
+            ChatRole.USER -> ::streamingUserId
+            ChatRole.ASSISTANT -> ::streamingAssistantId
+            ChatRole.THOUGHT -> ::streamingThoughtId
+            else -> {
+                appendStatic(role, delta)
+                return
+            }
+        }
+        val last = _ui.value.messages.lastOrNull()
         val existingId = idField.get()
-        if (existingId == null) {
+        // Append only when the last bubble is still this open stream (avoids merging turns on load).
+        val canAppend = existingId != null && last?.id == existingId && last.streaming
+        if (!canAppend) {
+            // Seal any previous open stream for this role.
+            idField.set(null)
             val id = UUID.randomUUID().toString()
             idField.set(id)
             _ui.update {
                 it.copy(
-                    messages = it.messages + ChatMessage(
+                    messages = it.messages.map { msg ->
+                        if (msg.streaming && msg.role == role) msg.copy(streaming = false) else msg
+                    } + ChatMessage(
                         id = id,
                         role = role,
                         text = delta,
@@ -234,7 +397,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun finalizeStreaming() {
-        val ids = listOfNotNull(streamingAssistantId, streamingThoughtId)
+        val ids = listOfNotNull(streamingUserId, streamingAssistantId, streamingThoughtId)
+        streamingUserId = null
         streamingAssistantId = null
         streamingThoughtId = null
         if (ids.isEmpty()) return
@@ -248,6 +412,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendStatic(role: ChatRole, text: String) {
+        // When a new role block starts mid-stream, seal previous streaming blobs of other roles.
         _ui.update {
             it.copy(
                 messages = it.messages + ChatMessage(
