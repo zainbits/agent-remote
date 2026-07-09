@@ -122,14 +122,12 @@ class GrokAcpClient : AgentBackend {
                     )
                     .put(
                         "clientInfo",
-                        JSONObject().put("name", "AgentRemote").put("version", "0.1.0"),
+                        JSONObject()
+                            .put("name", "AgentRemote")
+                            .put("title", "AgentRemote")
+                            .put("version", "0.1.0"),
                     ),
             )
-
-            // ACP optional auth notification; ignore failures on hosts that do not require it.
-            runCatching {
-                notify("authenticated", JSONObject().put("methodId", "none"))
-            }
 
             val newSession = requestRpc(
                 method = "session/new",
@@ -291,7 +289,7 @@ class GrokAcpClient : AgentBackend {
             .put("id", id)
             .put("method", method)
             .put("params", params)
-        sendRaw(payload.toString())
+        sendRaw(encodeJson(payload))
         return try {
             withTimeout(300_000) { deferred.await() }
         } catch (t: Throwable) {
@@ -300,20 +298,12 @@ class GrokAcpClient : AgentBackend {
         }
     }
 
-    private suspend fun notify(method: String, params: JSONObject) {
-        val payload = JSONObject()
-            .put("jsonrpc", "2.0")
-            .put("method", method)
-            .put("params", params)
-        sendRaw(payload.toString())
-    }
-
     private suspend fun respond(id: Long, result: JSONObject) {
         val payload = JSONObject()
             .put("jsonrpc", "2.0")
             .put("id", id)
             .put("result", result)
-        sendRaw(payload.toString())
+        sendRaw(encodeJson(payload))
     }
 
     private suspend fun sendRaw(text: String) = withContext(Dispatchers.IO) {
@@ -322,6 +312,13 @@ class GrokAcpClient : AgentBackend {
             error("Failed to enqueue WebSocket frame")
         }
     }
+
+    /**
+     * org.json escapes `/` as `\/`. Grok's ACP decoder uses zero-copy string
+     * borrows and rejects those escapes ("expected a borrowed string").
+     */
+    private fun encodeJson(obj: JSONObject): String =
+        obj.toString().replace("\\/", "/")
 
     private fun failAllPending(t: Throwable) {
         val copy = pending.values.toList()
