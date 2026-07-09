@@ -1,0 +1,43 @@
+*.iml
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Android Studio / IntelliJ
+.idea/
+*.ipr
+*.iws
+captures/
+
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+build/
+*/build/
+local.properties
+
+# Android NDK / native
+.externalNativeBuild/
+.cxx/
+
+# Signing and release artifacts
+*.jks
+*.keystore
+*.idsig
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Logs and crash dumps
+*.log
+*.hprof
+
+# OS junk
+Thumbs.db
+
+# Optional local notes / secrets (never commit)
+*.secret
+.env
+.env.*
+secrets/
