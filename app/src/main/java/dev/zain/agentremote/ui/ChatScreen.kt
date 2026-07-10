@@ -5,7 +5,10 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -20,6 +23,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -35,6 +39,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -45,7 +50,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -53,12 +58,15 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -88,13 +96,6 @@ fun ChatScreen(
     onBack: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
-    val listState = rememberLazyListState()
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text?.length) {
-        if (state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(state.messages.lastIndex)
-        }
-    }
-
     val connected = state.connection is ConnectionState.Connected
     val cwd = when (val c = state.connection) {
         is ConnectionState.Connected -> c.cwd.ifBlank { state.settings.workingDirectory }
@@ -181,31 +182,27 @@ fun ChatScreen(
                 .imePadding()
                 .navigationBarsPadding(),
         ) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                if (state.messages.isEmpty()) {
-                    item {
-                        Text(
-                            text = if (state.busy) {
-                                "Loading conversation…"
-                            } else {
-                                "Send a prompt to the host agent.\nProject: $cwd"
-                            },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(12.dp),
-                        )
-                    }
+            if (state.historyLoading) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "Loading conversation…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
-                items(state.messages, key = { it.id }) { msg ->
-                    MessageBlock(msg)
-                }
+            } else {
+                ChatHistory(
+                    messages = state.messages,
+                    emptyText = "Send a prompt to the host agent.\nProject: $cwd",
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                )
             }
 
             state.commandOutput?.let { output ->
@@ -233,29 +230,170 @@ fun ChatScreen(
                 it.source == SlashCommandSource.APP && it.name.equals(commandName, ignoreCase = true)
             }
             val canSendWhileBusy = commandName == "stop" || commandName == "cancel"
-            Row(
+            MessageComposer(
+                draft = state.draft,
+                agentName = state.settings.backendKind.displayName,
+                modelName = state.usage.modelName ?: state.usage.modelId,
+                reasoningEffort = state.usage.reasoningEffort,
+                inputEnabled = !state.busy || connected,
+                requestInFlight = state.requestInFlight,
+                cancellationRequested = state.cancellationRequested,
+                sendEnabled = state.draft.isNotBlank() &&
+                    (connected || isLocalCommand) &&
+                    (!state.busy || canSendWhileBusy),
+                onDraftChange = onDraftChange,
+                onSend = onSend,
+                onCancel = onCancel,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedTextField(
-                    value = state.draft,
-                    onValueChange = onDraftChange,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message Grok…") },
-                    maxLines = 6,
-                    enabled = !state.busy || connected,
+                    .padding(start = 10.dp, top = 6.dp, end = 10.dp, bottom = 10.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ChatHistory(
+    messages: List<ChatMessage>,
+    emptyText: String,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+    var followLatest by remember { mutableStateOf(true) }
+    val latest = messages.lastOrNull()
+
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) {
+                followLatest = listState.firstVisibleItemIndex == 0 &&
+                    listState.firstVisibleItemScrollOffset == 0
+            }
+        }
+    }
+
+    LaunchedEffect(
+        messages.size,
+        latest?.id,
+        latest?.text?.length,
+        latest?.detail?.length,
+        latest?.toolStatus,
+    ) {
+        if (followLatest && !listState.isScrollInProgress && messages.isNotEmpty()) {
+            listState.scrollToItem(0)
+        }
+    }
+
+    LazyColumn(
+        state = listState,
+        modifier = modifier,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+        reverseLayout = true,
+        verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Bottom),
+    ) {
+        if (messages.isEmpty()) {
+            item {
+                Text(
+                    text = emptyText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(12.dp),
                 )
-                if (state.requestInFlight) {
+            }
+        }
+        items(messages.asReversed(), key = { it.id }) { message ->
+            MessageBlock(message)
+        }
+    }
+}
+
+@Composable
+private fun MessageComposer(
+    draft: String,
+    agentName: String,
+    modelName: String?,
+    reasoningEffort: String?,
+    inputEnabled: Boolean,
+    requestInFlight: Boolean,
+    cancellationRequested: Boolean,
+    sendEnabled: Boolean,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        shape = RoundedCornerShape(26.dp),
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
+        ),
+        tonalElevation = 3.dp,
+        shadowElevation = 1.dp,
+    ) {
+        Column(
+            modifier = Modifier.padding(start = 10.dp, top = 8.dp, end = 8.dp, bottom = 8.dp),
+        ) {
+            BasicTextField(
+                value = draft,
+                onValueChange = onDraftChange,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .padding(horizontal = 6.dp, vertical = 8.dp),
+                enabled = inputEnabled,
+                minLines = 1,
+                maxLines = 6,
+                textStyle = MaterialTheme.typography.bodyLarge.copy(
+                    color = if (inputEnabled) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    },
+                ),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                decorationBox = { innerTextField ->
+                    Box {
+                        if (draft.isEmpty()) {
+                            Text(
+                                text = "Message $agentName…",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                                    alpha = if (inputEnabled) 0.75f else 0.38f,
+                                ),
+                            )
+                        }
+                        innerTextField()
+                    }
+                },
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                ComposerModelRail(
+                    modelName = modelName ?: "$agentName model",
+                    reasoningEffort = reasoningEffort,
+                    modifier = Modifier.weight(1f),
+                )
+
+                if (requestInFlight) {
                     FilledIconButton(
                         onClick = onCancel,
-                        enabled = !state.cancellationRequested,
+                        enabled = !cancellationRequested,
+                        modifier = Modifier.size(48.dp),
+                        colors = IconButtonDefaults.filledIconButtonColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer,
+                            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                        ),
                     ) {
                         Icon(
                             Icons.Default.Stop,
-                            contentDescription = if (state.cancellationRequested) {
+                            contentDescription = if (cancellationRequested) {
                                 "Stopping request"
                             } else {
                                 "Stop request"
@@ -263,15 +401,76 @@ fun ChatScreen(
                         )
                     }
                 }
+
                 FilledIconButton(
                     onClick = onSend,
-                    enabled = state.draft.isNotBlank() &&
-                        (connected || isLocalCommand) &&
-                        (!state.busy || canSendWhileBusy),
+                    enabled = sendEnabled,
+                    modifier = Modifier.size(48.dp),
                 ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send message")
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ComposerModelRail(
+    modelName: String,
+    reasoningEffort: String?,
+    modifier: Modifier = Modifier,
+) {
+    val effortLabel = reasoningEffort
+        ?.let { effort ->
+            when (effort.lowercase()) {
+                "xhigh" -> "XHigh"
+                else -> effort.replaceFirstChar { it.uppercase() }
+            }
+        }
+        ?.let { "$it effort" }
+        ?: "Effort —"
+
+    Surface(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Default.Memory,
+                contentDescription = null,
+                modifier = Modifier.size(15.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                text = modelName,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(
+                modifier = Modifier
+                    .size(width = 1.dp, height = 16.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant),
+            )
+            Icon(
+                imageVector = Icons.Default.Psychology,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.tertiary,
+            )
+            Text(
+                text = effortLabel,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+            )
         }
     }
 }

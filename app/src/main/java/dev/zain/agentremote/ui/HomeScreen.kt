@@ -1,46 +1,78 @@
 package dev.zain.agentremote.ui
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.zain.agentremote.ChatUiState
 import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
 import dev.zain.agentremote.data.displayName
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -61,13 +93,14 @@ fun HomeScreen(
     val backend = state.settings.backendKind
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.surface,
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Text("${backend.displayName} sessions")
+                        Text("AgentRemote")
                         Text(
-                            text = "Project · $cwd  ·  $profile",
+                            text = "${backend.displayName} · $profile",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -86,27 +119,29 @@ fun HomeScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(
+            ExtendedFloatingActionButton(
                 onClick = { if (interactionEnabled) onNewSession() },
-            ) {
-                Icon(Icons.Default.Add, contentDescription = "New chat")
-            }
+                icon = { Icon(Icons.Default.Add, contentDescription = null) },
+                text = { Text("New session") },
+            )
         },
         bottomBar = {
-            NavigationBar {
-                NavigationBarItem(
+            NavigationBar(
+                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+            ) {
+                AnimatedNavigationBarItem(
                     selected = backend == BackendKind.GROK_BUILD,
                     onClick = { onSelectBackend(BackendKind.GROK_BUILD) },
                     enabled = interactionEnabled,
-                    icon = { Icon(Icons.Default.SmartToy, contentDescription = null) },
-                    label = { Text("Grok") },
+                    icon = Icons.Default.SmartToy,
+                    label = "Grok",
                 )
-                NavigationBarItem(
+                AnimatedNavigationBarItem(
                     selected = backend == BackendKind.CODEX,
                     onClick = { onSelectBackend(BackendKind.CODEX) },
                     enabled = interactionEnabled,
-                    icon = { Icon(Icons.Default.Code, contentDescription = null) },
-                    label = { Text("Codex") },
+                    icon = Icons.Default.Code,
+                    label = "Codex",
                 )
             }
         },
@@ -115,62 +150,53 @@ fun HomeScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                Column(Modifier.padding(horizontal = 4.dp, vertical = 4.dp)) {
+                WorkspaceCard(
+                    cwd = cwd,
+                    backendName = backend.displayName,
+                    profile = profile,
+                )
+            }
+
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Text(
-                        "Sessions",
+                        "Recent sessions",
                         style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f),
                     )
-                    Text(
-                        "Host working directory is the project the agent uses for tools " +
-                            "(files, shell, git). Default is the host home directory. " +
-                            "Change it in Settings.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        "cwd: $cwd",
-                        style = MaterialTheme.typography.labelMedium.copy(
-                            fontFamily = FontFamily.Monospace,
-                        ),
-                        color = MaterialTheme.colorScheme.primary,
-                    )
+                    SessionCountPill(state.sessions.size)
                 }
             }
 
             if (state.sessionsLoading) {
                 item {
-                    Text(
-                        "Loading sessions…",
-                        modifier = Modifier.padding(12.dp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    LinearProgressIndicator(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(CircleShape),
                     )
                 }
             }
 
             state.sessionsError?.let { err ->
                 item {
-                    Text(
-                        err,
-                        modifier = Modifier.padding(12.dp),
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                    SessionError(message = err)
                 }
             }
 
             if (!state.sessionsLoading && state.sessions.isEmpty() && state.sessionsError == null) {
                 item {
-                    Text(
-                        "No sessions for this directory yet.\n" +
-                            "Tap + for a new chat, or start the ${backend.displayName} " +
-                            "host service.",
-                        modifier = Modifier.padding(12.dp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    EmptySessions(
+                        backendName = backend.displayName,
                     )
                 }
             }
@@ -189,6 +215,275 @@ fun HomeScreen(
 }
 
 @Composable
+private fun WorkspaceCard(
+    cwd: String,
+    backendName: String,
+    profile: String,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(18.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Surface(
+                modifier = Modifier.size(48.dp),
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null)
+                }
+            }
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = "Workspace",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    text = cwd,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "$backendName host · $profile",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SessionCountPill(count: Int) {
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+    ) {
+        Text(
+            text = count.toString(),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelMedium,
+        )
+    }
+}
+
+@Composable
+private fun SessionError(message: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            Icon(Icons.Default.ErrorOutline, contentDescription = null)
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmptySessions(backendName: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.extraLarge,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Surface(
+                modifier = Modifier.size(56.dp),
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.ChatBubbleOutline, contentDescription = null)
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            Text(
+                text = "No $backendName sessions yet",
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "Start a new session, or make sure the $backendName host service is running.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
+    }
+}
+
+@Composable
+private fun RowScope.AnimatedNavigationBarItem(
+    selected: Boolean,
+    onClick: () -> Unit,
+    enabled: Boolean,
+    icon: ImageVector,
+    label: String,
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val colors = NavigationBarItemDefaults.colors(
+        selectedIconColor = MaterialTheme.colorScheme.onSecondaryContainer,
+        selectedTextColor = MaterialTheme.colorScheme.onSurface,
+        indicatorColor = Color.Transparent,
+        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+
+    NavigationBarItem(
+        selected = selected,
+        onClick = onClick,
+        enabled = enabled,
+        interactionSource = interactionSource,
+        colors = colors,
+        icon = {
+            AnimatedNavigationPill(
+                selected = selected,
+                interactionSource = interactionSource,
+                icon = icon,
+            )
+        },
+        label = { Text(label) },
+    )
+}
+
+@Composable
+private fun AnimatedNavigationPill(
+    selected: Boolean,
+    interactionSource: MutableInteractionSource,
+    icon: ImageVector,
+) {
+    val baseColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.secondaryContainer
+        } else {
+            Color.Transparent
+        },
+        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+        label = "navigation pill color",
+    )
+    val pressAmount = remember { Animatable(0f) }
+    val scale = remember { Animatable(1f) }
+
+    LaunchedEffect(interactionSource) {
+        interactionSource.interactions.collectLatest { interaction ->
+            when (interaction) {
+                is PressInteraction.Press -> coroutineScope {
+                    launch {
+                        pressAmount.animateTo(
+                            targetValue = 1f,
+                            animationSpec = tween(90),
+                        )
+                    }
+                    launch {
+                        scale.animateTo(
+                            targetValue = 0.94f,
+                            animationSpec = tween(90),
+                        )
+                    }
+                }
+
+                is PressInteraction.Release -> coroutineScope {
+                    launch {
+                        pressAmount.snapTo(1f)
+                        pressAmount.animateTo(
+                            targetValue = 0f,
+                            animationSpec = tween(
+                                durationMillis = 260,
+                                easing = FastOutSlowInEasing,
+                            ),
+                        )
+                    }
+                    launch {
+                        scale.animateTo(
+                            targetValue = 1.04f,
+                            animationSpec = tween(90),
+                        )
+                        scale.animateTo(
+                            targetValue = 1f,
+                            animationSpec = spring(
+                                dampingRatio = Spring.DampingRatioMediumBouncy,
+                                stiffness = Spring.StiffnessMedium,
+                            ),
+                        )
+                    }
+                }
+
+                is PressInteraction.Cancel -> coroutineScope {
+                    launch {
+                        pressAmount.animateTo(0f, tween(120))
+                    }
+                    launch {
+                        scale.animateTo(
+                            targetValue = 1f,
+                            animationSpec = spring(
+                                dampingRatio = Spring.DampingRatioNoBouncy,
+                                stiffness = Spring.StiffnessMedium,
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .size(width = 64.dp, height = 32.dp)
+            .graphicsLayer {
+                scaleX = scale.value
+                scaleY = scale.value
+            }
+            .clip(CircleShape)
+            .background(baseColor),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .graphicsLayer {
+                    alpha = pressAmount.value * if (selected) 0.24f else 0.72f
+                }
+                .background(
+                    if (selected) {
+                        MaterialTheme.colorScheme.surfaceBright
+                    } else {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    },
+                ),
+        )
+        Icon(icon, contentDescription = null)
+    }
+}
+
+@Composable
 private fun SessionRow(
     session: SessionSummary,
     interactionEnabled: Boolean,
@@ -198,11 +493,12 @@ private fun SessionRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(enabled = interactionEnabled, onClick = onClick),
+        shape = MaterialTheme.shapes.extraLarge,
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         ),
     ) {
-        Column(Modifier.padding(14.dp)) {
+        Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
             Text(
                 text = session.title,
                 style = MaterialTheme.typography.titleSmall,
@@ -235,6 +531,10 @@ private fun SessionRow(
                 )
             }
             if (session.cwd.isNotBlank()) {
+                HorizontalDivider(
+                    modifier = Modifier.padding(top = 10.dp, bottom = 8.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                )
                 Text(
                     text = session.cwd,
                     style = MaterialTheme.typography.labelSmall.copy(
@@ -243,7 +543,6 @@ private fun SessionRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 2.dp),
                 )
             }
         }

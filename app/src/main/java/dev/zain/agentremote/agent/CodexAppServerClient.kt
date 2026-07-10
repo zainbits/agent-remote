@@ -667,8 +667,21 @@ class CodexAppServerClient : AgentBackend {
     }
 
     private fun emitModel(result: JSONObject) {
-        val model = result.optString("model").ifBlank { null } ?: return
-        events.tryEmit(AgentEvent.UsageChanged(AgentUsage(modelId = model, modelName = model)))
+        val model = result.optString("model").ifBlank { null }
+        val reasoningEffort = result
+            .takeIf { it.has("reasoningEffort") && !it.isNull("reasoningEffort") }
+            ?.optString("reasoningEffort")
+            ?.ifBlank { null }
+        if (model == null && reasoningEffort == null) return
+        events.tryEmit(
+            AgentEvent.UsageChanged(
+                AgentUsage(
+                    modelId = model,
+                    modelName = model,
+                    reasoningEffort = reasoningEffort,
+                ),
+            ),
+        )
     }
 
     private suspend fun emitUsage(tokenUsage: JSONObject?) {
@@ -832,11 +845,16 @@ class CodexAppServerClient : AgentBackend {
                 val id = thread.optString("id")
                 if (id.isBlank()) continue
                 val preview = thread.optString("preview").trim()
-                val title = thread.optString("name").trim().ifBlank {
-                    preview.lineSequence().firstOrNull().orEmpty().take(120).ifBlank {
-                        "New Codex thread"
+                val title = thread
+                    .takeIf { it.has("name") && !it.isNull("name") }
+                    ?.optString("name")
+                    ?.trim()
+                    ?.ifBlank { null }
+                    ?: run {
+                        preview.lineSequence().firstOrNull().orEmpty().take(120).ifBlank {
+                            "New Codex thread"
+                        }
                     }
-                }
                 add(
                     SessionSummary(
                         sessionId = id,

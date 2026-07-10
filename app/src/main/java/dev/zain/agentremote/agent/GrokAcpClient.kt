@@ -527,8 +527,18 @@ class GrokAcpClient : AgentBackend {
             ?.optJSONObject("_meta")
             ?.takeIf { it.has("totalContextTokens") && !it.isNull("totalContextTokens") }
             ?.optLong("totalContextTokens")
+        val reasoningEffort = currentModel
+            ?.optJSONObject("_meta")
+            ?.takeIf { it.has("reasoningEffort") && !it.isNull("reasoningEffort") }
+            ?.optString("reasoningEffort")
+            ?.ifBlank { null }
 
-        if (currentModelId == null && currentModel == null && contextSize == null) return
+        if (
+            currentModelId == null && currentModel == null &&
+            contextSize == null && reasoningEffort == null
+        ) {
+            return
+        }
 
         events.emit(
             AgentEvent.UsageChanged(
@@ -536,6 +546,7 @@ class GrokAcpClient : AgentBackend {
                     contextWindowTokens = contextSize,
                     modelId = currentModelId ?: currentModel?.optString("modelId")?.ifBlank { null },
                     modelName = currentModel?.optString("name")?.ifBlank { null },
+                    reasoningEffort = reasoningEffort,
                 ),
             ),
         )

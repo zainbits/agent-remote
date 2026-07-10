@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.NumberFormat
 import java.util.Locale
 import java.util.UUID
@@ -68,6 +69,7 @@ data class ChatUiState(
     val sessionsLoading: Boolean = false,
     val sessionsError: String? = null,
     val activeSessionTitle: String? = null,
+    val historyLoading: Boolean = false,
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
@@ -101,6 +103,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var connectionActionGeneration: Long = 0
     private var connectionDesired: Boolean = false
     private var hasConnectedSession: Boolean = false
+    private var appInForeground: Boolean = true
     private var activeSessionIdForReconnect: String? = null
     private var activeSessionCwdForReconnect: String = AppSettings.DEFAULT_CWD
     /**
@@ -308,6 +311,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     connection = ConnectionState.Connecting,
                     statusLine = "Connecting…",
                     activeSessionTitle = "New chat",
+                    historyLoading = false,
                     messages = emptyList(),
                     draft = "",
                     slashCommands = localSlashCommands,
@@ -370,6 +374,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     connection = ConnectionState.Connecting,
                     statusLine = "Loading session…",
                     activeSessionTitle = session.title,
+                    historyLoading = true,
                     messages = emptyList(),
                     draft = "",
                     slashCommands = localSlashCommands,
@@ -395,6 +400,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         canReconnect = true,
                         connection = ConnectionState.Error("Connection failed"),
                         statusLine = "Connection failed · tap link to retry",
+                        historyLoading = false,
                     )
                 }
             }.onSuccess {
@@ -434,6 +440,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     usage = AgentUsage(),
                     commandOutput = null,
                     activeSessionTitle = null,
+                    historyLoading = false,
                 )
             }
             refreshSessions()
@@ -465,6 +472,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     slashCommands = localSlashCommands,
                     usage = AgentUsage(),
                     commandOutput = null,
+                    historyLoading = false,
                 )
             }
         }
@@ -477,6 +485,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         hasConnectedSession = true
         val action = ++connectionActionGeneration
         startReconnect(action)
+    }
+
+    fun onAppForegrounded() {
+        appInForeground = true
+        val state = _ui.value
+        val sessionId = activeSessionIdForReconnect
+        val needsReconnect = state.reconnecting ||
+            state.connection !is ConnectionState.Connected ||
+            !backend.isConnected()
+        if (state.screen != AppScreen.CHAT || sessionId == null || !needsReconnect) return
+
+        // A reconnect started while Android was backgrounding may still be waiting
+        // on a half-open socket. Replace it so returning to the app always gets a
+        // fresh, foreground network attempt.
+        reconnectJob?.cancel()
+        reconnectJob = null
+        connectionDesired = true
+        hasConnectedSession = true
+        startReconnect(++connectionActionGeneration)
+    }
+
+    fun onAppBackgrounded() {
+        appInForeground = false
+        // Keep a healthy session connected, but do not spend the bounded retry
+        // budget while Android has stopped the activity. Foregrounding restarts
+        // an interrupted recovery from a new socket generation.
+        reconnectJob?.cancel()
+        reconnectJob = null
     }
 
     fun selectSlashCommand(command: SlashCommand) {
@@ -750,11 +786,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         reconnectJob = viewModelScope.launch {
-            val retryDelaysMillis = longArrayOf(0, 1_000, 2_500, 5_000, 10_000)
+            val retryDelaysMillis = longArrayOf(0, 1_000, 3_000)
 
             for ((attemptIndex, retryDelay) in retryDelaysMillis.withIndex()) {
                 if (retryDelay > 0) delay(retryDelay)
-                if (connectionAction != connectionActionGeneration || !connectionDesired) {
+                if (connectionAction != connectionActionGeneration ||
+                    !connectionDesired ||
+                    !appInForeground
+                ) {
                     return@launch
                 }
 
@@ -762,6 +801,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _ui.update {
                     it.copy(
                         messages = emptyList(),
+                        historyLoading = true,
                         usage = AgentUsage(),
                         slashCommands = localSlashCommands,
                         busy = false,
@@ -778,12 +818,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 try {
                     val settings = _ui.value.settings
-                    backend.connectLoad(
-                        baseUrl = settings.activeBaseUrl(activeBackendKind),
-                        secret = settings.agentSecret(activeBackendKind),
-                        workingDirectory = activeSessionCwdForReconnect,
-                        sessionId = sessionId,
-                    )
+                    val completed = withTimeoutOrNull(RECONNECT_ATTEMPT_TIMEOUT_MILLIS) {
+                        backend.connectLoad(
+                            baseUrl = settings.activeBaseUrl(activeBackendKind),
+                            secret = settings.agentSecret(activeBackendKind),
+                            workingDirectory = activeSessionCwdForReconnect,
+                            sessionId = sessionId,
+                        )
+                        true
+                    }
+                    check(completed == true) { "Reconnect attempt timed out" }
                     if (connectionAction == connectionActionGeneration && connectionDesired) {
                         _ui.update { it.copy(busy = false, reconnecting = false, canReconnect = true) }
                     }
@@ -796,6 +840,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _ui.update {
                         it.copy(
                             messages = retainedMessages,
+                            historyLoading = false,
                             usage = retainedUsage,
                             slashCommands = retainedCommands,
                             busy = false,
@@ -816,6 +861,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         canReconnect = true,
                         connection = ConnectionState.Error("Connection lost"),
                         statusLine = "Connection lost · tap link to retry",
+                        historyLoading = false,
                     )
                 }
             }
@@ -923,6 +969,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 usage.modelName != null -> usage.modelName
                 usage.modelId != null -> "`${usage.modelId}`"
                 else -> "Not reported"
+            },
+        )
+        appendLine()
+        appendLine("**Reasoning effort**")
+        appendLine(
+            when (usage.reasoningEffort?.lowercase()) {
+                "xhigh" -> "XHigh"
+                null -> "Not reported"
+                else -> usage.reasoningEffort.replaceFirstChar { it.uppercase() }
             },
         )
         appendLine()
@@ -1126,7 +1181,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     activeSessionIdForReconnect != null &&
                     _ui.value.screen == AppScreen.CHAT
                 val reconnectAction = if (shouldReconnect && reconnectJob?.isActive != true) {
-                    ++connectionActionGeneration
+                    if (appInForeground) ++connectionActionGeneration else null
                 } else {
                     null
                 }
@@ -1257,6 +1312,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val completedBeforeStop = wasCancelling &&
                     stopReason != null && stopReason != "cancelled"
                 finishActiveRequest()
+                if (stopReason == "loaded") {
+                    _ui.update { it.copy(historyLoading = false) }
+                }
                 suppressLoadedSlashTurn = false
                 loadedPromptIndex = null
                 if (command != null) {
@@ -1293,6 +1351,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 val command = activeSlashCommand
                 val wasCancelling = _ui.value.cancellationRequested
                 finishActiveRequest()
+                _ui.update { it.copy(historyLoading = false) }
                 suppressLoadedSlashTurn = false
                 loadedPromptIndex = null
                 if (command != null) {
@@ -1321,6 +1380,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     ?: state.usage.contextWindowTokens,
                 modelId = update.modelId ?: state.usage.modelId,
                 modelName = update.modelName ?: state.usage.modelName,
+                reasoningEffort = update.reasoningEffort ?: state.usage.reasoningEffort,
                 costAmount = update.costAmount ?: state.usage.costAmount,
                 costCurrency = update.costCurrency ?: state.usage.costCurrency,
             )
@@ -1468,5 +1528,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         grokBackend.shutdown()
         codexBackend.shutdown()
         super.onCleared()
+    }
+
+    private companion object {
+        const val RECONNECT_ATTEMPT_TIMEOUT_MILLIS = 25_000L
     }
 }

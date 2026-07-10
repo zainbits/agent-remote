@@ -5,6 +5,33 @@ set -euo pipefail
 CODEX_AGENT_BIND="${CODEX_AGENT_BIND:-0.0.0.0:2430}"
 CODEX_AGENT_TOKEN_FILE="${CODEX_AGENT_TOKEN_FILE:-$HOME/.codex/agentremote.token}"
 
+show_token=false
+typeset -a app_server_args=()
+
+while (( $# > 0 )); do
+    case "$1" in
+        --show-token)
+            show_token=true
+            ;;
+        *)
+            app_server_args+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if [[ "$show_token" == true ]]; then
+    if [[ ! -s "$CODEX_AGENT_TOKEN_FILE" ]]; then
+        print -u2 "codexserve: no token found (missing $CODEX_AGENT_TOKEN_FILE)"
+        print -u2 "Run codexserve once to create one."
+        exit 1
+    fi
+    # Token only on stdout for easy copy/paste into AgentsRemote settings.
+    tr -d '\n' <"$CODEX_AGENT_TOKEN_FILE"
+    print
+    exit 0
+fi
+
 mkdir -p "${CODEX_AGENT_TOKEN_FILE:h}"
 if [[ ! -s "$CODEX_AGENT_TOKEN_FILE" ]]; then
     umask 077
@@ -15,9 +42,10 @@ chmod 600 "$CODEX_AGENT_TOKEN_FILE"
 print "Codex app-server: ws://$CODEX_AGENT_BIND"
 print "Bearer token file: $CODEX_AGENT_TOKEN_FILE"
 print "Copy that file's contents into AgentsRemote Settings → Codex bearer token."
+print "Or run: codexserve --show-token"
 
 exec codex app-server \
     --listen "ws://$CODEX_AGENT_BIND" \
     --ws-auth capability-token \
     --ws-token-file "$CODEX_AGENT_TOKEN_FILE" \
-    "$@"
+    "${app_server_args[@]}"

@@ -39,6 +39,7 @@ data class AgentUsage(
     val contextWindowTokens: Long? = null,
     val modelId: String? = null,
     val modelName: String? = null,
+    val reasoningEffort: String? = null,
     val costAmount: Double? = null,
     val costCurrency: String? = null,
 )

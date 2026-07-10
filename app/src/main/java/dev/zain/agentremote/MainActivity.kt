@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -45,6 +46,11 @@ class MainActivity : ComponentActivity() {
                 val vm: ChatViewModel = viewModel()
                 val state by vm.ui.collectAsState()
                 val nav = rememberNavController()
+
+                LifecycleStartEffect(vm) {
+                    vm.onAppForegrounded()
+                    onStopOrDispose { vm.onAppBackgrounded() }
+                }
 
                 NavHost(navController = nav, startDestination = "main") {
                     composable("main") {
@@ -81,27 +87,32 @@ class MainActivity : ComponentActivity() {
                         }
 
                         val progress = backProgress.value
+                        val homeRevealProgress = if (state.screen == AppScreen.HOME) {
+                            1f
+                        } else {
+                            progress
+                        }
                         Box(Modifier.fillMaxSize()) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .graphicsLayer {
-                                        val homeScale = 0.97f + (0.03f * progress)
+                                        val homeScale = 0.97f + (0.03f * homeRevealProgress)
                                         scaleX = homeScale
                                         scaleY = homeScale
-                                        alpha = 0.78f + (0.22f * progress)
+                                        alpha = 0.78f + (0.22f * homeRevealProgress)
                                     },
                             ) {
                                 HomeScreen(
-                                state = state,
-                                onOpenSession = vm::openSession,
-                                onNewSession = vm::openNewSession,
-                                onRefresh = vm::refreshSessions,
-                                onSelectBackend = vm::selectBackend,
-                                onOpenSettings = { nav.navigate("settings") },
-                                interactionEnabled =
-                                    state.screen == AppScreen.HOME && !state.busy,
-                            )
+                                    state = state,
+                                    onOpenSession = vm::openSession,
+                                    onNewSession = vm::openNewSession,
+                                    onRefresh = vm::refreshSessions,
+                                    onSelectBackend = vm::selectBackend,
+                                    onOpenSettings = { nav.navigate("settings") },
+                                    interactionEnabled =
+                                        state.screen == AppScreen.HOME && !state.busy,
+                                )
                             }
 
                             if (state.screen == AppScreen.CHAT) {

@@ -10,6 +10,12 @@ Not a boot service. In a terminal:
 grokserve
 ```
 
+To print the current Grok secret without starting the server (for **Settings → Grok secret**):
+
+```zsh
+grokserve --show-token
+```
+
 To replace the persistent secret before starting both endpoints:
 
 ```zsh
@@ -28,6 +34,7 @@ grok agent --always-approve serve --bind 0.0.0.0:2419 --secret <token>
 ```
 
 - Secret persists in `~/.grok/agent-serve.secret` (or set `GROK_AGENT_SECRET`).
+- `--show-token` prints the secret that would be used (env or secret file) and exits without starting servers.
 - `--rotate-secret` securely replaces that file before the server starts.
 - Override agent bind with `GROK_AGENT_BIND=0.0.0.0:2419`.
 - Override session API port with `GROK_SESSION_INDEX_PORT=2420`.
@@ -39,10 +46,17 @@ Run the checked-in foreground helper:
 
 ```zsh
 host/codexserve
+# or, if ~/.zshrc is loaded:
+codexserve
 ```
 
-It creates a mode-`600` bearer-token file when needed and starts Codex app-server on port **2430** using capability-token authentication. Copy the token file's contents into **Settings → Codex bearer token**. Override the bind or token path with `CODEX_AGENT_BIND` and `CODEX_AGENT_TOKEN_FILE`.
+It creates a mode-`600` bearer-token file when needed and starts Codex app-server on port **2430** using capability-token authentication. Copy the token into **Settings → Codex bearer token**:
 
+```zsh
+codexserve --show-token
+```
+
+Override the bind or token path with `CODEX_AGENT_BIND` and `CODEX_AGENT_TOKEN_FILE`.
 Codex WebSocket transport is experimental. Use `wss://` or an authenticated encrypted tunnel when the connection leaves a trusted LAN/Tailnet; never expose an unauthenticated listener publicly.
 
 ### Project / working directory
