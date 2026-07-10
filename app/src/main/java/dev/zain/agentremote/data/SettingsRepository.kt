@@ -17,6 +17,9 @@ class SettingsRepository(private val context: Context) {
         val lanBaseUrl = stringPreferencesKey("lan_base_url")
         val tailnetBaseUrl = stringPreferencesKey("tailnet_base_url")
         val agentSecret = stringPreferencesKey("agent_secret")
+        val codexLanBaseUrl = stringPreferencesKey("codex_lan_base_url")
+        val codexTailnetBaseUrl = stringPreferencesKey("codex_tailnet_base_url")
+        val codexAgentSecret = stringPreferencesKey("codex_agent_secret")
         val workingDirectory = stringPreferencesKey("working_directory")
         val backendKind = stringPreferencesKey("backend_kind")
     }
@@ -29,6 +32,10 @@ class SettingsRepository(private val context: Context) {
             lanBaseUrl = prefs[Keys.lanBaseUrl] ?: AppSettings().lanBaseUrl,
             tailnetBaseUrl = prefs[Keys.tailnetBaseUrl] ?: AppSettings().tailnetBaseUrl,
             agentSecret = prefs[Keys.agentSecret] ?: "",
+            codexLanBaseUrl = prefs[Keys.codexLanBaseUrl] ?: AppSettings().codexLanBaseUrl,
+            codexTailnetBaseUrl = prefs[Keys.codexTailnetBaseUrl]
+                ?: AppSettings().codexTailnetBaseUrl,
+            codexAgentSecret = prefs[Keys.codexAgentSecret] ?: "",
             workingDirectory = prefs[Keys.workingDirectory] ?: AppSettings().workingDirectory,
             backendKind = prefs[Keys.backendKind]
                 ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
@@ -45,6 +52,10 @@ class SettingsRepository(private val context: Context) {
                 lanBaseUrl = prefs[Keys.lanBaseUrl] ?: AppSettings().lanBaseUrl,
                 tailnetBaseUrl = prefs[Keys.tailnetBaseUrl] ?: AppSettings().tailnetBaseUrl,
                 agentSecret = prefs[Keys.agentSecret] ?: "",
+                codexLanBaseUrl = prefs[Keys.codexLanBaseUrl] ?: AppSettings().codexLanBaseUrl,
+                codexTailnetBaseUrl = prefs[Keys.codexTailnetBaseUrl]
+                    ?: AppSettings().codexTailnetBaseUrl,
+                codexAgentSecret = prefs[Keys.codexAgentSecret] ?: "",
                 workingDirectory = prefs[Keys.workingDirectory] ?: AppSettings().workingDirectory,
                 backendKind = prefs[Keys.backendKind]
                     ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
@@ -55,6 +66,9 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.lanBaseUrl] = next.lanBaseUrl
             prefs[Keys.tailnetBaseUrl] = next.tailnetBaseUrl
             prefs[Keys.agentSecret] = next.agentSecret
+            prefs[Keys.codexLanBaseUrl] = next.codexLanBaseUrl
+            prefs[Keys.codexTailnetBaseUrl] = next.codexTailnetBaseUrl
+            prefs[Keys.codexAgentSecret] = next.codexAgentSecret
             prefs[Keys.workingDirectory] = next.workingDirectory
             prefs[Keys.backendKind] = next.backendKind.name
         }

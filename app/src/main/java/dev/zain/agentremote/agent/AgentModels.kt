@@ -25,13 +25,43 @@ data class ChatMessage(
     val detail: String? = null,
 )
 
+/** A command the chat composer can complete after the user types `/`. */
+data class SlashCommand(
+    val name: String,
+    val description: String,
+    val argumentHint: String? = null,
+    val source: SlashCommandSource = SlashCommandSource.AGENT,
+)
+
+/** Latest session-level context and model metadata reported by the ACP agent. */
+data class AgentUsage(
+    val usedTokens: Long? = null,
+    val contextWindowTokens: Long? = null,
+    val modelId: String? = null,
+    val modelName: String? = null,
+    val costAmount: Double? = null,
+    val costCurrency: String? = null,
+)
+
+enum class SlashCommandSource {
+    /** Implemented by AgentRemote itself. */
+    APP,
+
+    /** Advertised by the connected ACP agent. */
+    AGENT,
+}
+
+/** The ACP agent ended an in-flight request because it was cancelled. */
+class AgentRequestCancelledException(message: String) : IllegalStateException(message)
+
 data class SessionSummary(
     val sessionId: String,
     val title: String,
     val cwd: String,
     val createdAt: String? = null,
     val updatedAt: String? = null,
-    val messageCount: Int = 0,
+    /** Null when the backend's list API does not return a cheap message count. */
+    val messageCount: Int? = null,
     val modelId: String? = null,
 )
 
@@ -47,7 +77,9 @@ sealed class ConnectionState {
 
 sealed class AgentEvent {
     data class ConnectionChanged(val state: ConnectionState) : AgentEvent()
-    data class UserDelta(val text: String) : AgentEvent()
+    data class SlashCommandsChanged(val commands: List<SlashCommand>) : AgentEvent()
+    data class UsageChanged(val usage: AgentUsage) : AgentEvent()
+    data class UserDelta(val text: String, val promptIndex: Long? = null) : AgentEvent()
     data class AssistantDelta(val text: String) : AgentEvent()
     data class ThoughtDelta(val text: String) : AgentEvent()
     data class ToolCall(
@@ -79,6 +111,8 @@ interface AgentBackend {
     )
     suspend fun disconnect()
     suspend fun sendPrompt(text: String)
+    /** Sends ACP's session-scoped cancellation notification for the active turn. */
+    suspend fun cancelCurrentRequest(): Boolean
     fun events(): kotlinx.coroutines.flow.Flow<AgentEvent>
     fun isConnected(): Boolean
 }

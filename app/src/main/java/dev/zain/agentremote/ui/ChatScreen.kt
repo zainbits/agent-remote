@@ -30,15 +30,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -60,10 +65,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.zain.agentremote.ChatUiState
+import dev.zain.agentremote.CommandOutputState
 import dev.zain.agentremote.agent.ChatMessage
 import dev.zain.agentremote.agent.ChatRole
 import dev.zain.agentremote.agent.ConnectionState
+import dev.zain.agentremote.agent.SlashCommand
+import dev.zain.agentremote.agent.SlashCommandSource
 import dev.zain.agentremote.data.NetworkProfile
+import dev.zain.agentremote.data.displayName
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -71,7 +80,11 @@ fun ChatScreen(
     state: ChatUiState,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
+    onCancel: () -> Unit,
+    onSelectSlashCommand: (SlashCommand) -> Unit,
+    onDismissCommandOutput: () -> Unit,
     onDisconnect: () -> Unit,
+    onReconnect: () -> Unit,
     onBack: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
@@ -101,7 +114,7 @@ fun ChatScreen(
                         )
                         Text(
                             text = buildString {
-                                append(state.statusLine)
+                                append(if (state.cancellationRequested) "Stopping…" else state.statusLine)
                                 append(" · ")
                                 append(
                                     when (state.settings.networkProfile) {
@@ -138,6 +151,20 @@ fun ChatScreen(
                     if (connected) {
                         IconButton(onClick = onDisconnect) {
                             Icon(Icons.Default.LinkOff, contentDescription = "Disconnect")
+                        }
+                    } else if (state.canReconnect) {
+                        IconButton(
+                            onClick = onReconnect,
+                            enabled = !state.reconnecting,
+                        ) {
+                            Icon(
+                                Icons.Default.Link,
+                                contentDescription = if (state.reconnecting) {
+                                    "Reconnecting"
+                                } else {
+                                    "Reconnect"
+                                },
+                            )
                         }
                     }
                     IconButton(onClick = onOpenSettings) {
@@ -181,6 +208,31 @@ fun ChatScreen(
                 }
             }
 
+            state.commandOutput?.let { output ->
+                CommandOutputPanel(
+                    output = output,
+                    onClose = onDismissCommandOutput,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp),
+                )
+            }
+
+            SlashCommandSuggestions(
+                draft = state.draft,
+                commands = state.slashCommands,
+                agentName = state.settings.backendKind.displayName,
+                onSelect = onSelectSlashCommand,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
+            )
+
+            val commandName = slashCommandName(state.draft)
+            val isLocalCommand = state.slashCommands.any {
+                it.source == SlashCommandSource.APP && it.name.equals(commandName, ignoreCase = true)
+            }
+            val canSendWhileBusy = commandName == "stop" || commandName == "cancel"
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -196,15 +248,209 @@ fun ChatScreen(
                     maxLines = 6,
                     enabled = !state.busy || connected,
                 )
+                if (state.requestInFlight) {
+                    FilledIconButton(
+                        onClick = onCancel,
+                        enabled = !state.cancellationRequested,
+                    ) {
+                        Icon(
+                            Icons.Default.Stop,
+                            contentDescription = if (state.cancellationRequested) {
+                                "Stopping request"
+                            } else {
+                                "Stop request"
+                            },
+                        )
+                    }
+                }
                 FilledIconButton(
                     onClick = onSend,
-                    enabled = state.draft.isNotBlank() && connected && !state.busy,
+                    enabled = state.draft.isNotBlank() &&
+                        (connected || isLocalCommand) &&
+                        (!state.busy || canSendWhileBusy),
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
                 }
             }
         }
     }
+}
+
+@Composable
+private fun CommandOutputPanel(
+    output: CommandOutputState,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val scrollState = rememberScrollState()
+    LaunchedEffect(output.body.length) {
+        scrollState.animateScrollTo(scrollState.maxValue)
+    }
+    val containerColor = if (output.isError) {
+        MaterialTheme.colorScheme.errorContainer
+    } else {
+        MaterialTheme.colorScheme.surfaceContainerHigh
+    }
+    val contentColor = if (output.isError) {
+        MaterialTheme.colorScheme.onErrorContainer
+    } else {
+        MaterialTheme.colorScheme.onSurface
+    }
+
+    Surface(
+        modifier = modifier,
+        color = containerColor,
+        contentColor = contentColor,
+        shape = MaterialTheme.shapes.large,
+        tonalElevation = 3.dp,
+    ) {
+        Column(modifier = Modifier.padding(start = 14.dp, top = 8.dp, end = 6.dp, bottom = 12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "/${output.command}",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontFamily = FontFamily.Monospace,
+                    modifier = Modifier.weight(1f),
+                )
+                if (output.running) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                    )
+                }
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Default.Close, contentDescription = "Close command output")
+                }
+            }
+
+            output.progress?.let { progress ->
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(end = 8.dp, bottom = 8.dp),
+                )
+            }
+
+            output.status?.let { status ->
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (output.isError) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.primary
+                    },
+                    modifier = Modifier.padding(end = 8.dp, bottom = 6.dp),
+                )
+            }
+
+            if (output.body.isNotBlank()) {
+                MarkdownText(
+                    markdown = output.body,
+                    streaming = output.running,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 260.dp)
+                        .verticalScroll(scrollState)
+                        .padding(end = 8.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SlashCommandSuggestions(
+    draft: String,
+    commands: List<SlashCommand>,
+    agentName: String,
+    onSelect: (SlashCommand) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val matchingCommands = matchingSlashCommands(draft, commands)
+    if (matchingCommands.isEmpty()) return
+
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        shape = MaterialTheme.shapes.medium,
+        modifier = modifier.padding(bottom = 4.dp),
+        tonalElevation = 2.dp,
+    ) {
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            matchingCommands.forEach { command ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onSelect(command) }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = buildString {
+                                append("/${command.name}")
+                                command.argumentHint?.let { append(" <$it>") }
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = command.description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Text(
+                        text = when (command.source) {
+                            SlashCommandSource.APP -> "App"
+                            SlashCommandSource.AGENT -> agentName
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun matchingSlashCommands(
+    draft: String,
+    commands: List<SlashCommand>,
+): List<SlashCommand> {
+    val trimmed = draft.trimStart()
+    if (!trimmed.startsWith('/')) return emptyList()
+    val query = trimmed.drop(1)
+    if (query.any { it.isWhitespace() }) return emptyList()
+
+    return commands
+        .filter { command ->
+            command.name.contains(query, ignoreCase = true) ||
+                command.description.contains(query, ignoreCase = true)
+        }
+        .sortedBy { it.name.lowercase() }
+        .take(6)
+}
+
+private fun slashCommandName(draft: String): String? {
+    val trimmed = draft.trimStart()
+    if (!trimmed.startsWith('/')) return null
+    return trimmed
+        .drop(1)
+        .takeWhile { !it.isWhitespace() }
+        .lowercase()
+        .ifBlank { null }
 }
 
 @Composable

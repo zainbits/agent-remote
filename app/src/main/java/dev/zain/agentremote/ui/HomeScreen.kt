@@ -14,8 +14,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -23,6 +25,8 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -34,7 +38,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.zain.agentremote.ChatUiState
 import dev.zain.agentremote.agent.SessionSummary
+import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
+import dev.zain.agentremote.data.displayName
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,20 +49,23 @@ fun HomeScreen(
     onOpenSession: (SessionSummary) -> Unit,
     onNewSession: () -> Unit,
     onRefresh: () -> Unit,
+    onSelectBackend: (BackendKind) -> Unit,
     onOpenSettings: () -> Unit,
+    interactionEnabled: Boolean = true,
 ) {
     val cwd = state.settings.workingDirectory
     val profile = when (state.settings.networkProfile) {
         NetworkProfile.LAN -> "LAN"
         NetworkProfile.TAILNET -> "Tailnet"
     }
+    val backend = state.settings.backendKind
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Column {
-                        Text("AgentRemote")
+                        Text("${backend.displayName} sessions")
                         Text(
                             text = "Project · $cwd  ·  $profile",
                             style = MaterialTheme.typography.labelSmall,
@@ -67,18 +76,38 @@ fun HomeScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = onRefresh) {
+                    IconButton(onClick = onRefresh, enabled = interactionEnabled) {
                         Icon(Icons.Default.Refresh, contentDescription = "Refresh sessions")
                     }
-                    IconButton(onClick = onOpenSettings) {
+                    IconButton(onClick = onOpenSettings, enabled = interactionEnabled) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
                 },
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = onNewSession) {
+            FloatingActionButton(
+                onClick = { if (interactionEnabled) onNewSession() },
+            ) {
                 Icon(Icons.Default.Add, contentDescription = "New chat")
+            }
+        },
+        bottomBar = {
+            NavigationBar {
+                NavigationBarItem(
+                    selected = backend == BackendKind.GROK_BUILD,
+                    onClick = { onSelectBackend(BackendKind.GROK_BUILD) },
+                    enabled = interactionEnabled,
+                    icon = { Icon(Icons.Default.SmartToy, contentDescription = null) },
+                    label = { Text("Grok") },
+                )
+                NavigationBarItem(
+                    selected = backend == BackendKind.CODEX,
+                    onClick = { onSelectBackend(BackendKind.CODEX) },
+                    enabled = interactionEnabled,
+                    icon = { Icon(Icons.Default.Code, contentDescription = null) },
+                    label = { Text("Codex") },
+                )
             }
         },
     ) { padding ->
@@ -138,7 +167,8 @@ fun HomeScreen(
                 item {
                     Text(
                         "No sessions for this directory yet.\n" +
-                            "Tap + for a new chat, or run grokserve on the host.",
+                            "Tap + for a new chat, or start the ${backend.displayName} " +
+                            "host service.",
                         modifier = Modifier.padding(12.dp),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -146,7 +176,11 @@ fun HomeScreen(
             }
 
             items(state.sessions, key = { it.sessionId }) { session ->
-                SessionRow(session = session, onClick = { onOpenSession(session) })
+                SessionRow(
+                    session = session,
+                    interactionEnabled = interactionEnabled,
+                    onClick = { onOpenSession(session) },
+                )
             }
 
             item { Spacer(Modifier.height(72.dp)) }
@@ -155,11 +189,15 @@ fun HomeScreen(
 }
 
 @Composable
-private fun SessionRow(session: SessionSummary, onClick: () -> Unit) {
+private fun SessionRow(
+    session: SessionSummary,
+    interactionEnabled: Boolean,
+    onClick: () -> Unit,
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable(enabled = interactionEnabled, onClick = onClick),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
         ),
@@ -183,7 +221,15 @@ private fun SessionRow(session: SessionSummary, onClick: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    text = "${session.messageCount} msgs · ${session.sessionId.take(8)}…",
+                    text = session.messageCount?.let { count ->
+                        buildString {
+                            append(count)
+                            append(if (count == 1) " msg" else " msgs")
+                            append(" · ")
+                            append(session.sessionId.take(8))
+                            append('…')
+                        }
+                    } ?: "${session.sessionId.take(8)}…",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

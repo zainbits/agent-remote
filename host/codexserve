@@ -1,0 +1,23 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+CODEX_AGENT_BIND="${CODEX_AGENT_BIND:-0.0.0.0:2430}"
+CODEX_AGENT_TOKEN_FILE="${CODEX_AGENT_TOKEN_FILE:-$HOME/.codex/agentremote.token}"
+
+mkdir -p "${CODEX_AGENT_TOKEN_FILE:h}"
+if [[ ! -s "$CODEX_AGENT_TOKEN_FILE" ]]; then
+    umask 077
+    python3 -c 'import secrets; print(secrets.token_hex(32))' > "$CODEX_AGENT_TOKEN_FILE"
+fi
+chmod 600 "$CODEX_AGENT_TOKEN_FILE"
+
+print "Codex app-server: ws://$CODEX_AGENT_BIND"
+print "Bearer token file: $CODEX_AGENT_TOKEN_FILE"
+print "Copy that file's contents into AgentsRemote Settings → Codex bearer token."
+
+exec codex app-server \
+    --listen "ws://$CODEX_AGENT_BIND" \
+    --ws-auth capability-token \
+    --ws-token-file "$CODEX_AGENT_TOKEN_FILE" \
+    "$@"

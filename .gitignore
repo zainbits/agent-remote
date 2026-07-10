@@ -16,6 +16,10 @@ build/
 */build/
 local.properties
 
+# Python host helper
+__pycache__/
+*.py[cod]
+
 # Android NDK / native
 .externalNativeBuild/
 .cxx/

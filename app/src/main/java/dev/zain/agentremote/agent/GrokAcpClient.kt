@@ -6,6 +6,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -37,17 +38,25 @@ class GrokAcpClient : AgentBackend {
     override val name: String = "Grok Build"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val incomingMessages = Channel<IncomingMessage>(Channel.UNLIMITED)
     private val nextId = AtomicLong(1)
     private val connected = AtomicBoolean(false)
+    private val connectionGeneration = AtomicLong(0)
+    private val connectionLock = Any()
 
     private val http = OkHttpClient.Builder()
-        .pingInterval(20, TimeUnit.SECONDS)
+        .pingInterval(30, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .connectTimeout(15, TimeUnit.SECONDS)
         .build()
 
+    @Volatile
     private var socket: WebSocket? = null
+
+    @Volatile
     private var sessionId: String? = null
+
+    private var opening: CompletableDeferred<Unit>? = null
     private var workingDirectory: String = "/home/user"
 
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<JSONObject>>()
@@ -57,22 +66,41 @@ class GrokAcpClient : AgentBackend {
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
+    init {
+        // Preserve WebSocket frame order so the prompt response cannot overtake
+        // its final streamed delta and send command output into the chat thread.
+        scope.launch {
+            for (incoming in incomingMessages) {
+                if (isCurrentConnection(incoming.generation)) {
+                    handleMessage(incoming.text)
+                }
+            }
+        }
+    }
+
     override fun events(): Flow<AgentEvent> = events.asSharedFlow()
 
     override fun isConnected(): Boolean = connected.get() && sessionId != null
 
     override suspend fun connectNew(baseUrl: String, secret: String, workingDirectory: String) {
-        openAndInitialize(baseUrl, secret, workingDirectory)
-        val newSession = requestRpc(
-            method = "session/new",
-            params = JSONObject()
-                .put("cwd", this.workingDirectory)
-                .put("mcpServers", JSONArray()),
-        )
-        val sid = newSession.optString("sessionId").ifBlank {
-            error("session/new returned no sessionId")
+        val generation = openAndInitialize(baseUrl, secret, workingDirectory)
+        try {
+            val newSession = requestRpc(
+                method = "session/new",
+                params = JSONObject()
+                    .put("cwd", this.workingDirectory)
+                    .put("mcpServers", JSONArray()),
+            )
+            check(isCurrentConnection(generation)) { "Connection was replaced" }
+            val sid = newSession.optString("sessionId").ifBlank {
+                error("session/new returned no sessionId")
+            }
+            emitModelUsage(newSession.optJSONObject("models"))
+            finishConnected(sid, generation)
+        } catch (t: Throwable) {
+            disconnectQuiet(expectedGeneration = generation)
+            throw t
         }
-        finishConnected(sid)
     }
 
     override suspend fun connectLoad(
@@ -81,68 +109,90 @@ class GrokAcpClient : AgentBackend {
         workingDirectory: String,
         sessionId: String,
     ) {
-        openAndInitialize(baseUrl, secret, workingDirectory)
-        requestRpc(
-            method = "session/load",
-            params = JSONObject()
-                .put("sessionId", sessionId)
-                .put("cwd", this.workingDirectory)
-                .put("mcpServers", JSONArray()),
-        )
-        // session/load may put sessionId in result._meta or use the requested id
-        finishConnected(sessionId)
-        events.emit(AgentEvent.TurnComplete(stopReason = "loaded"))
+        val generation = openAndInitialize(baseUrl, secret, workingDirectory)
+        try {
+            val loadedSession = requestRpc(
+                method = "session/load",
+                params = JSONObject()
+                    .put("sessionId", sessionId)
+                    .put("cwd", this.workingDirectory)
+                    .put("mcpServers", JSONArray()),
+            )
+            check(isCurrentConnection(generation)) { "Connection was replaced" }
+            emitModelUsage(loadedSession.optJSONObject("models"))
+            // session/load may put sessionId in result._meta or use the requested id
+            finishConnected(sessionId, generation)
+            events.emit(AgentEvent.TurnComplete(stopReason = "loaded"))
+        } catch (t: Throwable) {
+            disconnectQuiet(expectedGeneration = generation)
+            throw t
+        }
     }
 
     private suspend fun openAndInitialize(
         baseUrl: String,
         secret: String,
         workingDirectory: String,
-    ) {
-        disconnectQuiet()
+    ): Long {
         this.workingDirectory = workingDirectory.ifBlank { "/home/user" }
 
         val url = buildWebSocketUrl(baseUrl, secret)
-        events.emit(AgentEvent.ConnectionChanged(ConnectionState.Connecting))
-
-        val opened = CompletableDeferred<Unit>()
-
         val request = Request.Builder().url(url).build()
+        val opened = CompletableDeferred<Unit>()
+        val generation = beginConnection(opened)
+
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                opened.complete(Unit)
+                synchronized(connectionLock) {
+                    if (!isCurrentConnection(generation) || opening !== opened) return
+                    opening = null
+                    opened.complete(Unit)
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                scope.launch { handleMessage(text) }
+                if (isCurrentConnection(generation)) {
+                    incomingMessages.trySend(IncomingMessage(generation, text))
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!opened.isCompleted) {
-                    opened.completeExceptionally(t)
-                }
-                scope.launch {
-                    connected.set(false)
-                    sessionId = null
-                    failAllPending(t)
-                    events.emit(
-                        AgentEvent.ConnectionChanged(
-                            ConnectionState.Error(t.message ?: "WebSocket failure"),
-                        ),
-                    )
-                }
+                retireConnection(
+                    generation = generation,
+                    cause = t,
+                    state = ConnectionState.Error(t.message ?: "WebSocket failure"),
+                    opened = opened,
+                )
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                scope.launch {
-                    connected.set(false)
-                    sessionId = null
-                    events.emit(AgentEvent.ConnectionChanged(ConnectionState.Disconnected))
-                }
+                retireConnection(
+                    generation = generation,
+                    cause = IllegalStateException("WebSocket closed ($code)"),
+                    state = ConnectionState.Disconnected,
+                    opened = opened,
+                )
             }
         }
 
-        socket = http.newWebSocket(request, listener)
+        val newSocket = try {
+            http.newWebSocket(request, listener)
+        } catch (t: Throwable) {
+            disconnectQuiet(expectedGeneration = generation)
+            throw t
+        }
+        val accepted = synchronized(connectionLock) {
+            if (isCurrentConnection(generation)) {
+                socket = newSocket
+                true
+            } else {
+                false
+            }
+        }
+        if (!accepted) {
+            newSocket.cancel()
+            error("Connection was replaced")
+        }
 
         try {
             withTimeout(20_000) { opened.await() }
@@ -153,9 +203,10 @@ class GrokAcpClient : AgentBackend {
                     .put("protocolVersion", 1)
                     .put(
                         "clientCapabilities",
-                        JSONObject()
-                            .put("fs", JSONObject().put("readTextFile", true).put("writeTextFile", true))
-                            .put("terminal", true),
+                        // AgentRemote is a remote UI for the host workspace. An empty
+                        // capability object keeps filesystem and terminal execution on
+                        // the Grok host instead of delegating it to the Android client.
+                        JSONObject(),
                     )
                     .put(
                         "clientInfo",
@@ -165,6 +216,7 @@ class GrokAcpClient : AgentBackend {
                             .put("version", "0.1.0"),
                     ),
             )
+            check(isCurrentConnection(generation)) { "Connection was replaced" }
 
             // Prefer host-reported cwd when settings left blank-ish, but keep client cwd for session.
             val meta = initResult.optJSONObject("_meta")
@@ -172,6 +224,12 @@ class GrokAcpClient : AgentBackend {
             if (this.workingDirectory.isBlank() && hostCwd.isNotBlank()) {
                 this.workingDirectory = hostCwd
             }
+            events.emit(
+                AgentEvent.SlashCommandsChanged(
+                    parseAvailableCommands(meta?.optJSONArray("availableCommands")),
+                ),
+            )
+            emitModelUsage(meta?.optJSONObject("modelState"))
 
             val caps = initResult.optJSONObject("agentCapabilities")
             // loadSession is checked by callers of connectLoad; new always works.
@@ -179,37 +237,94 @@ class GrokAcpClient : AgentBackend {
                 // still allow new sessions
             }
         } catch (t: Throwable) {
-            disconnectQuiet()
-            events.emit(
+            disconnectQuiet(expectedGeneration = generation)
+            throw t
+        }
+        return generation
+    }
+
+    private fun finishConnected(sid: String, generation: Long) {
+        synchronized(connectionLock) {
+            check(isCurrentConnection(generation)) { "Connection was replaced" }
+            sessionId = sid
+            connected.set(true)
+            events.tryEmit(
                 AgentEvent.ConnectionChanged(
-                    ConnectionState.Error(t.message ?: "Failed to connect"),
+                    ConnectionState.Connected(sessionId = sid, cwd = workingDirectory),
                 ),
             )
-            throw t
         }
     }
 
-    private suspend fun finishConnected(sid: String) {
-        sessionId = sid
-        connected.set(true)
-        events.emit(
-            AgentEvent.ConnectionChanged(
-                ConnectionState.Connected(sessionId = sid, cwd = workingDirectory),
-            ),
-        )
-    }
-
     override suspend fun disconnect() {
-        disconnectQuiet()
-        events.emit(AgentEvent.ConnectionChanged(ConnectionState.Disconnected))
+        disconnectQuiet(notify = true)
     }
 
-    private fun disconnectQuiet() {
-        connected.set(false)
-        sessionId = null
-        failAllPending(IllegalStateException("Disconnected"))
-        socket?.close(1000, "client disconnect")
-        socket = null
+    private fun beginConnection(opened: CompletableDeferred<Unit>): Long {
+        val oldSocket: WebSocket?
+        val generation: Long
+        synchronized(connectionLock) {
+            generation = connectionGeneration.incrementAndGet()
+            connected.set(false)
+            sessionId = null
+            opening?.completeExceptionally(IllegalStateException("Connection was replaced"))
+            opening = opened
+            failAllPending(IllegalStateException("Connection was replaced"))
+            oldSocket = socket
+            socket = null
+            events.tryEmit(AgentEvent.ConnectionChanged(ConnectionState.Connecting))
+        }
+        closeSocketQuietly(oldSocket)
+        return generation
+    }
+
+    private fun retireConnection(
+        generation: Long,
+        cause: Throwable,
+        state: ConnectionState,
+        opened: CompletableDeferred<Unit>,
+    ) {
+        synchronized(connectionLock) {
+            if (!isCurrentConnection(generation)) return
+            connectionGeneration.incrementAndGet()
+            connected.set(false)
+            sessionId = null
+            socket = null
+            if (opening === opened) {
+                opening = null
+                opened.completeExceptionally(cause)
+            }
+            failAllPending(cause)
+            events.tryEmit(AgentEvent.ConnectionChanged(state))
+        }
+    }
+
+    private fun disconnectQuiet(
+        notify: Boolean = false,
+        expectedGeneration: Long? = null,
+    ) {
+        val oldSocket: WebSocket?
+        synchronized(connectionLock) {
+            if (expectedGeneration != null && !isCurrentConnection(expectedGeneration)) return
+            connectionGeneration.incrementAndGet()
+            connected.set(false)
+            sessionId = null
+            opening?.completeExceptionally(IllegalStateException("Disconnected"))
+            opening = null
+            failAllPending(IllegalStateException("Disconnected"))
+            oldSocket = socket
+            socket = null
+            if (notify) {
+                events.tryEmit(AgentEvent.ConnectionChanged(ConnectionState.Disconnected))
+            }
+        }
+        closeSocketQuietly(oldSocket)
+    }
+
+    private fun closeSocketQuietly(webSocket: WebSocket?) {
+        if (webSocket != null && !webSocket.close(1000, "client disconnect")) {
+            webSocket.cancel()
+        }
     }
 
     override suspend fun sendPrompt(text: String) {
@@ -219,13 +334,26 @@ class GrokAcpClient : AgentBackend {
                 .put("type", "text")
                 .put("text", text),
         )
-        requestRpc(
+        val result = requestRpc(
             method = "session/prompt",
             params = JSONObject()
                 .put("sessionId", sid)
                 .put("prompt", prompt),
         )
-        events.emit(AgentEvent.TurnComplete(stopReason = null))
+        events.emit(
+            AgentEvent.TurnComplete(
+                stopReason = result.optString("stopReason").ifBlank { null },
+            ),
+        )
+    }
+
+    override suspend fun cancelCurrentRequest(): Boolean {
+        val sid = sessionId ?: return false
+        sendNotification(
+            method = "session/cancel",
+            params = JSONObject().put("sessionId", sid),
+        )
+        return true
     }
 
     private suspend fun handleMessage(raw: String) {
@@ -240,9 +368,13 @@ class GrokAcpClient : AgentBackend {
                 val deferred = pending.remove(id)
                 if (msg.has("error")) {
                     val err = msg.getJSONObject("error")
-                    deferred?.completeExceptionally(
-                        IllegalStateException(err.optString("message", "RPC error")),
-                    )
+                    val message = err.optString("message", "RPC error")
+                    val failure = if (err.optInt("code") == REQUEST_CANCELLED_ERROR_CODE) {
+                        AgentRequestCancelledException(message)
+                    } else {
+                        IllegalStateException(message)
+                    }
+                    deferred?.completeExceptionally(failure)
                 } else {
                     deferred?.complete(msg.optJSONObject("result") ?: JSONObject())
                 }
@@ -254,7 +386,11 @@ class GrokAcpClient : AgentBackend {
                     "session/request_permission" -> autoApprovePermission(msg)
                     else -> {
                         if (msg.has("id")) {
-                            respond(msg.getLong("id"), JSONObject())
+                            respondError(
+                                id = msg.getLong("id"),
+                                code = METHOD_NOT_FOUND_ERROR_CODE,
+                                message = "Method not supported by AgentRemote: ${msg.optString("method")}",
+                            )
                         }
                     }
                 }
@@ -265,10 +401,24 @@ class GrokAcpClient : AgentBackend {
     private suspend fun handleSessionUpdate(params: JSONObject?) {
         if (params == null) return
         val update = params.optJSONObject("update") ?: return
+        emitUsage(update, params.optJSONObject("_meta"))
         when (update.optString("sessionUpdate")) {
+            "available_commands_update" -> {
+                events.emit(
+                    AgentEvent.SlashCommandsChanged(
+                        parseAvailableCommands(update.optJSONArray("availableCommands")),
+                    ),
+                )
+            }
+
             "user_message_chunk" -> {
                 val text = update.optJSONObject("content")?.optString("text").orEmpty()
-                if (text.isNotEmpty()) events.emit(AgentEvent.UserDelta(text))
+                val promptIndex = update.optJSONObject("_meta")
+                    ?.takeIf { it.has("promptIndex") && !it.isNull("promptIndex") }
+                    ?.optLong("promptIndex")
+                if (text.isNotEmpty()) {
+                    events.emit(AgentEvent.UserDelta(text, promptIndex = promptIndex))
+                }
             }
 
             "agent_message_chunk" -> {
@@ -322,6 +472,73 @@ class GrokAcpClient : AgentBackend {
                 }
             }
         }
+    }
+
+    /**
+     * Grok 0.2.93 reports current context use in each notification's custom
+     * `params._meta.totalTokens`. Newer ACP agents can instead use the standard
+     * `usage_update` shape, so accept both.
+     */
+    private suspend fun emitUsage(update: JSONObject, notificationMeta: JSONObject?) {
+        val isStandardUsage = update.optString("sessionUpdate") == "usage_update"
+        val hasCustomTotal = notificationMeta?.has("totalTokens") == true &&
+            !notificationMeta.isNull("totalTokens")
+        val cost = if (isStandardUsage) update.optJSONObject("cost") else null
+
+        if (!isStandardUsage && !hasCustomTotal) return
+
+        events.emit(
+            AgentEvent.UsageChanged(
+                AgentUsage(
+                    usedTokens = when {
+                        isStandardUsage && update.has("used") && !update.isNull("used") ->
+                            update.optLong("used")
+                        hasCustomTotal -> notificationMeta.optLong("totalTokens")
+                        else -> null
+                    },
+                    contextWindowTokens = if (
+                        isStandardUsage && update.has("size") && !update.isNull("size")
+                    ) {
+                        update.optLong("size")
+                    } else {
+                        null
+                    },
+                    costAmount = cost?.takeIf { it.has("amount") && !it.isNull("amount") }
+                        ?.optDouble("amount"),
+                    costCurrency = cost?.optString("currency")?.ifBlank { null },
+                ),
+            ),
+        )
+    }
+
+    private suspend fun emitModelUsage(modelState: JSONObject?) {
+        if (modelState == null) return
+        val currentModelId = modelState.optString("currentModelId").ifBlank { null }
+        val availableModels = modelState.optJSONArray("availableModels")
+        val currentModel = availableModels?.let { models ->
+            (0 until models.length())
+                .asSequence()
+                .mapNotNull { index -> models.optJSONObject(index) }
+                .firstOrNull { model ->
+                    currentModelId == null || model.optString("modelId") == currentModelId
+                }
+        }
+        val contextSize = currentModel
+            ?.optJSONObject("_meta")
+            ?.takeIf { it.has("totalContextTokens") && !it.isNull("totalContextTokens") }
+            ?.optLong("totalContextTokens")
+
+        if (currentModelId == null && currentModel == null && contextSize == null) return
+
+        events.emit(
+            AgentEvent.UsageChanged(
+                AgentUsage(
+                    contextWindowTokens = contextSize,
+                    modelId = currentModelId ?: currentModel?.optString("modelId")?.ifBlank { null },
+                    modelName = currentModel?.optString("name")?.ifBlank { null },
+                ),
+            ),
+        )
     }
 
     private fun toolKind(update: JSONObject): String? {
@@ -460,6 +677,14 @@ class GrokAcpClient : AgentBackend {
         }
     }
 
+    private suspend fun sendNotification(method: String, params: JSONObject) {
+        val payload = JSONObject()
+            .put("jsonrpc", "2.0")
+            .put("method", method)
+            .put("params", params)
+        sendRaw(encodeJson(payload))
+    }
+
     private suspend fun respond(id: Long, result: JSONObject) {
         val payload = JSONObject()
             .put("jsonrpc", "2.0")
@@ -468,10 +693,45 @@ class GrokAcpClient : AgentBackend {
         sendRaw(encodeJson(payload))
     }
 
+    private suspend fun respondError(id: Long, code: Int, message: String) {
+        val payload = JSONObject()
+            .put("jsonrpc", "2.0")
+            .put("id", id)
+            .put(
+                "error",
+                JSONObject()
+                    .put("code", code)
+                    .put("message", message),
+            )
+        sendRaw(encodeJson(payload))
+    }
+
     private suspend fun sendRaw(text: String) = withContext(Dispatchers.IO) {
-        val ws = socket ?: error("Socket not open")
+        val ws = synchronized(connectionLock) { socket } ?: error("Socket not open")
         if (!ws.send(text)) {
             error("Failed to enqueue WebSocket frame")
+        }
+    }
+
+    private fun parseAvailableCommands(rawCommands: JSONArray?): List<SlashCommand> {
+        if (rawCommands == null) return emptyList()
+        return buildList {
+            for (index in 0 until rawCommands.length()) {
+                val raw = rawCommands.optJSONObject(index) ?: continue
+                val name = raw.optString("name")
+                    .trim()
+                    .removePrefix("/")
+                if (name.isBlank()) continue
+                add(
+                    SlashCommand(
+                        name = name,
+                        description = raw.optString("description").ifBlank { "Run /$name" },
+                        argumentHint = raw.optJSONObject("input")
+                            ?.optString("hint")
+                            ?.ifBlank { null },
+                    ),
+                )
+            }
         }
     }
 
@@ -489,12 +749,24 @@ class GrokAcpClient : AgentBackend {
     }
 
     fun shutdown() {
+        disconnectQuiet()
+        incomingMessages.close()
         scope.cancel()
-        socket?.cancel()
         http.dispatcher.executorService.shutdown()
     }
 
+    private fun isCurrentConnection(generation: Long): Boolean =
+        connectionGeneration.get() == generation
+
+    private data class IncomingMessage(
+        val generation: Long,
+        val text: String,
+    )
+
     companion object {
+        private const val METHOD_NOT_FOUND_ERROR_CODE = -32601
+        private const val REQUEST_CANCELLED_ERROR_CODE = -32800
+
         fun buildWebSocketUrl(baseUrl: String, secret: String): String {
             var url = baseUrl.trim().trimEnd('/')
             if (url.startsWith("http://")) url = "ws://" + url.removePrefix("http://")
