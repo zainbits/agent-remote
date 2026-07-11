@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -13,10 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import LegacyCatalog
+from .metadata import MetadataProvider
 from .store import ConflictError, JobStore, NotFoundError
 
 
 MAX_DETAIL_CHARS = 16_000
+LOGGER = logging.getLogger("agentremote.host.manager")
 
 
 def _text(value: Any) -> str:
@@ -93,10 +96,12 @@ class JobManager:
         max_workers: int = 4,
         codex_bin: str | None = None,
         grok_bin: str | None = None,
+        metadata: MetadataProvider | None = None,
     ):
         self.store = store
         self.codex_bin = codex_bin or os.environ.get("AGENTREMOTE_CODEX_BIN", "codex")
         self.grok_bin = grok_bin or os.environ.get("AGENTREMOTE_GROK_BIN", "grok")
+        self.metadata = metadata or MetadataProvider(grok_bin=self.grok_bin)
         self.executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="agent-job")
         self._lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen[str]] = {}
@@ -119,8 +124,9 @@ class JobManager:
 
     def create_session(self, backend: str, cwd: str) -> dict[str, Any]:
         session = self.store.create_session(backend, cwd)
+        self._refresh_metadata(session["id"])
         self.notify(session["id"])
-        return session
+        return self.store.get_session(session["id"])
 
     def list_sessions(self, backend: str, cwd: str, limit: int = 50) -> list[dict[str, Any]]:
         if self.import_legacy:
@@ -130,7 +136,14 @@ class JobManager:
     def session_bundle(self, session_id: str) -> dict[str, Any]:
         if self.import_legacy:
             self.catalog.import_history_if_needed(session_id)
-        return self.store.session_bundle(session_id)
+        self._refresh_metadata(session_id)
+        bundle = self.store.session_bundle(session_id)
+        bundle["commands"] = self.metadata.commands_for(bundle["session"]["backend"])
+        return bundle
+
+    def command_catalog(self, session_id: str) -> list[dict[str, Any]]:
+        session = self.store.get_session(session_id)
+        return self.metadata.commands_for(session["backend"])
 
     def start_turn(self, session_id: str, prompt: str) -> dict[str, Any]:
         turn = self.store.create_turn(session_id, prompt)
@@ -248,6 +261,14 @@ class JobManager:
             command[1:1] = ["--resume", backend_id]
         return command
 
+    @staticmethod
+    def _effective_grok_prompt(prompt: str) -> str:
+        # Grok's headless `/context` completes without a text event. `/session-info`
+        # is the equivalent non-interactive report and includes live token counts.
+        if prompt.strip().lower() in {"/context", "/usage"}:
+            return "/session-info"
+        return prompt
+
     def _run_turn(self, turn_id: str) -> None:
         turn = self.store.get_turn(turn_id)
         if turn["status"] != "queued" or turn["cancellationRequested"]:
@@ -260,6 +281,7 @@ class JobManager:
         stderr_parts: list[str] = []
         terminal_error: str | None = None
         stop_reason: str | None = None
+        compact_completed = False
         try:
             if session["backend"] == "grok":
                 descriptor, prompt_path = tempfile.mkstemp(
@@ -269,7 +291,7 @@ class JobManager:
                     text=True,
                 )
                 with os.fdopen(descriptor, "w", encoding="utf-8") as prompt_file:
-                    prompt_file.write(turn["prompt"])
+                    prompt_file.write(self._effective_grok_prompt(turn["prompt"]))
             command = self._command(session, turn["prompt"], prompt_path)
             process = subprocess.Popen(
                 command,
@@ -323,6 +345,8 @@ class JobManager:
                     stop_reason = result["stopReason"]
                 if result.get("error"):
                     terminal_error = result["error"]
+                if result.get("compactCompleted"):
+                    compact_completed = True
 
             return_code = process.wait()
             stderr_thread.join(timeout=1.0)
@@ -336,6 +360,13 @@ class JobManager:
                 error = self._stderr_message(stderr_parts, return_code)
                 self.store.finish_turn(turn_id, "failed", stop_reason="failed", error=error)
             else:
+                if session["backend"] == "grok":
+                    self._finalize_grok_command(
+                        session["id"],
+                        turn_id,
+                        turn["prompt"],
+                        compact_completed,
+                    )
                 self.store.finish_turn(turn_id, "completed", stop_reason=stop_reason or "completed")
             self.notify(session["id"])
         except FileNotFoundError as error:
@@ -406,7 +437,7 @@ class JobManager:
         turn_id: str,
         messages: _StreamMessages,
         event: dict[str, Any],
-    ) -> dict[str, str | None]:
+    ) -> dict[str, Any]:
         event_type = event.get("type", "")
         if event_type == "thread.started":
             backend_id = str(event.get("thread_id") or "")
@@ -481,7 +512,7 @@ class JobManager:
         turn_id: str,
         messages: _StreamMessages,
         event: dict[str, Any],
-    ) -> dict[str, str | None]:
+    ) -> dict[str, Any]:
         event_type = str(event.get("type") or "")
         if event_type == "thought":
             messages.append("thought", _text(event.get("data")))
@@ -490,14 +521,68 @@ class JobManager:
         elif event_type == "end":
             backend_id = str(event.get("sessionId") or "")
             self.store.set_backend_session_id(session["id"], backend_id)
+            metadata = {
+                "modelId": event.get("modelId"),
+                "usedTokens": event.get("totalTokens"),
+            }
+            if any(value is not None for value in metadata.values()):
+                self.store.update_usage(session["id"], metadata)
             self.notify(session["id"])
             return {"stopReason": str(event.get("stopReason") or "completed"), "error": None}
+        elif event_type == "auto_compact_completed":
+            return {"stopReason": None, "error": None, "compactCompleted": True}
         elif event_type == "error":
             return {
                 "stopReason": "failed",
                 "error": _text(event.get("data") or event.get("message")) or "Grok turn failed.",
             }
         return {"stopReason": None, "error": None}
+
+    def _refresh_metadata(self, session_id: str) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        try:
+            metadata = self.metadata.metadata_for(session)
+            if any(value is not None for value in metadata.values()):
+                session = self.store.update_usage(session_id, metadata)
+                self.notify(session_id)
+        except Exception as error:
+            # Metadata enriches the UI; it must never make a durable turn unavailable.
+            LOGGER.warning("Could not refresh %s metadata: %s", session["backend"], error)
+        return session
+
+    def _finalize_grok_command(
+        self,
+        session_id: str,
+        turn_id: str,
+        prompt: str,
+        compact_completed: bool,
+    ) -> None:
+        command = prompt.strip().split(maxsplit=1)[0].lower() if prompt.strip().startswith("/") else ""
+        assistant_text = self.store.turn_role_text(turn_id, "assistant")
+        if command in {"/context", "/usage", "/session-info"} and assistant_text:
+            parsed = self.metadata.parse_session_info(assistant_text)
+            if parsed:
+                self.store.update_usage(session_id, parsed)
+                self.notify(session_id)
+        session = self._refresh_metadata(session_id)
+        if assistant_text or not command:
+            return
+        if command in {"/context", "/usage", "/session-info"}:
+            report = self.metadata.context_report(session)
+        elif command == "/compact" and compact_completed:
+            report = self.metadata.compact_report(session)
+        elif compact_completed:
+            report = "Conversation history compacted successfully."
+        else:
+            report = f"`{command}` completed successfully without a text report."
+        self.store.append_complete_message(
+            session_id,
+            turn_id,
+            f"{turn_id}:assistant",
+            "assistant",
+            report,
+        )
+        self.notify(session_id)
 
     def shutdown(self) -> None:
         with self._lock:

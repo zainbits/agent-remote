@@ -158,6 +158,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             source = SlashCommandSource.APP,
         ),
         SlashCommand(
+            name = "session-info",
+            description = "Show session details (model, turns, context usage)",
+            source = SlashCommandSource.APP,
+        ),
+        SlashCommand(
             name = "help",
             description = "Show available slash commands",
             source = SlashCommandSource.APP,
@@ -879,6 +884,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 disconnect()
             }
             "context", "usage", "session-info" -> {
+                if (activeBackendKind == BackendKind.GROK_BUILD) return false
                 _ui.update { it.copy(draft = "") }
                 showUsageOutput(command)
             }
@@ -1384,7 +1390,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             if (merged == state.usage) return@update state
             val output = state.commandOutput
             val updatedOutput = if (
-                output != null && output.command in informationCommands
+                output != null && !output.running && output.command in informationCommands
             ) {
                 output.copy(
                     body = usageBody(merged),

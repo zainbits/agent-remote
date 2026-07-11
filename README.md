@@ -103,7 +103,10 @@ Existing Grok and Codex sessions are discovered and adopted automatically. Their
 - Reopening a running session restores persisted history and resumes live observation.
 - **Stop**, `/stop`, and `/cancel` explicitly cancel only the open session's active turn.
 - `/new`, `/clear`, `/home`, and `/disconnect` detach without stopping host work.
-- `/help`, `/context`, and `/usage` remain local app commands.
+- The composer shows the backend's effective model and reasoning effort.
+- Grok built-ins and installed skills populate slash autocomplete; Codex exposes app-local commands only.
+- Grok `/context`, `/usage`, and `/session-info` return durable live usage reports, while Codex renders those reports from its persisted usage state.
+- Silent Grok outcomes such as `/compact` receive a persisted completion report instead of an empty panel.
 
 Concurrent sessions may operate on the same workspace. Their agent contexts are isolated, but filesystem writes are not automatically placed in Git worktrees; avoid assigning conflicting edits to the same checkout simultaneously.
 

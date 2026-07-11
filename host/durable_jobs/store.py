@@ -51,6 +51,13 @@ class JobStore:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
             connection.executescript(schema)
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if "model_name" not in columns:
+                connection.execute("ALTER TABLE sessions ADD COLUMN model_name TEXT")
+            connection.execute("PRAGMA user_version = 2")
         os.chmod(self.database_path, 0o600)
 
     @staticmethod
@@ -82,6 +89,7 @@ class JobStore:
             "status": row["status"],
             "activeTurnId": row["active_turn_id"],
             "modelId": row["model_id"],
+            "modelName": row["model_name"],
             "reasoningEffort": row["reasoning_effort"],
             "usedTokens": row["used_tokens"],
             "contextWindowTokens": row["context_window_tokens"],
@@ -518,6 +526,27 @@ class JobStore:
                 now,
             )
 
+    def turn_role_text(self, turn_id: str, role: str) -> str:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT text FROM messages WHERE turn_id = ? AND role = ? ORDER BY rowid",
+                (turn_id, role),
+            ).fetchall()
+        return "\n".join(str(row["text"] or "") for row in rows).strip()
+
+    def append_complete_message(
+        self,
+        session_id: str,
+        turn_id: str,
+        message_id: str,
+        role: str,
+        text: str,
+    ) -> None:
+        if not text:
+            return
+        self.append_message_delta(session_id, turn_id, message_id, role, text)
+        self.complete_message(message_id)
+
     def upsert_tool(
         self,
         session_id: str,
@@ -559,24 +588,92 @@ class JobStore:
                 now,
             )
 
-    def update_usage(self, session_id: str, usage: dict[str, Any]) -> None:
-        input_tokens = int(usage.get("input_tokens") or usage.get("inputTokens") or 0)
-        output_tokens = int(usage.get("output_tokens") or usage.get("outputTokens") or 0)
-        used_tokens = input_tokens + output_tokens or None
+    def update_usage(self, session_id: str, usage: dict[str, Any]) -> dict[str, Any]:
+        def optional_int(*keys: str) -> int | None:
+            for key in keys:
+                value = usage.get(key)
+                if value is None or isinstance(value, bool):
+                    continue
+                try:
+                    return max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        input_tokens = optional_int("input_tokens", "inputTokens")
+        output_tokens = optional_int("output_tokens", "outputTokens")
+        used_tokens = optional_int("used_tokens", "usedTokens", "totalTokens")
+        if used_tokens is None and (input_tokens is not None or output_tokens is not None):
+            used_tokens = (input_tokens or 0) + (output_tokens or 0)
+        context_window_tokens = optional_int(
+            "context_window_tokens",
+            "contextWindowTokens",
+            "contextSize",
+        )
+        model_id = str(usage.get("model_id") or usage.get("modelId") or "").strip() or None
+        model_name = str(usage.get("model_name") or usage.get("modelName") or "").strip() or None
+        reasoning_effort = str(
+            usage.get("reasoning_effort") or usage.get("reasoningEffort") or ""
+        ).strip() or None
         now = utc_now()
         with self._connect() as connection:
-            connection.execute(
-                "UPDATE sessions SET used_tokens = COALESCE(?, used_tokens), updated_at = ? WHERE id = ?",
-                (used_tokens, now, session_id),
+            current = connection.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if current is None:
+                raise NotFoundError("Session not found")
+            updates = {
+                "model_id": model_id,
+                "model_name": model_name,
+                "reasoning_effort": reasoning_effort,
+                "used_tokens": used_tokens,
+                "context_window_tokens": context_window_tokens,
+            }
+            changed = any(
+                value is not None and value != current[column]
+                for column, value in updates.items()
             )
+            if not changed:
+                return self._session_dict(current)
+            connection.execute(
+                """
+                UPDATE sessions SET
+                    model_id = COALESCE(?, model_id),
+                    model_name = COALESCE(?, model_name),
+                    reasoning_effort = COALESCE(?, reasoning_effort),
+                    used_tokens = COALESCE(?, used_tokens),
+                    context_window_tokens = COALESCE(?, context_window_tokens),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    model_id,
+                    model_name,
+                    reasoning_effort,
+                    used_tokens,
+                    context_window_tokens,
+                    now,
+                    session_id,
+                ),
+            )
+            row = connection.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("Session not found")
+            merged = self._session_dict(row)
             self._event(
                 connection,
                 session_id,
                 None,
                 "usage.updated",
-                {"usedTokens": used_tokens, "raw": usage},
+                {
+                    "modelId": merged["modelId"],
+                    "modelName": merged["modelName"],
+                    "reasoningEffort": merged["reasoningEffort"],
+                    "usedTokens": merged["usedTokens"],
+                    "contextWindowTokens": merged["contextWindowTokens"],
+                    "raw": usage,
+                },
                 now,
             )
+        return merged
 
     def request_cancellation(self, session_id: str) -> dict[str, Any] | None:
         now = utc_now()

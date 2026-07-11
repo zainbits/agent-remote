@@ -101,6 +101,12 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
                     self.server.manager.session_bundle(route[3]),
                 )
                 return
+            if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "commands":
+                self._send(
+                    HTTPStatus.OK,
+                    {"commands": self.server.manager.command_catalog(route[3])},
+                )
+                return
             if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "events":
                 after = int(query.get("after", ["0"])[0])
                 wait = float(query.get("wait", ["0"])[0])

@@ -99,8 +99,10 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                 ?: error("Durable host returned no session")
             finishConnection(session, connectionGeneration)
             val bundle = request(method = "GET", path = "/api/v1/sessions/${encodePath(sessionId!!)}")
+            val currentSession = bundle.optJSONObject("session") ?: session
             lastEventId = bundle.optLong("latestEventId", 0L)
-            emitUsage(session)
+            emitUsage(currentSession)
+            emitCommands(bundle.optJSONArray("commands"))
             startPolling(connectionGeneration)
         } catch (error: Throwable) {
             retireConnection(connectionGeneration, error)
@@ -125,6 +127,7 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             finishConnection(session, connectionGeneration)
             replayMessages(bundle.optJSONArray("messages"))
             emitUsage(session)
+            emitCommands(bundle.optJSONArray("commands"))
             lastEventId = bundle.optLong("latestEventId", 0L)
             events.emit(AgentEvent.TurnComplete(stopReason = "loaded"))
             if (session.isActive) events.emit(AgentEvent.TurnStarted)
@@ -310,7 +313,14 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             )
             "usage.updated" -> events.emit(
                 AgentEvent.UsageChanged(
-                    AgentUsage(usedTokens = data.optNullableLong("usedTokens")),
+                    AgentUsage(
+                        usedTokens = data.optNullableLong("usedTokens"),
+                        contextWindowTokens = data.optNullableLong("contextWindowTokens"),
+                        modelId = data.optNullableString("modelId"),
+                        modelName = data.optNullableString("modelName")
+                            ?: data.optNullableString("modelId"),
+                        reasoningEffort = data.optNullableString("reasoningEffort"),
+                    ),
                 ),
             )
             "turn.queued", "turn.started" -> events.emit(AgentEvent.TurnStarted)
@@ -364,10 +374,31 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             usedTokens = session.optNullableLong("usedTokens"),
             contextWindowTokens = session.optNullableLong("contextWindowTokens"),
             modelId = session.optNullableString("modelId"),
-            modelName = session.optNullableString("modelId"),
+            modelName = session.optNullableString("modelName")
+                ?: session.optNullableString("modelId"),
             reasoningEffort = session.optNullableString("reasoningEffort"),
         )
         if (usage != AgentUsage()) events.emit(AgentEvent.UsageChanged(usage))
+    }
+
+    private suspend fun emitCommands(commands: JSONArray?) {
+        if (commands == null) return
+        val parsed = buildList {
+            for (index in 0 until commands.length()) {
+                val command = commands.optJSONObject(index) ?: continue
+                val name = command.optString("name")
+                if (name.isBlank()) continue
+                add(
+                    SlashCommand(
+                        name = name,
+                        description = command.optString("description").ifBlank { "Agent command" },
+                        argumentHint = command.optNullableString("argumentHint"),
+                        source = SlashCommandSource.AGENT,
+                    ),
+                )
+            }
+        }
+        events.emit(AgentEvent.SlashCommandsChanged(parsed))
     }
 
     private suspend fun request(

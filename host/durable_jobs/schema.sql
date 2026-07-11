@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT NOT NULL DEFAULT 'idle',
     active_turn_id TEXT,
     model_id TEXT,
+    model_name TEXT,
     reasoning_effort TEXT,
     used_tokens INTEGER,
     context_window_tokens INTEGER,
@@ -66,4 +67,4 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_session_id
     ON events(session_id, id);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
