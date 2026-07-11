@@ -27,6 +27,7 @@ import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import dev.zain.agentremote.ui.ChatScreen
 import dev.zain.agentremote.ui.HomeScreen
@@ -46,6 +47,13 @@ class MainActivity : ComponentActivity() {
                 val vm: ChatViewModel = viewModel()
                 val state by vm.ui.collectAsState()
                 val nav = rememberNavController()
+                val navEntry by nav.currentBackStackEntryAsState()
+
+                LaunchedEffect(navEntry?.destination?.route, state.screen) {
+                    vm.onSessionListVisibilityChanged(
+                        navEntry?.destination?.route == "main" && state.screen == AppScreen.HOME,
+                    )
+                }
 
                 LifecycleStartEffect(vm) {
                     vm.onAppForegrounded()

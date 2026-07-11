@@ -76,6 +76,11 @@ enum class SessionStatus {
     CANCELLED,
 }
 
+val SessionStatus.isActive: Boolean
+    get() = this == SessionStatus.QUEUED ||
+        this == SessionStatus.RUNNING ||
+        this == SessionStatus.CANCELLING
+
 sealed class ConnectionState {
     data object Disconnected : ConnectionState()
     data object Connecting : ConnectionState()

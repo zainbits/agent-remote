@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -51,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import dev.zain.agentremote.ChatUiState
 import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.agent.SessionStatus
+import dev.zain.agentremote.agent.isActive
 import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
 import dev.zain.agentremote.data.displayName
@@ -354,27 +356,39 @@ private fun SessionRow(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Text(
-                    text = buildString {
-                        sessionStatusLabel(session.status)?.let {
-                            append(it)
-                            append(" · ")
-                        }
-                        append(
-                            session.messageCount?.let { count ->
-                                buildString {
-                                    append(count)
-                                    append(if (count == 1) " msg" else " msgs")
-                                    append(" · ")
-                                    append(session.sessionId.take(8))
-                                    append('…')
-                                }
-                            } ?: "${session.sessionId.take(8)}…",
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (session.status.isActive) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            color = MaterialTheme.colorScheme.primary,
+                            strokeWidth = 2.dp,
                         )
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                    }
+                    Text(
+                        text = buildString {
+                            sessionStatusLabel(session.status)?.let {
+                                append(it)
+                                append(" · ")
+                            }
+                            append(
+                                session.messageCount?.let { count ->
+                                    buildString {
+                                        append(count)
+                                        append(if (count == 1) " msg" else " msgs")
+                                        append(" · ")
+                                        append(session.sessionId.take(8))
+                                        append('…')
+                                    }
+                                } ?: "${session.sessionId.take(8)}…",
+                            )
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             if (session.cwd.isNotBlank()) {
                 HorizontalDivider(

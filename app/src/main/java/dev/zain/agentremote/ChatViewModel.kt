@@ -13,6 +13,7 @@ import dev.zain.agentremote.agent.DurableAgentClient
 import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
+import dev.zain.agentremote.agent.isActive
 import dev.zain.agentremote.data.AppSettings
 import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
@@ -105,6 +106,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var connectionDesired: Boolean = false
     private var hasConnectedSession: Boolean = false
     private var appInForeground: Boolean = true
+    private var sessionListVisible: Boolean = false
+    private var sessionStatusPollingJob: Job? = null
     private var activeSessionIdForReconnect: String? = null
     private var activeSessionCwdForReconnect: String = AppSettings.DEFAULT_CWD
     /**
@@ -211,10 +214,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun refreshSessions() {
+        stopSessionStatusPolling()
         refreshSessions(_ui.value.settings.backendKind)
     }
 
-    private fun refreshSessions(kind: BackendKind) {
+    private fun refreshSessions(kind: BackendKind, showLoading: Boolean = true) {
         val s = _ui.value.settings
         val secret = s.durableHostToken
         if (secret.isBlank()) {
@@ -232,7 +236,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             _ui.update {
-                if (it.settings.backendKind == kind) {
+                if (showLoading && it.settings.backendKind == kind) {
                     it.copy(sessionsLoading = true, sessionsError = null)
                 } else {
                     it
@@ -255,23 +259,99 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         it
                     }
                 }
+                updateSessionStatusPolling(kind, list)
             }.onFailure { e ->
                 val message = e.message ?: "Failed to load ${kind.displayName} sessions"
-                sessionErrorsByBackend[kind] = message
-                _ui.update {
-                    if (it.settings.backendKind == kind) {
-                        it.copy(sessionsLoading = false, sessionsError = message)
-                    } else {
-                        it
+                if (showLoading) {
+                    sessionErrorsByBackend[kind] = message
+                    _ui.update {
+                        if (it.settings.backendKind == kind) {
+                            it.copy(sessionsLoading = false, sessionsError = message)
+                        } else {
+                            it
+                        }
                     }
                 }
+                updateSessionStatusPolling(kind, sessionsByBackend[kind].orEmpty())
             }
         }
+    }
+
+    private fun updateSessionStatusPolling(
+        kind: BackendKind,
+        sessions: List<SessionSummary>,
+    ) {
+        val state = _ui.value
+        // An older refresh for the other backend must not cancel the selected backend's monitor.
+        if (state.settings.backendKind != kind) return
+        val shouldPoll = appInForeground &&
+            sessionListVisible &&
+            state.screen == AppScreen.HOME &&
+            !state.busy &&
+            state.settings.durableHostToken.isNotBlank() &&
+            sessions.any { it.status.isActive }
+        if (!shouldPoll) {
+            stopSessionStatusPolling()
+            return
+        }
+        if (sessionStatusPollingJob?.isActive == true) return
+
+        val pollingJob = viewModelScope.launch {
+            while (true) {
+                delay(SESSION_STATUS_POLL_INTERVAL_MILLIS)
+                val current = _ui.value
+                if (!appInForeground ||
+                    !sessionListVisible ||
+                    current.screen != AppScreen.HOME ||
+                    current.busy ||
+                    current.settings.backendKind != kind ||
+                    current.settings.durableHostToken.isBlank() ||
+                    current.sessions.none { it.status.isActive }
+                ) {
+                    break
+                }
+
+                val settings = current.settings
+                runCatching {
+                    val cwd = settings.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
+                    durableBackend(kind).listSessions(
+                        baseUrl = settings.activeDurableBaseUrl,
+                        secret = settings.durableHostToken,
+                        workingDirectory = cwd,
+                    )
+                }.onSuccess { list ->
+                    sessionsByBackend[kind] = list
+                    sessionErrorsByBackend[kind] = null
+                    _ui.update {
+                        if (it.settings.backendKind == kind &&
+                            it.screen == AppScreen.HOME &&
+                            sessionListVisible
+                        ) {
+                            it.copy(sessions = list, sessionsError = null)
+                        } else {
+                            it
+                        }
+                    }
+                }
+                // A transient background refresh failure keeps the last good list and retries.
+                // Manual refresh remains the path that surfaces a host/network error to the user.
+            }
+        }
+        sessionStatusPollingJob = pollingJob
+        pollingJob.invokeOnCompletion {
+            if (sessionStatusPollingJob === pollingJob) sessionStatusPollingJob = null
+        }
+    }
+
+    private fun stopSessionStatusPolling() {
+        sessionStatusPollingJob?.cancel()
+        sessionStatusPollingJob = null
     }
 
     fun selectBackend(kind: BackendKind) {
         val state = _ui.value
         if (state.screen != AppScreen.HOME || state.busy || state.settings.backendKind == kind) return
+        stopSessionStatusPolling()
         activeBackendKind = kind
         _ui.update {
             it.copy(
@@ -480,6 +560,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun onAppForegrounded() {
         appInForeground = true
         val state = _ui.value
+        if (state.screen == AppScreen.HOME) {
+            if (sessionListVisible && state.settings.durableHostToken.isNotBlank()) {
+                stopSessionStatusPolling()
+                refreshSessions(state.settings.backendKind, showLoading = false)
+            }
+            return
+        }
         val sessionId = activeSessionIdForReconnect
         val needsReconnect = state.reconnecting ||
             state.connection !is ConnectionState.Connected ||
@@ -498,11 +585,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onAppBackgrounded() {
         appInForeground = false
+        stopSessionStatusPolling()
         // Keep a healthy session connected, but do not spend the bounded retry
         // budget while Android has stopped the activity. Foregrounding restarts
         // an interrupted recovery from a new socket generation.
         reconnectJob?.cancel()
         reconnectJob = null
+    }
+
+    fun onSessionListVisibilityChanged(visible: Boolean) {
+        if (sessionListVisible == visible) return
+        sessionListVisible = visible
+        if (!visible) {
+            stopSessionStatusPolling()
+            return
+        }
+        val state = _ui.value
+        if (appInForeground &&
+            state.screen == AppScreen.HOME &&
+            !state.busy &&
+            state.sessions.any { it.status.isActive }
+        ) {
+            stopSessionStatusPolling()
+            refreshSessions(state.settings.backendKind, showLoading = false)
+        }
     }
 
     fun selectSlashCommand(command: SlashCommand) {
@@ -731,6 +837,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun beginConnectionAction(sessionId: String?, cwd: String): Long {
+        stopSessionStatusPolling()
         reconnectJob?.cancel()
         reconnectJob = null
         connectionDesired = true
@@ -1527,6 +1634,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun pushSystem(text: String) = appendStatic(ChatRole.SYSTEM, text)
 
     override fun onCleared() {
+        stopSessionStatusPolling()
         eventsJobs.forEach(Job::cancel)
         grokBackend.shutdown()
         codexBackend.shutdown()
@@ -1535,5 +1643,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val RECONNECT_ATTEMPT_TIMEOUT_MILLIS = 25_000L
+        const val SESSION_STATUS_POLL_INTERVAL_MILLIS = 2_000L
     }
 }
