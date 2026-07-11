@@ -64,7 +64,17 @@ data class SessionSummary(
     /** Null when the backend's list API does not return a cheap message count. */
     val messageCount: Int? = null,
     val modelId: String? = null,
+    val status: SessionStatus = SessionStatus.IDLE,
 )
+
+enum class SessionStatus {
+    IDLE,
+    QUEUED,
+    RUNNING,
+    CANCELLING,
+    FAILED,
+    CANCELLED,
+}
 
 sealed class ConnectionState {
     data object Disconnected : ConnectionState()
@@ -97,6 +107,8 @@ sealed class AgentEvent {
         val kind: String? = null,
         val detail: String? = null,
     ) : AgentEvent()
+    /** A durable host turn is queued or running, including after reconnecting to it. */
+    data object TurnStarted : AgentEvent()
     data class TurnComplete(val stopReason: String?) : AgentEvent()
     data class Error(val message: String) : AgentEvent()
 }
@@ -112,7 +124,7 @@ interface AgentBackend {
     )
     suspend fun disconnect()
     suspend fun sendPrompt(text: String)
-    /** Sends ACP's session-scoped cancellation notification for the active turn. */
+    /** Explicitly requests cancellation of the active turn; disconnecting must not call this. */
     suspend fun cancelCurrentRequest(): Boolean
     fun events(): kotlinx.coroutines.flow.Flow<AgentEvent>
     fun isConnected(): Boolean

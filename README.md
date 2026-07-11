@@ -1,117 +1,143 @@
-# AgentsRemote
+# AgentRemote
 
-Android frontend for remote coding agents, with independent **Grok** and **Codex** session tabs.
+Android frontend for durable, concurrent **Grok** and **Codex** jobs running on a Linux host.
 
-## Host (manual)
+AgentRemote is only the controller and live viewer. The checked-in host service owns agent processes, so pressing Back, starting another session, losing the phone connection, or quitting Android does not cancel active work. Reopen the app later to replay persisted progress and results.
 
-Not a boot service. In a terminal:
+## Architecture
 
-```zsh
-grokserve
-```
+- `host/agentremotesrv`: installs and manages the user-level host service.
+- `host/durable_jobs/`: authenticated HTTP API, worker pool, CLI event normalization, and legacy-session adoption.
+- SQLite in WAL mode stores durable sessions, turns, messages, status, usage, and replay events.
+- Codex runs through documented `codex exec --json` sessions and resumes by Codex thread ID.
+- Grok runs through `grok --output-format streaming-json` and resumes by Grok session ID.
+- The Android client long-polls persisted events. Disconnecting only removes that observer.
 
-To print the current Grok secret without starting the server (for **Settings → Grok secret**):
+All implementation, schema, tests, and service configuration live in this repository. Runtime databases, tokens, logs, and agent-owned files are deliberately not committed.
 
-```zsh
-grokserve --show-token
-```
+## Host setup
 
-To replace the persistent secret before starting both endpoints:
+The service uses the already authenticated `codex` and `grok` CLIs. No `sudo`, Python package installation, or separate database server is required.
 
-```zsh
-grokserve --rotate-secret
-```
-
-The rotated value is used immediately and must also be updated in AgentRemote's Grok secret setting. If `GROK_AGENT_SECRET` is set, unset it before using `--rotate-secret` because an environment-provided credential cannot be rotated by the wrapper.
-
-Defined in `~/.zshrc`. Starts:
-
-1. **Session index** HTTP API on port **2420** (`host/session_index.py`) — lists old Grok sessions for the app home screen.
-2. **Grok agent** WebSocket server on port **2419**:
-
-```text
-grok agent --always-approve serve --bind 0.0.0.0:2419 --secret <token>
-```
-
-- Secret persists in `~/.grok/agent-serve.secret` (or set `GROK_AGENT_SECRET`).
-- `--show-token` prints the secret that would be used (env or secret file) and exits without starting servers.
-- `--rotate-secret` securely replaces that file before the server starts.
-- Override agent bind with `GROK_AGENT_BIND=0.0.0.0:2419`.
-- Override session API port with `GROK_SESSION_INDEX_PORT=2420`.
-- Ctrl+C stops both.
-
-### Codex app-server
-
-Run the checked-in foreground helper:
+From the project directory:
 
 ```zsh
-host/codexserve
-# or, if ~/.zshrc is loaded:
-codexserve
+host/agentremotesrv install
+host/agentremotesrv status
 ```
 
-It creates a mode-`600` bearer-token file when needed and starts Codex app-server on port **2430** using capability-token authentication. Copy the token into **Settings → Codex bearer token**:
+`install` creates the runtime token/database, symlinks the tracked systemd unit into the user service directory, and enables and starts it. The service listens on port `2440` by default and restarts automatically if the process exits.
+
+Print the token for Android Settings:
 
 ```zsh
-codexserve --show-token
+host/agentremotesrv --show-token
 ```
 
-Override the bind or token path with `CODEX_AGENT_BIND` and `CODEX_AGENT_TOKEN_FILE`.
-Codex WebSocket transport is experimental. Use `wss://` or an authenticated encrypted tunnel when the connection leaves a trusted LAN/Tailnet; never expose an unauthenticated listener publicly.
-
-### Project / working directory
-
-The **host working directory (cwd)** is the project the agent uses for tools (files, shell, git). It is **not** the phone path.
-
-- App default: host `$HOME` → `/home/user`
-- Change in **Settings → Host project directory**
-- Home screen shows the active cwd and only lists sessions for that directory
-- Chat top bar also shows the cwd for the open session
-
-Grok sessions live under `~/.grok/sessions/<encoded-cwd>/<session-id>/`. Codex threads use Codex's own persisted thread store and native `thread/list` / `thread/resume` APIs.
-
-## Phone
-
-### Install from GitHub release
-
-On the build machine (no phone required):
+Useful management commands:
 
 ```zsh
-cd ~/AndroidStudioProjects/AgentRemote
+host/agentremotesrv logs -f
+host/agentremotesrv --rotate-token
+host/agentremotesrv uninstall
+```
+
+Rotating the token restarts the installed service, so do it only when no turn is active. Update the token in Android Settings afterwards.
+
+### Runtime state
+
+Defaults:
+
+| Path / value | Purpose |
+| --- | --- |
+| `~/.local/share/agentremote/jobs.sqlite3` | Durable job database |
+| `~/.local/share/agentremote/server.token` | Mode-`600` bearer token |
+| `0.0.0.0:2440` | HTTP bind |
+| `4` | Concurrent agent workers; additional turns remain queued |
+
+Host overrides:
+
+- `AGENTREMOTE_BIND=HOST:PORT`
+- `AGENTREMOTE_DATA_DIR=/path`
+- `AGENTREMOTE_DATABASE=/path/jobs.sqlite3`
+- `AGENTREMOTE_TOKEN_FILE=/path/token`
+- `AGENTREMOTE_MAX_WORKERS=N`
+- `AGENTREMOTE_CODEX_BIN=/path/to/codex`
+- `AGENTREMOTE_GROK_BIN=/path/to/grok`
+- `AGENTREMOTE_IMPORT_LEGACY=0` to disable discovery of pre-durable CLI sessions
+
+Put persistent overrides in a systemd user-service override, then restart the service.
+
+If the service must start at boot and continue after the Linux user logs out, enable user lingering once:
+
+```zsh
+loginctl enable-linger "$USER"
+```
+
+### Durability boundary
+
+Active turns are independent of the phone and continue with no connected Android client. Completed and failed history remains in SQLite across service restarts.
+
+If the Linux host or host service itself stops during a turn, that process cannot continue. On restart, AgentRemote marks the orphaned turn failed instead of pretending it completed; the session remains resumable with a new prompt.
+
+Codex runs with `workspace-write` sandboxing and `approval_policy=never`. Grok runs with `--always-approve`, matching the previous host behavior. Jobs requiring an unavailable interactive approval can fail closed.
+
+## Phone configuration
+
+In **Settings** configure:
+
+1. Host LAN URL, normally `http://<LAN-host>:2440`.
+2. Host Tailnet URL, normally `http://<Tailscale-host>:2440`.
+3. The token printed by `host/agentremotesrv --show-token`.
+4. The absolute Linux workspace path used by both agents.
+
+The LAN/Tailnet chips select the saved URL. Tailscale encrypts Tailnet traffic; use HTTPS or another trusted encrypted tunnel if exposing the API by another route. Never expose port `2440` directly to the public internet.
+
+Existing Grok and Codex sessions are discovered and adopted automatically. Their histories are imported lazily when first opened, and later prompts resume the original backend session ID.
+
+## Behavior
+
+- Back/Home detaches from the session without cancelling its active turn.
+- **New session** can start while other sessions remain queued or running.
+- Session cards show `Queued`, `Running`, `Stopping`, `Failed`, or `Stopped` when applicable.
+- Reopening a running session restores persisted history and resumes live observation.
+- **Stop**, `/stop`, and `/cancel` explicitly cancel only the open session's active turn.
+- `/new`, `/clear`, `/home`, and `/disconnect` detach without stopping host work.
+- `/help`, `/context`, and `/usage` remain local app commands.
+
+Concurrent sessions may operate on the same workspace. Their agent contexts are isolated, but filesystem writes are not automatically placed in Git worktrees; avoid assigning conflicting edits to the same checkout simultaneously.
+
+## Build and verification
+
+Host tests:
+
+```zsh
+python3 -m unittest host/test_session_index.py host/test_durable_jobs.py -v
+```
+
+Android checks:
+
+```zsh
+./gradlew :app:assembleDebug :app:lintDebug
+```
+
+Publish a sideloadable GitHub APK release:
+
+```zsh
 androidrun --publish
 ```
 
-Then open the release URL, download `AgentRemote-v…-release.apk` on the phone, and install (sideload; signed with the Android debug keystore).
+Only the newest three releases are retained by default.
 
-Only the **newest 3** releases are kept; older ones (and their tags) are deleted automatically (`ANDROIDRUN_RELEASE_KEEP=3`, set `0` to keep all).
-### Configure
+## Legacy direct helpers
 
-1. Settings → configure the Grok URLs/secret and Codex URLs/bearer token, plus the shared host cwd.
-2. Switch LAN / Tailnet with the chips.
-3. Use the bottom bar to switch between the independent **Grok** and **Codex** session lists.
-4. Start `grokserve` and/or `host/codexserve` for the selected tab.
-5. Tap a session to resume it, or **+** for a new chat.
-
-Session-card message totals count the user/assistant conversation shown by AgentRemote. Grok bootstrap context, synthetic instructions, reasoning/tool-loop records, and hidden slash-command turns are excluded.
-
-Permissions for tools are approved on the **host** (`--always-approve`), not in the app.
-
-### Chat controls
-
-- While an agent is responding, use the **Stop** button or `/stop` (alias: `/cancel`) to cancel the current turn without dropping the connection.
-- Type `/` in the composer to browse slash commands. The list combines AgentRemote actions with the commands advertised by the connected Grok agent; tap one to complete it, then send it.
-- Slash-command results appear in a dismissible panel above the composer and are not added to the chat timeline.
-- AgentsRemote handles `/new` (alias: `/clear`), `/home`, `/disconnect`, `/help`, `/context`, and `/usage` locally. `/context` and `/usage` show the latest model and context-window metadata reported by the selected agent. Grok also advertises its host slash commands dynamically.
-- If the active LAN or Tailnet WebSocket drops, AgentRemote retries and reloads the same ACP session. Deliberate disconnects stay disconnected; use the link button in the header to reconnect without leaving the chat.
-
-On a session screen, Android's predictive back gesture scales and fades the live session as the swipe progresses, revealing that agent's session list beneath it. Completing the gesture returns to the list; cancelling springs the session back into place.
+`grokserve`, `host/codexserve`, the old WebSocket clients, and the Grok session-index API remain in the repository for compatibility and diagnostics. The Android v0.2 durable path does not require those foreground servers.
 
 ## Ports
 
 | Port | Role |
 | --- | --- |
-| 2419 | ACP WebSocket (`ws://host:2419/ws?server-key=…`) |
-| 2420 | Session list HTTP (`http://host:2420/api/sessions?cwd=…`) |
-| 2430 | Codex app-server WebSocket (`ws://host:2430`) |
-
-The app derives the session API host/port from the agent base URL (agent port + 1).
+| `2440` | Durable AgentRemote HTTP API (current Android path) |
+| `2419` | Legacy Grok ACP WebSocket |
+| `2420` | Legacy Grok session index |
+| `2430` | Legacy Codex app-server WebSocket |

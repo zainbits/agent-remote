@@ -41,37 +41,28 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onSave: (
         networkProfile: NetworkProfile,
-        lanBaseUrl: String,
-        tailnetBaseUrl: String,
-        agentSecret: String,
-        codexLanBaseUrl: String,
-        codexTailnetBaseUrl: String,
-        codexAgentSecret: String,
+        durableLanBaseUrl: String,
+        durableTailnetBaseUrl: String,
+        durableHostToken: String,
         workingDirectory: String,
     ) -> Unit,
 ) {
     var networkProfile by remember(settings.networkProfile) {
         mutableStateOf(settings.networkProfile)
     }
-    var lanBaseUrl by remember(settings.lanBaseUrl) { mutableStateOf(settings.lanBaseUrl) }
-    var tailnetBaseUrl by remember(settings.tailnetBaseUrl) {
-        mutableStateOf(settings.tailnetBaseUrl)
+    var durableLanBaseUrl by remember(settings.durableLanBaseUrl) {
+        mutableStateOf(settings.durableLanBaseUrl)
     }
-    var agentSecret by remember(settings.agentSecret) { mutableStateOf(settings.agentSecret) }
-    var codexLanBaseUrl by remember(settings.codexLanBaseUrl) {
-        mutableStateOf(settings.codexLanBaseUrl)
+    var durableTailnetBaseUrl by remember(settings.durableTailnetBaseUrl) {
+        mutableStateOf(settings.durableTailnetBaseUrl)
     }
-    var codexTailnetBaseUrl by remember(settings.codexTailnetBaseUrl) {
-        mutableStateOf(settings.codexTailnetBaseUrl)
-    }
-    var codexAgentSecret by remember(settings.codexAgentSecret) {
-        mutableStateOf(settings.codexAgentSecret)
+    var durableHostToken by remember(settings.durableHostToken) {
+        mutableStateOf(settings.durableHostToken)
     }
     var workingDirectory by remember(settings.workingDirectory) {
         mutableStateOf(settings.workingDirectory)
     }
-    var showSecret by remember { mutableStateOf(false) }
-    var showCodexSecret by remember { mutableStateOf(false) }
+    var showToken by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -112,83 +103,44 @@ fun SettingsScreen(
                 )
             }
 
-            Text("Grok", style = MaterialTheme.typography.titleMedium)
-            OutlinedTextField(
-                value = lanBaseUrl,
-                onValueChange = { lanBaseUrl = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Grok LAN WebSocket URL") },
-                supportingText = { Text("Example: ws://192.168.1.50:2419") },
-                singleLine = true,
-            )
-            OutlinedTextField(
-                value = tailnetBaseUrl,
-                onValueChange = { tailnetBaseUrl = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Grok Tailnet WebSocket URL") },
-                supportingText = { Text("Example: ws://100.64.0.1:2419") },
-                singleLine = true,
-            )
-            OutlinedTextField(
-                value = agentSecret,
-                onValueChange = { agentSecret = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Grok agent secret") },
-                supportingText = { Text("Same token as GROK_AGENT_SECRET / grokserve") },
-                singleLine = true,
-                visualTransformation = if (showSecret) {
-                    VisualTransformation.None
-                } else {
-                    PasswordVisualTransformation()
-                },
-                trailingIcon = {
-                    IconButton(onClick = { showSecret = !showSecret }) {
-                        Text(
-                            if (showSecret) "Hide" else "Show",
-                            style = MaterialTheme.typography.labelMedium,
-                        )
-                    }
-                },
-            )
-
-            Text("Codex", style = MaterialTheme.typography.titleMedium)
+            Text("Durable host", style = MaterialTheme.typography.titleMedium)
             Text(
-                "Connects to Codex app-server. Grok and Codex keep separate session lists.",
+                "The host owns Grok and Codex turns, so they keep running after this app closes.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             OutlinedTextField(
-                value = codexLanBaseUrl,
-                onValueChange = { codexLanBaseUrl = it },
+                value = durableLanBaseUrl,
+                onValueChange = { durableLanBaseUrl = it },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Codex LAN WebSocket URL") },
-                supportingText = { Text("Example: ws://host:2430") },
+                label = { Text("Host LAN URL") },
+                supportingText = { Text("Example: http://192.168.1.50:2440") },
                 singleLine = true,
             )
             OutlinedTextField(
-                value = codexTailnetBaseUrl,
-                onValueChange = { codexTailnetBaseUrl = it },
+                value = durableTailnetBaseUrl,
+                onValueChange = { durableTailnetBaseUrl = it },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Codex Tailnet WebSocket URL") },
-                supportingText = { Text("Use wss:// or a trusted encrypted tunnel remotely") },
+                label = { Text("Host Tailnet URL") },
+                supportingText = { Text("Example: http://100.64.0.1:2440") },
                 singleLine = true,
             )
             OutlinedTextField(
-                value = codexAgentSecret,
-                onValueChange = { codexAgentSecret = it },
+                value = durableHostToken,
+                onValueChange = { durableHostToken = it },
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("Codex bearer token") },
-                supportingText = { Text("Contents of the app-server --ws-token-file") },
+                label = { Text("Durable host token") },
+                supportingText = { Text("Run host/agentremotesrv --show-token") },
                 singleLine = true,
-                visualTransformation = if (showCodexSecret) {
+                visualTransformation = if (showToken) {
                     VisualTransformation.None
                 } else {
                     PasswordVisualTransformation()
                 },
                 trailingIcon = {
-                    IconButton(onClick = { showCodexSecret = !showCodexSecret }) {
+                    IconButton(onClick = { showToken = !showToken }) {
                         Text(
-                            if (showCodexSecret) "Hide" else "Show",
+                            if (showToken) "Hide" else "Show",
                             style = MaterialTheme.typography.labelMedium,
                         )
                     }
@@ -215,12 +167,9 @@ fun SettingsScreen(
                 onClick = {
                     onSave(
                         networkProfile,
-                        lanBaseUrl,
-                        tailnetBaseUrl,
-                        agentSecret,
-                        codexLanBaseUrl,
-                        codexTailnetBaseUrl,
-                        codexAgentSecret,
+                        durableLanBaseUrl,
+                        durableTailnetBaseUrl,
+                        durableHostToken,
                         workingDirectory,
                     )
                     onBack()
@@ -231,8 +180,8 @@ fun SettingsScreen(
             }
 
             Text(
-                "Host: run grokserve for Grok, or host/codexserve for Codex. " +
-                    "Both are foreground services and use independent credentials.",
+                "Host: install the checked-in agentremote-durable user service once. " +
+                    "The same service runs both backends and survives phone disconnects.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

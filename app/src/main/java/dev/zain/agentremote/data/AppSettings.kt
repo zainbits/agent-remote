@@ -18,37 +18,18 @@ val BackendKind.displayName: String
 
 data class AppSettings(
     val networkProfile: NetworkProfile = NetworkProfile.LAN,
-    val lanBaseUrl: String = "ws://192.168.1.50:2419",
-    val tailnetBaseUrl: String = "ws://100.64.0.1:2419",
-    val agentSecret: String = "",
-    val codexLanBaseUrl: String = "ws://192.168.1.50:2430",
-    val codexTailnetBaseUrl: String = "ws://100.64.0.1:2430",
-    val codexAgentSecret: String = "",
+    val durableLanBaseUrl: String = "http://192.168.1.50:2440",
+    val durableTailnetBaseUrl: String = "http://100.64.0.1:2440",
+    val durableHostToken: String = "",
     /** Absolute path on the Linux host — default is the host $HOME. */
     val workingDirectory: String = DEFAULT_CWD,
     val backendKind: BackendKind = BackendKind.GROK_BUILD,
 ) {
-    val activeBaseUrl: String
+    val activeDurableBaseUrl: String
         get() = when (networkProfile) {
-            NetworkProfile.LAN -> lanBaseUrl.trim()
-            NetworkProfile.TAILNET -> tailnetBaseUrl.trim()
+            NetworkProfile.LAN -> durableLanBaseUrl.trim()
+            NetworkProfile.TAILNET -> durableTailnetBaseUrl.trim()
         }
-
-    val activeCodexBaseUrl: String
-        get() = when (networkProfile) {
-            NetworkProfile.LAN -> codexLanBaseUrl.trim()
-            NetworkProfile.TAILNET -> codexTailnetBaseUrl.trim()
-        }
-
-    fun activeBaseUrl(kind: BackendKind): String = when (kind) {
-        BackendKind.GROK_BUILD -> activeBaseUrl
-        BackendKind.CODEX -> activeCodexBaseUrl
-    }
-
-    fun agentSecret(kind: BackendKind): String = when (kind) {
-        BackendKind.GROK_BUILD -> agentSecret
-        BackendKind.CODEX -> codexAgentSecret
-    }
 
     companion object {
         /** Host home directory used as the default project/cwd. */

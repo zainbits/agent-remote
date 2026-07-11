@@ -8,10 +8,8 @@ import dev.zain.agentremote.agent.AgentRequestCancelledException
 import dev.zain.agentremote.agent.AgentUsage
 import dev.zain.agentremote.agent.ChatMessage
 import dev.zain.agentremote.agent.ChatRole
-import dev.zain.agentremote.agent.CodexAppServerClient
 import dev.zain.agentremote.agent.ConnectionState
-import dev.zain.agentremote.agent.GrokAcpClient
-import dev.zain.agentremote.agent.SessionIndexClient
+import dev.zain.agentremote.agent.DurableAgentClient
 import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
@@ -30,7 +28,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.NumberFormat
 import java.util.Locale
@@ -74,9 +71,8 @@ data class ChatUiState(
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
-    private val grokBackend = GrokAcpClient()
-    private val codexBackend = CodexAppServerClient()
-    private val sessionIndex = SessionIndexClient()
+    private val grokBackend = DurableAgentClient(BackendKind.GROK_BUILD)
+    private val codexBackend = DurableAgentClient(BackendKind.CODEX)
     private val sessionsByBackend = mutableMapOf<BackendKind, List<SessionSummary>>()
     private val sessionErrorsByBackend = mutableMapOf<BackendKind, String?>()
     private var activeBackendKind: BackendKind = BackendKind.GROK_BUILD
@@ -86,6 +82,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             BackendKind.GROK_BUILD -> grokBackend
             BackendKind.CODEX -> codexBackend
         }
+
+    private fun durableBackend(kind: BackendKind): DurableAgentClient = when (kind) {
+        BackendKind.GROK_BUILD -> grokBackend
+        BackendKind.CODEX -> codexBackend
+    }
 
     private val _ui = MutableStateFlow(ChatUiState())
     val ui: StateFlow<ChatUiState> = _ui.asStateFlow()
@@ -189,7 +190,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             settingsRepo.settings.collect {
                 // only auto-refresh when on home and we have a secret
                 if (_ui.value.screen == AppScreen.HOME &&
-                    _ui.value.settings.agentSecret(_ui.value.settings.backendKind).isNotBlank() &&
+                    _ui.value.settings.durableHostToken.isNotBlank() &&
                     _ui.value.sessions.isEmpty() &&
                     !_ui.value.sessionsLoading
                 ) {
@@ -210,9 +211,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun refreshSessions(kind: BackendKind) {
         val s = _ui.value.settings
-        val secret = s.agentSecret(kind)
+        val secret = s.durableHostToken
         if (secret.isBlank()) {
-            val message = "Set the ${kind.displayName} credential in Settings first."
+            val message = "Set the durable host token in Settings first."
             sessionsByBackend[kind] = emptyList()
             sessionErrorsByBackend[kind] = message
             _ui.update {
@@ -234,18 +235,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             runCatching {
                 val cwd = s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
-                when (kind) {
-                    BackendKind.GROK_BUILD -> sessionIndex.listSessions(
-                        agentBaseUrl = s.activeBaseUrl(kind),
-                        secret = secret,
-                        cwd = cwd,
-                    )
-                    BackendKind.CODEX -> codexBackend.listSessions(
-                        baseUrl = s.activeBaseUrl(kind),
-                        secret = secret,
-                        workingDirectory = cwd,
-                    )
-                }
+                durableBackend(kind).listSessions(
+                    baseUrl = s.activeDurableBaseUrl,
+                    secret = secret,
+                    workingDirectory = cwd,
+                )
             }.onSuccess { list ->
                 sessionsByBackend[kind] = list
                 sessionErrorsByBackend[kind] = null
@@ -291,9 +285,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun openNewSession() {
         val s = _ui.value.settings
         activeBackendKind = s.backendKind
-        val secret = s.agentSecret(activeBackendKind)
+        val secret = s.durableHostToken
         if (secret.isBlank()) {
-            pushSystem("Set the ${activeBackendKind.displayName} credential in Settings first.")
+            pushSystem("Set the durable host token in Settings first.")
             return
         }
         val cwd = s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
@@ -321,7 +315,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             runCatching {
                 backend.connectNew(
-                    baseUrl = s.activeBaseUrl(activeBackendKind),
+                    baseUrl = s.activeDurableBaseUrl,
                     secret = secret,
                     workingDirectory = cwd,
                 )
@@ -347,12 +341,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun openSession(session: SessionSummary) {
         val s = _ui.value.settings
         activeBackendKind = s.backendKind
-        val secret = s.agentSecret(activeBackendKind)
+        val secret = s.durableHostToken
         if (secret.isBlank()) {
             _ui.update {
                 it.copy(
                     sessionsError =
-                        "Set the ${activeBackendKind.displayName} credential in Settings first.",
+                        "Set the durable host token in Settings first.",
                 )
             }
             return
@@ -384,7 +378,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             runCatching {
                 backend.connectLoad(
-                    baseUrl = s.activeBaseUrl(activeBackendKind),
+                    baseUrl = s.activeDurableBaseUrl,
                     secret = secret,
                     workingDirectory = cwd,
                     sessionId = session.sessionId,
@@ -412,18 +406,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun goHome() {
         val departingBackend = backend
-        val requestWasInFlight = _ui.value.requestInFlight
         stopConnectionIntent(clearSession = true)
+        clearChatLocal()
         // Commit navigation immediately; transport cleanup continues off-screen.
         _ui.update { it.copy(screen = AppScreen.HOME, busy = true) }
         viewModelScope.launch {
-            if (requestWasInFlight) {
-                runCatching {
-                    withTimeout(5_000) { departingBackend.cancelCurrentRequest() }
-                }
-            }
             runCatching { departingBackend.disconnect() }
-            clearChatLocal()
             _ui.update {
                 it.copy(
                     screen = AppScreen.HOME,
@@ -450,12 +438,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun disconnect() {
         stopConnectionIntent(clearSession = false)
         val canReconnect = activeSessionIdForReconnect != null
+        clearChatLocal()
         viewModelScope.launch {
-            if (_ui.value.requestInFlight) {
-                runCatching { backend.cancelCurrentRequest() }
-            }
             runCatching { backend.disconnect() }
-            clearChatLocal()
             _ui.update {
                 it.copy(
                     busy = false,
@@ -711,24 +696,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveSettings(
         networkProfile: NetworkProfile,
-        lanBaseUrl: String,
-        tailnetBaseUrl: String,
-        agentSecret: String,
-        codexLanBaseUrl: String,
-        codexTailnetBaseUrl: String,
-        codexAgentSecret: String,
+        durableLanBaseUrl: String,
+        durableTailnetBaseUrl: String,
+        durableHostToken: String,
         workingDirectory: String,
     ) {
         viewModelScope.launch {
             settingsRepo.update {
                 it.copy(
                     networkProfile = networkProfile,
-                    lanBaseUrl = lanBaseUrl.trim(),
-                    tailnetBaseUrl = tailnetBaseUrl.trim(),
-                    agentSecret = agentSecret,
-                    codexLanBaseUrl = codexLanBaseUrl.trim(),
-                    codexTailnetBaseUrl = codexTailnetBaseUrl.trim(),
-                    codexAgentSecret = codexAgentSecret,
+                    durableLanBaseUrl = durableLanBaseUrl.trim(),
+                    durableTailnetBaseUrl = durableTailnetBaseUrl.trim(),
+                    durableHostToken = durableHostToken,
                     workingDirectory = workingDirectory.trim()
                         .ifBlank { AppSettings.DEFAULT_CWD },
                 )
@@ -820,8 +799,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val settings = _ui.value.settings
                     val completed = withTimeoutOrNull(RECONNECT_ATTEMPT_TIMEOUT_MILLIS) {
                         backend.connectLoad(
-                            baseUrl = settings.activeBaseUrl(activeBackendKind),
-                            secret = settings.agentSecret(activeBackendKind),
+                            baseUrl = settings.activeDurableBaseUrl,
+                            secret = settings.durableHostToken,
                             workingDirectory = activeSessionCwdForReconnect,
                             sessionId = sessionId,
                         )
@@ -910,13 +889,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startNewSessionFromCommand() {
-        if (!_ui.value.requestInFlight) {
-            openNewSession()
-            return
+        val departingBackend = backend
+        stopConnectionIntent(clearSession = true)
+        clearChatLocal()
+        _ui.update {
+            it.copy(
+                busy = true,
+                requestInFlight = false,
+                cancellationRequested = false,
+                reconnecting = false,
+            )
         }
         viewModelScope.launch {
-            // The old agent session may persist after the WebSocket is replaced, so cancel first.
-            runCatching { backend.cancelCurrentRequest() }
+            // Detach from the old durable turn; the host keeps owning it.
+            runCatching { departingBackend.disconnect() }
             openNewSession()
         }
     }
@@ -1246,6 +1232,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentEvent.UsageChanged -> mergeUsage(event.usage)
+
+            AgentEvent.TurnStarted -> {
+                _ui.update {
+                    it.copy(
+                        busy = true,
+                        requestInFlight = true,
+                        cancellationRequested = false,
+                        historyLoading = false,
+                    )
+                }
+            }
 
             is AgentEvent.UserDelta -> {
                 // Skip agent echo of the prompt we already rendered in [send].

@@ -1,0 +1,74 @@
+#!/usr/bin/env zsh
+
+set -euo pipefail
+
+SCRIPT_DIR=${0:A:h}
+SERVICE_SOURCE="$SCRIPT_DIR/agentremote-durable.service"
+SERVICE_TARGET="$HOME/.config/systemd/user/agentremote-durable.service"
+
+cd "$SCRIPT_DIR"
+
+# systemd user services do not inherit interactive zsh/nvm PATH setup.
+if [[ -z ${AGENTREMOTE_CODEX_BIN:-} ]] && ! command -v codex >/dev/null 2>&1; then
+  codex_candidates=("$HOME"/.nvm/versions/node/*/bin/codex(N))
+  if (( ${#codex_candidates} > 0 )); then
+    export AGENTREMOTE_CODEX_BIN=${codex_candidates[-1]}
+  fi
+fi
+if [[ -n ${AGENTREMOTE_CODEX_BIN:-} ]]; then
+  codex_bin_dir=${AGENTREMOTE_CODEX_BIN:h}
+  if [[ -x "$codex_bin_dir/node" ]]; then
+    export PATH="$codex_bin_dir:$PATH"
+  fi
+fi
+if [[ -z ${AGENTREMOTE_GROK_BIN:-} ]] && ! command -v grok >/dev/null 2>&1; then
+  if [[ -x "$HOME/.grok/bin/grok" ]]; then
+    export AGENTREMOTE_GROK_BIN="$HOME/.grok/bin/grok"
+  fi
+fi
+
+command=${1:-serve}
+if (( $# > 0 )); then
+  shift
+fi
+
+case "$command" in
+  serve)
+    exec python3 -m durable_jobs.main serve "$@"
+    ;;
+  init)
+    exec python3 -m durable_jobs.main init "$@"
+    ;;
+  --show-token|show-token)
+    exec python3 -m durable_jobs.main show-token
+    ;;
+  --rotate-token|rotate-token)
+    python3 -m durable_jobs.main rotate-token
+    systemctl --user try-restart agentremote-durable.service >/dev/null 2>&1 || true
+    ;;
+  install)
+    python3 -m durable_jobs.main init
+    mkdir -p "$HOME/.config/systemd/user"
+    ln -sfn "$SERVICE_SOURCE" "$SERVICE_TARGET"
+    systemctl --user daemon-reload
+    systemctl --user enable --now agentremote-durable.service
+    echo "AgentRemote durable service installed and started."
+    echo "Token: $SCRIPT_DIR/agentremotesrv --show-token"
+    ;;
+  uninstall)
+    systemctl --user disable --now agentremote-durable.service 2>/dev/null || true
+    rm -f "$SERVICE_TARGET"
+    systemctl --user daemon-reload
+    echo "Service removed. Runtime jobs and token were kept."
+    ;;
+  status)
+    exec systemctl --user status agentremote-durable.service "$@"
+    ;;
+  logs)
+    exec journalctl --user -u agentremote-durable.service "$@"
+    ;;
+  *)
+    echo "Usage: ${0:t} {serve|install|uninstall|status|logs|--show-token|--rotate-token}" >&2
+    exit 2
+    ;;
+esac

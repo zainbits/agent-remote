@@ -50,6 +50,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.zain.agentremote.ChatUiState
 import dev.zain.agentremote.agent.SessionSummary
+import dev.zain.agentremote.agent.SessionStatus
 import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
 import dev.zain.agentremote.data.displayName
@@ -354,15 +355,23 @@ private fun SessionRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    text = session.messageCount?.let { count ->
-                        buildString {
-                            append(count)
-                            append(if (count == 1) " msg" else " msgs")
+                    text = buildString {
+                        sessionStatusLabel(session.status)?.let {
+                            append(it)
                             append(" · ")
-                            append(session.sessionId.take(8))
-                            append('…')
                         }
-                    } ?: "${session.sessionId.take(8)}…",
+                        append(
+                            session.messageCount?.let { count ->
+                                buildString {
+                                    append(count)
+                                    append(if (count == 1) " msg" else " msgs")
+                                    append(" · ")
+                                    append(session.sessionId.take(8))
+                                    append('…')
+                                }
+                            } ?: "${session.sessionId.take(8)}…",
+                        )
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -384,6 +393,15 @@ private fun SessionRow(
             }
         }
     }
+}
+
+private fun sessionStatusLabel(status: SessionStatus): String? = when (status) {
+    SessionStatus.QUEUED -> "Queued"
+    SessionStatus.RUNNING -> "Running"
+    SessionStatus.CANCELLING -> "Stopping"
+    SessionStatus.FAILED -> "Failed"
+    SessionStatus.CANCELLED -> "Stopped"
+    SessionStatus.IDLE -> null
 }
 
 private fun formatWhen(raw: String?): String {

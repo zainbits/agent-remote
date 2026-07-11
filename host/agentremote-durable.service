@@ -1,0 +1,17 @@
+[Unit]
+Description=AgentRemote durable agent job service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/AndroidStudioProjects/AgentRemote/host/agentremotesrv serve
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
