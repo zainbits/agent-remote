@@ -97,7 +97,12 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
         return parseCodexStatus(status)
     }
 
-    override suspend fun connectNew(baseUrl: String, secret: String, workingDirectory: String) {
+    override suspend fun connectNew(
+        baseUrl: String,
+        secret: String,
+        workingDirectory: String,
+        codexFullAccess: Boolean,
+    ) {
         val connectionGeneration = beginConnection(baseUrl, secret, workingDirectory)
         try {
             val response = request(
@@ -105,7 +110,8 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                 path = "/api/v1/sessions",
                 body = JSONObject()
                     .put("backend", kind.apiName)
-                    .put("cwd", workingDirectory),
+                    .put("cwd", workingDirectory)
+                    .put("codexFullAccess", codexFullAccess),
             )
             val session = response.optJSONObject("session")
                 ?: error("Durable host returned no session")

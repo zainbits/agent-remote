@@ -134,9 +134,13 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
             route = self._route(parsed.path)
             if route == ["api", "v1", "sessions"]:
                 body = self._json_body()
+                codex_full_access = body.get("codexFullAccess", True)
+                if not isinstance(codex_full_access, bool):
+                    raise StoreError("codexFullAccess must be a boolean")
                 session = self.server.manager.create_session(
                     str(body.get("backend") or ""),
                     str(body.get("cwd") or ""),
+                    codex_full_access=codex_full_access,
                 )
                 self._send(HTTPStatus.CREATED, {"session": session})
                 return

@@ -434,6 +434,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     baseUrl = s.activeDurableBaseUrl,
                     secret = secret,
                     workingDirectory = cwd,
+                    codexFullAccess = s.codexFullAccess,
                 )
             }.onFailure { e ->
                 if (connectionAction != connectionActionGeneration) return@onFailure
@@ -842,6 +843,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         durableTailnetBaseUrl: String,
         durableHostToken: String,
         workingDirectory: String,
+        codexFullAccess: Boolean,
     ) {
         viewModelScope.launch {
             settingsRepo.update {
@@ -852,6 +854,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     durableHostToken = durableHostToken,
                     workingDirectory = workingDirectory.trim()
                         .ifBlank { AppSettings.DEFAULT_CWD },
+                    codexFullAccess = codexFullAccess,
                 )
             }
             // Refresh list with new cwd/secret/url

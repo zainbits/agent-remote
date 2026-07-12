@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     reasoning_effort TEXT,
     used_tokens INTEGER,
     context_window_tokens INTEGER,
+    codex_full_access INTEGER NOT NULL DEFAULT 1,
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -67,4 +68,4 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_session_id
     ON events(session_id, id);
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;

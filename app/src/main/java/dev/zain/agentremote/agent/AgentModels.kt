@@ -178,7 +178,12 @@ sealed class AgentEvent {
 
 interface AgentBackend {
     val name: String
-    suspend fun connectNew(baseUrl: String, secret: String, workingDirectory: String)
+    suspend fun connectNew(
+        baseUrl: String,
+        secret: String,
+        workingDirectory: String,
+        codexFullAccess: Boolean = true,
+    )
     suspend fun connectLoad(
         baseUrl: String,
         secret: String,

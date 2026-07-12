@@ -222,16 +222,35 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("gpt-test", session["modelName"])
         self.assertEqual("xhigh", session["reasoningEffort"])
 
-    def test_codex_workers_enable_network_for_new_and_resumed_turns(self):
+    def test_codex_workers_default_to_full_access_for_new_and_resumed_turns(self):
         session = self.manager.create_session("codex", str(self.workspace))
         new_command = self.manager._command(session, "first")
+        self.assertTrue(session["codexFullAccess"])
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", new_command)
+        self.assertNotIn("sandbox_workspace_write.network_access=true", new_command)
+
+        self.store.set_backend_session_id(session["id"], "existing-thread")
+        resumed = self.manager._command(self.store.get_session(session["id"]), "next")
+        self.assertIn("resume", resumed)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", resumed)
+
+    def test_codex_workers_can_opt_out_to_networked_workspace_sandbox(self):
+        session = self.manager.create_session(
+            "codex",
+            str(self.workspace),
+            codex_full_access=False,
+        )
+        new_command = self.manager._command(session, "first")
+        self.assertFalse(session["codexFullAccess"])
         self.assertIn("sandbox_workspace_write.network_access=true", new_command)
-        self.assertIn("workspace-write", new_command)
+        self.assertIn('sandbox_mode="workspace-write"', new_command)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", new_command)
 
         self.store.set_backend_session_id(session["id"], "existing-thread")
         resumed = self.manager._command(self.store.get_session(session["id"]), "next")
         self.assertIn("resume", resumed)
         self.assertIn("sandbox_workspace_write.network_access=true", resumed)
+        self.assertIn('sandbox_mode="workspace-write"', resumed)
 
     def test_codex_rollout_status_matches_native_context_fields(self):
         rollout = self.workspace / "rollout.jsonl"
@@ -300,9 +319,17 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual(40, status["rateLimits"]["primary"]["usedPercent"])
         self.assertEqual(25, status["rateLimits"]["secondary"]["usedPercent"])
         self.assertEqual(2, status["rateLimitResetCreditsAvailable"])
-        self.assertEqual("workspace-write", status["sandboxMode"])
+        self.assertEqual("danger-full-access", status["sandboxMode"])
         self.assertTrue(status["networkAccess"])
         self.assertEqual("never", status["approvalPolicy"])
+
+        sandboxed = self.manager.create_session(
+            "codex",
+            str(self.workspace),
+            codex_full_access=False,
+        )
+        sandboxed_status = self.manager.codex_status(sandboxed["id"])
+        self.assertEqual("workspace-write", sandboxed_status["sandboxMode"])
 
     def test_grok_command_catalog_includes_builtins_and_installed_skills(self):
         skill = Path(self.temporary.name, ".grok", "skills", "verify", "SKILL.md")
@@ -370,6 +397,21 @@ class DurableJobsTest(unittest.TestCase):
             with urllib.request.urlopen(request, timeout=2) as response:
                 created = json.load(response)
             self.assertEqual("codex", created["session"]["backend"])
+            self.assertTrue(created["session"]["codexFullAccess"])
+
+            sandboxed_request = urllib.request.Request(
+                base + "/api/v1/sessions",
+                data=json.dumps({
+                    "backend": "codex",
+                    "cwd": str(self.workspace),
+                    "codexFullAccess": False,
+                }).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(sandboxed_request, timeout=2) as response:
+                sandboxed = json.load(response)
+            self.assertFalse(sandboxed["session"]["codexFullAccess"])
 
             commands_request = urllib.request.Request(
                 base + f"/api/v1/sessions/{created['session']['id']}/commands",
@@ -399,7 +441,7 @@ class DurableJobsTest(unittest.TestCase):
         mode = os.stat(self.store.database_path).st_mode & 0o777
         self.assertEqual(0o600, mode)
 
-    def test_existing_v1_database_adds_model_name_column(self):
+    def test_existing_v1_database_adds_current_session_columns(self):
         path = Path(self.temporary.name, "v1.sqlite3")
         with sqlite3.connect(path) as connection:
             connection.execute(
@@ -430,7 +472,8 @@ class DurableJobsTest(unittest.TestCase):
             version = connection.execute("PRAGMA user_version").fetchone()[0]
 
         self.assertIn("model_name", columns)
-        self.assertEqual(2, version)
+        self.assertIn("codex_full_access", columns)
+        self.assertEqual(3, version)
 
     def test_legacy_session_is_adopted_once_with_history(self):
         first = self.store.import_session(

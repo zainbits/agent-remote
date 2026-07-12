@@ -23,6 +23,8 @@ data class AppSettings(
     val durableHostToken: String = "",
     /** Absolute path on the Linux host — default is the host $HOME. */
     val workingDirectory: String = DEFAULT_CWD,
+    /** Default permission mode for newly created Codex sessions. */
+    val codexFullAccess: Boolean = true,
     val backendKind: BackendKind = BackendKind.GROK_BUILD,
 ) {
     val activeDurableBaseUrl: String

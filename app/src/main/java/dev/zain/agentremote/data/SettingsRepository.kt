@@ -3,6 +3,7 @@ package dev.zain.agentremote.data
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -24,6 +25,7 @@ class SettingsRepository(private val context: Context) {
         val legacyCodexTailnetBaseUrl = stringPreferencesKey("codex_tailnet_base_url")
         val legacyCodexAgentSecret = stringPreferencesKey("codex_agent_secret")
         val workingDirectory = stringPreferencesKey("working_directory")
+        val codexFullAccess = booleanPreferencesKey("codex_full_access")
         val backendKind = stringPreferencesKey("backend_kind")
     }
 
@@ -37,6 +39,7 @@ class SettingsRepository(private val context: Context) {
                 ?: AppSettings().durableTailnetBaseUrl,
             durableHostToken = prefs[Keys.durableHostToken] ?: "",
             workingDirectory = prefs[Keys.workingDirectory] ?: AppSettings().workingDirectory,
+            codexFullAccess = prefs[Keys.codexFullAccess] ?: true,
             backendKind = prefs[Keys.backendKind]
                 ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
                 ?: BackendKind.GROK_BUILD,
@@ -55,6 +58,7 @@ class SettingsRepository(private val context: Context) {
                     ?: AppSettings().durableTailnetBaseUrl,
                 durableHostToken = prefs[Keys.durableHostToken] ?: "",
                 workingDirectory = prefs[Keys.workingDirectory] ?: AppSettings().workingDirectory,
+                codexFullAccess = prefs[Keys.codexFullAccess] ?: true,
                 backendKind = prefs[Keys.backendKind]
                     ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
                     ?: BackendKind.GROK_BUILD,
@@ -65,6 +69,7 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.durableTailnetBaseUrl] = next.durableTailnetBaseUrl
             prefs[Keys.durableHostToken] = next.durableHostToken
             prefs[Keys.workingDirectory] = next.workingDirectory
+            prefs[Keys.codexFullAccess] = next.codexFullAccess
             prefs[Keys.backendKind] = next.backendKind.name
             prefs.remove(Keys.legacyLanBaseUrl)
             prefs.remove(Keys.legacyTailnetBaseUrl)

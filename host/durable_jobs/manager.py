@@ -21,6 +21,8 @@ from .store import ConflictError, JobStore, NotFoundError, StoreError
 MAX_DETAIL_CHARS = 16_000
 LOGGER = logging.getLogger("agentremote.host.manager")
 CODEX_SANDBOX_MODE = "workspace-write"
+CODEX_FULL_ACCESS_MODE = "danger-full-access"
+CODEX_FULL_ACCESS_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 CODEX_APPROVAL_POLICY = "never"
 CODEX_NETWORK_ACCESS_CONFIG = "sandbox_workspace_write.network_access=true"
 
@@ -125,8 +127,13 @@ class JobManager:
             self._versions[session_id] = self._versions.get(session_id, 0) + 1
             condition.notify_all()
 
-    def create_session(self, backend: str, cwd: str) -> dict[str, Any]:
-        session = self.store.create_session(backend, cwd)
+    def create_session(
+        self,
+        backend: str,
+        cwd: str,
+        codex_full_access: bool = True,
+    ) -> dict[str, Any]:
+        session = self.store.create_session(backend, cwd, codex_full_access)
         self._refresh_metadata(session["id"])
         self.notify(session["id"])
         return self.store.get_session(session["id"])
@@ -153,7 +160,9 @@ class JobManager:
         status = self.catalog.codex_status(session)
         # These values are host-owned worker policy, so report what the next turn
         # will actually use even when an older rollout predates this configuration.
-        status["sandboxMode"] = CODEX_SANDBOX_MODE
+        status["sandboxMode"] = (
+            CODEX_FULL_ACCESS_MODE if session["codexFullAccess"] else CODEX_SANDBOX_MODE
+        )
         status["networkAccess"] = True
         status["approvalPolicy"] = CODEX_APPROVAL_POLICY
         usage = {
@@ -247,6 +256,19 @@ class JobManager:
         cwd = session["cwd"]
         backend_id = session.get("backendSessionId")
         if session["backend"] == "codex":
+            full_access = bool(session.get("codexFullAccess", True))
+            permission_args = (
+                [CODEX_FULL_ACCESS_FLAG]
+                if full_access
+                else [
+                    "-c",
+                    f'sandbox_mode="{CODEX_SANDBOX_MODE}"',
+                    "-c",
+                    f'approval_policy="{CODEX_APPROVAL_POLICY}"',
+                    "-c",
+                    CODEX_NETWORK_ACCESS_CONFIG,
+                ]
+            )
             if backend_id:
                 return [
                     self.codex_bin,
@@ -254,10 +276,7 @@ class JobManager:
                     "resume",
                     "--json",
                     "--skip-git-repo-check",
-                    "-c",
-                    f'approval_policy="{CODEX_APPROVAL_POLICY}"',
-                    "-c",
-                    CODEX_NETWORK_ACCESS_CONFIG,
+                    *permission_args,
                     backend_id,
                     "-",
                 ]
@@ -268,14 +287,9 @@ class JobManager:
                 "--color",
                 "never",
                 "--skip-git-repo-check",
-                "--sandbox",
-                CODEX_SANDBOX_MODE,
                 "--cd",
                 cwd,
-                "-c",
-                f'approval_policy="{CODEX_APPROVAL_POLICY}"',
-                "-c",
-                CODEX_NETWORK_ACCESS_CONFIG,
+                *permission_args,
                 "-",
             ]
         command = [
@@ -412,12 +426,15 @@ class JobManager:
             self.notify(session["id"])
         except Exception as error:  # Keep the daemon alive and persist every worker failure.
             messages.flush()
-            self.store.finish_turn(
-                turn_id,
-                "failed",
-                stop_reason="host_error",
-                error=f"Host worker error: {error}",
-            )
+            if self.store.cancellation_requested(turn_id):
+                self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
+            else:
+                self.store.finish_turn(
+                    turn_id,
+                    "failed",
+                    stop_reason="host_error",
+                    error=f"Host worker error: {error}",
+                )
             self.notify(session["id"])
         finally:
             with self._lock:

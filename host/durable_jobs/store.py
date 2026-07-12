@@ -57,7 +57,11 @@ class JobStore:
             }
             if "model_name" not in columns:
                 connection.execute("ALTER TABLE sessions ADD COLUMN model_name TEXT")
-            connection.execute("PRAGMA user_version = 2")
+            if "codex_full_access" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN codex_full_access INTEGER NOT NULL DEFAULT 1"
+                )
+            connection.execute("PRAGMA user_version = 3")
         os.chmod(self.database_path, 0o600)
 
     @staticmethod
@@ -93,6 +97,7 @@ class JobStore:
             "reasoningEffort": row["reasoning_effort"],
             "usedTokens": row["used_tokens"],
             "contextWindowTokens": row["context_window_tokens"],
+            "codexFullAccess": bool(row["codex_full_access"]),
             "lastError": row["last_error"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
@@ -129,7 +134,12 @@ class JobStore:
             "updatedAt": row["updated_at"],
         }
 
-    def create_session(self, backend: str, cwd: str) -> dict[str, Any]:
+    def create_session(
+        self,
+        backend: str,
+        cwd: str,
+        codex_full_access: bool = True,
+    ) -> dict[str, Any]:
         normalized_backend = backend.strip().lower()
         if normalized_backend not in {"grok", "codex"}:
             raise StoreError("backend must be grok or codex")
@@ -139,15 +149,32 @@ class JobStore:
         session_id = str(uuid.uuid4())
         now = utc_now()
         title = f"New {normalized_backend.title()} session"
+        effective_full_access = normalized_backend == "codex" and codex_full_access
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO sessions(id, backend, cwd, title, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'idle', ?, ?)
+                INSERT INTO sessions(
+                    id, backend, cwd, title, status, codex_full_access, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'idle', ?, ?, ?)
                 """,
-                (session_id, normalized_backend, str(path), title, now, now),
+                (
+                    session_id,
+                    normalized_backend,
+                    str(path),
+                    title,
+                    int(effective_full_access),
+                    now,
+                    now,
+                ),
             )
-            self._event(connection, session_id, None, "session.created", {"status": "idle"}, now)
+            self._event(
+                connection,
+                session_id,
+                None,
+                "session.created",
+                {"status": "idle", "codexFullAccess": effective_full_access},
+                now,
+            )
         return self.get_session(session_id)
 
     def import_session(

@@ -20,6 +20,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -28,6 +29,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
@@ -45,6 +49,7 @@ fun SettingsScreen(
         durableTailnetBaseUrl: String,
         durableHostToken: String,
         workingDirectory: String,
+        codexFullAccess: Boolean,
     ) -> Unit,
 ) {
     var networkProfile by remember(settings.networkProfile) {
@@ -61,6 +66,9 @@ fun SettingsScreen(
     }
     var workingDirectory by remember(settings.workingDirectory) {
         mutableStateOf(settings.workingDirectory)
+    }
+    var codexFullAccess by remember(settings.codexFullAccess) {
+        mutableStateOf(settings.codexFullAccess)
     }
     var showToken by remember { mutableStateOf(false) }
 
@@ -117,6 +125,7 @@ fun SettingsScreen(
                 supportingText = { Text("Example: http://192.168.1.50:2440") },
                 singleLine = true,
             )
+
             OutlinedTextField(
                 value = durableTailnetBaseUrl,
                 onValueChange = { durableTailnetBaseUrl = it },
@@ -125,6 +134,7 @@ fun SettingsScreen(
                 supportingText = { Text("Example: http://100.64.0.1:2440") },
                 singleLine = true,
             )
+
             OutlinedTextField(
                 value = durableHostToken,
                 onValueChange = { durableHostToken = it },
@@ -162,6 +172,33 @@ fun SettingsScreen(
                 singleLine = true,
             )
 
+            Text("Codex permissions", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text("Full host access", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Default for new Codex sessions. Allows unrestricted access to files, " +
+                            "credentials, processes, and the network without approval prompts.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = codexFullAccess,
+                    onCheckedChange = { codexFullAccess = it },
+                    modifier = Modifier.semantics {
+                        contentDescription = "Full host access for new Codex sessions"
+                    },
+                )
+            }
+
             Spacer(Modifier.height(8.dp))
             Button(
                 onClick = {
@@ -171,6 +208,7 @@ fun SettingsScreen(
                         durableTailnetBaseUrl,
                         durableHostToken,
                         workingDirectory,
+                        codexFullAccess,
                     )
                     onBack()
                 },

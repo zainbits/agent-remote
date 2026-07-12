@@ -82,7 +82,12 @@ class GrokAcpClient : AgentBackend {
 
     override fun isConnected(): Boolean = connected.get() && sessionId != null
 
-    override suspend fun connectNew(baseUrl: String, secret: String, workingDirectory: String) {
+    override suspend fun connectNew(
+        baseUrl: String,
+        secret: String,
+        workingDirectory: String,
+        codexFullAccess: Boolean,
+    ) {
         val generation = openAndInitialize(baseUrl, secret, workingDirectory)
         try {
             val newSession = requestRpc(

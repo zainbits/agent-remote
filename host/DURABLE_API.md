@@ -8,7 +8,7 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | --- | --- | --- |
 | `GET` | `/api/v1/health` | Process readiness without exposing job data |
 | `GET` | `/api/v1/sessions?backend=codex|grok&cwd=…&limit=50` | List and lazily adopt sessions |
-| `POST` | `/api/v1/sessions` | Create a durable session from `{ backend, cwd }` |
+| `POST` | `/api/v1/sessions` | Create a durable session from `{ backend, cwd, codexFullAccess? }` |
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
 | `GET` | `/api/v1/sessions/{id}/commands` | Refresh the backend-specific slash-command catalog |
 | `GET` | `/api/v1/sessions/{id}/status` | Read live Codex account limits plus native thread configuration/context status |
@@ -32,7 +32,7 @@ Clients first fetch the session snapshot and its `latestEventId`, then poll stri
 
 Session snapshots and `usage.updated` events include the merged model name/ID, reasoning effort, used tokens, and context capacity when the backend reports them. Grok snapshots also include headless-compatible built-ins and installed skills. Informational slash reports are persisted as ordinary assistant output so they survive observer disconnects and replay.
 
-Codex workers keep workspace-write filesystem isolation but explicitly enable command networking for both new and resumed turns. The Codex status endpoint reads current account/rate-limit snapshots through app-server and combines them with the thread rollout's last-token/context-window data; account details are returned transiently and are not persisted in the durable database.
+`codexFullAccess` defaults to `true` and is persisted with the session. Full-access Codex sessions pass `--dangerously-bypass-approvals-and-sandbox` on both new and resumed turns. When it is `false`, workers use `workspace-write`, `approval_policy=never`, and explicit command networking instead. The Codex status endpoint reports the stored worker policy, reads current account/rate-limit snapshots through app-server, and combines them with the thread rollout's last-token/context-window data; account details are returned transiently and are not persisted in the durable database.
 
 The service wrapper also exports non-interactive toolchain paths for Linuxbrew, `~/.local/bin`, the local Temurin JDK, and Android SDK. This lets delegated Codex login shells find `gh` and `androidrun` without depending on interactive `~/.zshrc` startup.
 
