@@ -9,6 +9,30 @@ SERVICE_TARGET="$HOME/.config/systemd/user/agentremote-durable.service"
 cd "$SCRIPT_DIR"
 
 # systemd user services do not inherit interactive zsh/nvm PATH setup.
+# Export the same stable toolchain roots needed by delegated Codex commands;
+# login shells preserve this PATH but do not source the interactive ~/.zshrc.
+path=(
+  "$HOME/.local/bin"
+  /home/linuxbrew/.linuxbrew/bin
+  /home/linuxbrew/.linuxbrew/sbin
+  $path
+)
+if [[ -d "$HOME/.local/share/jdks/temurin-21" ]]; then
+  export JAVA_HOME="$HOME/.local/share/jdks/temurin-21"
+  path=("$JAVA_HOME/bin" $path)
+fi
+if [[ -d "$HOME/Android/Sdk" ]]; then
+  export ANDROID_HOME="$HOME/Android/Sdk"
+  export ANDROID_SDK_ROOT="$ANDROID_HOME"
+  path=(
+    "$ANDROID_HOME/platform-tools"
+    "$ANDROID_HOME/cmdline-tools/latest/bin"
+    $path
+  )
+fi
+typeset -U path
+export PATH
+
 if [[ -z ${AGENTREMOTE_CODEX_BIN:-} ]] && ! command -v codex >/dev/null 2>&1; then
   codex_candidates=("$HOME"/.nvm/versions/node/*/bin/codex(N))
   if (( ${#codex_candidates} > 0 )); then
