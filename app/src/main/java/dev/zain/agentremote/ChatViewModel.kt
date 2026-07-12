@@ -117,7 +117,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      */
     private var suppressUserEcho: Boolean = false
 
-    private val informationCommands = setOf("context", "usage", "session-info")
+    private val informationCommands = setOf("context", "usage", "session-info", "status")
 
     private val localSlashCommands = listOf(
         SlashCommand(
@@ -172,15 +172,37 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ),
     )
 
+    private val codexStatusCommand = SlashCommand(
+        name = "status",
+        description = "Show current session configuration and usage",
+        source = SlashCommandSource.APP,
+    )
+
+    private fun localSlashCommandsFor(kind: BackendKind = activeBackendKind): List<SlashCommand> =
+        if (kind == BackendKind.CODEX) {
+            localSlashCommands + codexStatusCommand
+        } else {
+            localSlashCommands
+        }
+
     val settingsFlow = settingsRepo.settings
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     init {
-        _ui.update { it.copy(slashCommands = localSlashCommands) }
+        _ui.update { it.copy(slashCommands = localSlashCommandsFor()) }
         viewModelScope.launch {
             settingsRepo.settings.collect { s ->
-                if (_ui.value.screen == AppScreen.HOME) activeBackendKind = s.backendKind
-                _ui.update { it.copy(settings = s) }
+                if (_ui.value.screen == AppScreen.HOME) {
+                    activeBackendKind = s.backendKind
+                    _ui.update {
+                        it.copy(
+                            settings = s,
+                            slashCommands = localSlashCommandsFor(s.backendKind),
+                        )
+                    }
+                } else {
+                    _ui.update { it.copy(settings = s) }
+                }
             }
         }
         eventsJobs += viewModelScope.launch {
@@ -359,6 +381,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 sessions = sessionsByBackend[kind].orEmpty(),
                 sessionsError = sessionErrorsByBackend[kind],
                 sessionsLoading = false,
+                slashCommands = localSlashCommandsFor(kind),
             )
         }
         viewModelScope.launch {
@@ -393,7 +416,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     historyLoading = false,
                     messages = emptyList(),
                     draft = "",
-                    slashCommands = localSlashCommands,
+                    slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     commandOutput = null,
                 )
@@ -456,7 +479,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     historyLoading = true,
                     messages = emptyList(),
                     draft = "",
-                    slashCommands = localSlashCommands,
+                    slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     commandOutput = null,
                 )
@@ -509,7 +532,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     statusLine = "Disconnected",
                     messages = emptyList(),
                     draft = "",
-                    slashCommands = localSlashCommands,
+                    slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     commandOutput = null,
                     activeSessionTitle = null,
@@ -539,7 +562,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     } else {
                         "Disconnected"
                     },
-                    slashCommands = localSlashCommands,
+                    slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     commandOutput = null,
                     historyLoading = false,
@@ -894,7 +917,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         messages = emptyList(),
                         historyLoading = true,
                         usage = AgentUsage(),
-                        slashCommands = localSlashCommands,
+                        slashCommands = localSlashCommandsFor(),
                         busy = false,
                         reconnecting = true,
                         canReconnect = true,
@@ -995,6 +1018,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 _ui.update { it.copy(draft = "") }
                 showUsageOutput(command)
             }
+            "status" -> {
+                if (activeBackendKind != BackendKind.CODEX) return false
+                _ui.update { it.copy(draft = "") }
+                showStatusOutput()
+            }
             "help", "?" -> showSlashHelp()
             else -> return false
         }
@@ -1058,6 +1086,30 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             progress = usageProgress(usage),
         )
     }
+
+    private fun showStatusOutput() {
+        val usage = _ui.value.usage
+        showCommandOutput(
+            command = "status",
+            body = statusBody(usage),
+            progress = usageProgress(usage),
+        )
+    }
+
+    private fun statusBody(usage: AgentUsage): String = buildString {
+        append(usageBody(usage))
+        appendLine()
+        appendLine()
+        appendLine("**Permissions**")
+        appendLine("Workspace write · approval prompts disabled")
+        appendLine()
+        appendLine("**Working directory**")
+        val connection = _ui.value.connection as? ConnectionState.Connected
+        val cwd = connection?.cwd
+            ?.takeIf { it.isNotBlank() }
+            ?: _ui.value.settings.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
+        append("`$cwd`")
+    }.trim()
 
     private fun usageBody(usage: AgentUsage): String = buildString {
         appendLine("**Model**")
@@ -1339,7 +1391,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             is AgentEvent.SlashCommandsChanged -> {
-                val commands = (localSlashCommands + event.commands)
+                val commands = (localSlashCommandsFor() + event.commands)
                     .distinctBy { it.name.lowercase() }
                 _ui.update { it.copy(slashCommands = commands) }
             }
@@ -1500,7 +1552,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 output != null && !output.running && output.command in informationCommands
             ) {
                 output.copy(
-                    body = usageBody(merged),
+                    body = if (output.command == "status") {
+                        statusBody(merged)
+                    } else {
+                        usageBody(merged)
+                    },
                     progress = usageProgress(merged),
                 )
             } else {
