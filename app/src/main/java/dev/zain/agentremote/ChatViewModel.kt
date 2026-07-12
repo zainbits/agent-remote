@@ -8,6 +8,8 @@ import dev.zain.agentremote.agent.AgentRequestCancelledException
 import dev.zain.agentremote.agent.AgentUsage
 import dev.zain.agentremote.agent.ChatMessage
 import dev.zain.agentremote.agent.ChatRole
+import dev.zain.agentremote.agent.CodexRateLimitWindow
+import dev.zain.agentremote.agent.CodexStatusSnapshot
 import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.DurableAgentClient
 import dev.zain.agentremote.agent.SessionSummary
@@ -31,8 +33,13 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.NumberFormat
+import java.time.Instant
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.roundToInt
 
 enum class AppScreen {
     HOME,
@@ -110,6 +117,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var sessionStatusPollingJob: Job? = null
     private var activeSessionIdForReconnect: String? = null
     private var activeSessionCwdForReconnect: String = AppSettings.DEFAULT_CWD
+    private var latestCodexStatus: CodexStatusSnapshot? = null
     /**
      * After a local [send], the agent echoes the prompt as `user_message_chunk`.
      * We already inserted an optimistic USER bubble, so ignore those deltas until
@@ -992,6 +1000,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         streamingAssistantId = null
         streamingThoughtId = null
         suppressUserEcho = false
+        latestCodexStatus = null
     }
 
     private fun runLocalSlashCommand(text: String): Boolean {
@@ -1088,28 +1097,260 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun showStatusOutput() {
-        val usage = _ui.value.usage
         showCommandOutput(
             command = "status",
-            body = statusBody(usage),
-            progress = usageProgress(usage),
+            status = "Refreshing Codex status…",
+            running = true,
         )
+        viewModelScope.launch {
+            runCatching { codexBackend.fetchCodexStatus() }
+                .onSuccess { status ->
+                    latestCodexStatus = status
+                    mergeUsage(
+                        AgentUsage(
+                            usedTokens = status.contextUsedTokens,
+                            contextWindowTokens = status.contextWindowTokens,
+                            modelId = status.modelId,
+                            modelName = status.modelName,
+                            reasoningEffort = status.reasoningEffort,
+                        ),
+                    )
+                    val usage = _ui.value.usage
+                    showCommandOutput(
+                        command = "status",
+                        body = statusBody(usage, status),
+                        progress = usageProgress(usage),
+                    )
+                }
+                .onFailure { error ->
+                    val usage = _ui.value.usage
+                    showCommandOutput(
+                        command = "status",
+                        body = buildString {
+                            append(statusBody(usage, null))
+                            appendLine()
+                            appendLine()
+                            appendLine("**Live account limits unavailable**")
+                            append(error.message ?: error::class.java.simpleName)
+                        },
+                        status = "Refresh failed",
+                        isError = true,
+                        progress = usageProgress(usage),
+                    )
+                }
+        }
     }
 
-    private fun statusBody(usage: AgentUsage): String = buildString {
-        append(usageBody(usage))
+    private fun statusBody(
+        usage: AgentUsage,
+        status: CodexStatusSnapshot? = latestCodexStatus,
+    ): String = buildString {
+        append("# OpenAI Codex")
+        status?.cliVersion?.let { append(" v$it") }
+        appendLine()
+        appendLine()
+        appendLine("[Codex usage and credits](https://chatgpt.com/codex/settings/usage)")
+        appendLine()
+        appendLine("**Model**")
+        val model = status?.modelName ?: usage.modelName ?: status?.modelId ?: usage.modelId
+        val modelDetails = buildList {
+            (status?.reasoningEffort ?: usage.reasoningEffort)?.let {
+                add("reasoning ${it.lowercase()}")
+            }
+            status?.reasoningSummary?.let { add("summaries ${it.lowercase()}") }
+        }
+        append(model?.let { "`$it`" } ?: "Not reported")
+        if (modelDetails.isNotEmpty()) append(" (${modelDetails.joinToString()})")
+        status?.modelProvider?.takeIf { it.isNotBlank() && it != "openai" }?.let { provider ->
+            appendLine()
+            append("Provider: $provider")
+        }
         appendLine()
         appendLine()
         appendLine("**Permissions**")
-        appendLine("Workspace write · approval prompts disabled")
+        appendLine(permissionSummary(status))
         appendLine()
         appendLine("**Working directory**")
         val connection = _ui.value.connection as? ConnectionState.Connected
-        val cwd = connection?.cwd
+        val cwd = status?.cwd
+            ?.takeIf { it.isNotBlank() }
+            ?: connection?.cwd
             ?.takeIf { it.isNotBlank() }
             ?: _ui.value.settings.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
-        append("`$cwd`")
+        appendLine("`$cwd`")
+        appendLine()
+        appendLine("**Agents.md**")
+        val agentsFiles = status?.agentsFiles.orEmpty()
+        if (agentsFiles.isEmpty()) {
+            appendLine("<none>")
+        } else {
+            appendLine(agentsFiles.joinToString { "`$it`" })
+        }
+
+        status?.accountType?.let { accountType ->
+            appendLine()
+            appendLine("**Account**")
+            val account = buildString {
+                append(status.accountEmail ?: if (accountType == "apiKey") "API key" else "ChatGPT")
+                status.accountPlanType?.let { plan -> append(" (${formatPlanType(plan)})") }
+            }
+            appendLine(account)
+        }
+        status?.collaborationMode?.let {
+            appendLine()
+            appendLine("**Collaboration mode**")
+            appendLine(it.replaceFirstChar(Char::uppercase))
+        }
+        status?.threadName?.let {
+            appendLine()
+            appendLine("**Thread name**")
+            appendLine(it)
+        }
+        val sessionId = status?.sessionId ?: connection?.sessionId
+        sessionId?.let {
+            appendLine()
+            appendLine("**Session**")
+            appendLine("`$it`")
+        }
+        status?.forkedFrom?.let {
+            appendLine()
+            appendLine("**Forked from**")
+            appendLine("`$it`")
+        }
+
+        val contextUsed = usage.usedTokens ?: status?.contextUsedTokens
+        val contextWindow = usage.contextWindowTokens ?: status?.contextWindowTokens
+        if (contextUsed != null || contextWindow != null) {
+            appendLine()
+            appendLine("**Context window**")
+            when {
+                contextUsed != null && contextWindow != null && contextWindow > 0L -> {
+                    val left = codexContextPercentRemaining(contextUsed, contextWindow)
+                    appendLine(
+                        "$left% left (${formatInteger(contextUsed)} used / " +
+                            formatInteger(contextWindow) + ")",
+                    )
+                }
+                contextUsed != null -> appendLine("${formatInteger(contextUsed)} tokens used")
+                contextWindow != null -> appendLine("${formatInteger(contextWindow)} token capacity")
+            }
+        }
+
+        if (status?.accountType != "chatgpt") {
+            status?.totalTokenUsage?.let { tokenUsage ->
+                val input = tokenUsage.inputTokens
+                val cached = tokenUsage.cachedInputTokens ?: 0L
+                val output = tokenUsage.outputTokens
+                if (input != null || output != null) {
+                    val nonCachedInput = ((input ?: 0L) - cached).coerceAtLeast(0L)
+                    val blendedTotal = nonCachedInput + (output ?: 0L)
+                    appendLine()
+                    appendLine("**Token usage**")
+                    appendLine(
+                        "${formatInteger(blendedTotal)} total " +
+                            "(${formatInteger(nonCachedInput)} input + " +
+                            "${formatInteger(output ?: 0L)} output)",
+                    )
+                }
+            }
+        }
+
+        status?.primaryRateLimit?.let { appendRateLimit(it, primary = true) }
+        status?.secondaryRateLimit?.let { appendRateLimit(it, primary = false) }
+        status?.credits?.let { credits ->
+            val value = when {
+                credits.unlimited -> "Unlimited"
+                credits.hasCredits && !credits.balance.isNullOrBlank() -> "${credits.balance} credits"
+                else -> null
+            }
+            value?.let {
+                appendLine()
+                appendLine("**Credits**")
+                appendLine(it)
+            }
+        }
+        status?.spendLimit?.let { limit ->
+            appendLine()
+            appendLine("**Monthly credit limit**")
+            val remaining = limit.remainingPercent?.let { "$it% left" } ?: "Not reported"
+            append(remaining)
+            if (limit.used != null && limit.limit != null) {
+                append(" · ${limit.used} of ${limit.limit} credits used")
+            }
+            limit.resetsAtEpochSeconds?.let { append(" · resets ${formatResetTime(it)}") }
+            appendLine()
+        }
+        status?.rateLimitResetCreditsAvailable?.takeIf { it > 0L }?.let {
+            appendLine()
+            appendLine("**Usage-limit resets**")
+            appendLine("$it available")
+        }
     }.trim()
+
+    private fun StringBuilder.appendRateLimit(window: CodexRateLimitWindow, primary: Boolean) {
+        val used = window.usedPercent?.coerceIn(0, 100) ?: return
+        val remaining = 100 - used
+        val label = when (window.windowDurationMinutes) {
+            300L -> "5h limit"
+            10_080L -> "Weekly limit"
+            else -> if (primary) "Usage limit" else "Secondary usage limit"
+        }
+        appendLine()
+        appendLine("**$label**")
+        append("`${rateLimitBar(remaining)}` $remaining% left")
+        window.resetsAtEpochSeconds?.let { append(" · resets ${formatResetTime(it)}") }
+        appendLine()
+    }
+
+    private fun permissionSummary(status: CodexStatusSnapshot?): String {
+        val sandbox = when (status?.sandboxMode) {
+            "workspace-write" -> if (status.networkAccess == true) {
+                "workspace with network access"
+            } else {
+                "workspace"
+            }
+            "read-only" -> "read only"
+            "danger-full-access" -> "full access"
+            null -> "workspace"
+            else -> status.sandboxMode.replace('-', ' ')
+        }
+        val approval = when (status?.approvalPolicy) {
+            "never" -> "never"
+            "on-request" -> "ask for approval"
+            null -> "never"
+            else -> status.approvalPolicy.replace('-', ' ')
+        }
+        return "Custom ($sandbox, $approval)"
+    }
+
+    private fun formatPlanType(value: String): String = when (value.lowercase()) {
+        "self_serve_business_usage_based", "team" -> "Business"
+        "enterprise_cbp_usage_based", "enterprise" -> "Enterprise"
+        else -> value.split('_').joinToString(" ") { it.replaceFirstChar(Char::uppercase) }
+    }
+
+    private fun codexContextPercentRemaining(used: Long, window: Long): Int {
+        val effectiveWindow = window - CODEX_CONTEXT_BASELINE_TOKENS
+        if (effectiveWindow <= 0L) return 0
+        val effectiveUsed = (used - CODEX_CONTEXT_BASELINE_TOKENS).coerceAtLeast(0L)
+        val remaining = (effectiveWindow - effectiveUsed).coerceAtLeast(0L)
+        return (remaining.toDouble() / effectiveWindow.toDouble() * 100.0)
+            .roundToInt()
+            .coerceIn(0, 100)
+    }
+
+    private fun rateLimitBar(percentRemaining: Int): String {
+        val filled = (percentRemaining.coerceIn(0, 100) / 5.0).roundToInt().coerceIn(0, 20)
+        return "[" + "█".repeat(filled) + "░".repeat(20 - filled) + "]"
+    }
+
+    private fun formatResetTime(epochSeconds: Long): String {
+        val zone = ZoneId.systemDefault()
+        val reset = Instant.ofEpochSecond(epochSeconds).atZone(zone)
+        val now = ZonedDateTime.now(zone)
+        val pattern = if (reset.toLocalDate() == now.toLocalDate()) "HH:mm" else "HH:mm 'on' d MMM"
+        return reset.format(DateTimeFormatter.ofPattern(pattern, Locale.getDefault()))
+    }
 
     private fun usageBody(usage: AgentUsage): String = buildString {
         appendLine("**Model**")
@@ -1553,7 +1794,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             ) {
                 output.copy(
                     body = if (output.command == "status") {
-                        statusBody(merged)
+                        statusBody(merged, latestCodexStatus)
                     } else {
                         usageBody(merged)
                     },
@@ -1698,6 +1939,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
+        const val CODEX_CONTEXT_BASELINE_TOKENS = 12_000L
         const val RECONNECT_ATTEMPT_TIMEOUT_MILLIS = 25_000L
         const val SESSION_STATUS_POLL_INTERVAL_MILLIS = 2_000L
     }

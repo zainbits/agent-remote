@@ -21,6 +21,35 @@ import os
 import sys
 import time
 
+if "app-server" in sys.argv:
+    for line in sys.stdin:
+        request = json.loads(line)
+        request_id = request.get("id")
+        if request_id is None:
+            continue
+        method = request.get("method")
+        if method == "thread/read":
+            result = {"thread": {
+                "id": request.get("params", {}).get("threadId"),
+                "cliVersion": "0.test",
+                "cwd": os.getcwd(),
+                "modelProvider": "openai",
+            }}
+        elif method == "account/read":
+            result = {"requiresOpenaiAuth": True, "account": {
+                "type": "chatgpt", "email": "test@example.invalid", "planType": "plus"
+            }}
+        elif method == "account/rateLimits/read":
+            result = {"rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 2000000000},
+                "secondary": {"usedPercent": 25, "windowDurationMins": 10080, "resetsAt": 2000600000},
+            }, "rateLimitResetCredits": {"availableCount": 2, "credits": []}}
+        else:
+            result = {}
+        print(json.dumps({"id": request_id, "result": result}), flush=True)
+    raise SystemExit(0)
+
 prompt = sys.stdin.read()
 print(json.dumps({"type": "thread.started", "thread_id": "codex-thread-test"}), flush=True)
 print(json.dumps({"type": "turn.started"}), flush=True)
@@ -193,6 +222,88 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("gpt-test", session["modelName"])
         self.assertEqual("xhigh", session["reasoningEffort"])
 
+    def test_codex_workers_enable_network_for_new_and_resumed_turns(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        new_command = self.manager._command(session, "first")
+        self.assertIn("sandbox_workspace_write.network_access=true", new_command)
+        self.assertIn("workspace-write", new_command)
+
+        self.store.set_backend_session_id(session["id"], "existing-thread")
+        resumed = self.manager._command(self.store.get_session(session["id"]), "next")
+        self.assertIn("resume", resumed)
+        self.assertIn("sandbox_workspace_write.network_access=true", resumed)
+
+    def test_codex_rollout_status_matches_native_context_fields(self):
+        rollout = self.workspace / "rollout.jsonl"
+        records = [
+            {
+                "type": "world_state",
+                "payload": {
+                    "state": {
+                        "agents_md": {"directory": str(self.workspace), "text": "rules"},
+                    },
+                },
+            },
+            {
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-test",
+                    "effort": "xhigh",
+                    "summary": "auto",
+                    "approval_policy": "never",
+                    "approvals_reviewer": "user",
+                    "collaboration_mode": {"mode": "default", "settings": {}},
+                    "sandbox_policy": {"type": "workspace-write", "network_access": True},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 12000,
+                            "cached_input_tokens": 9000,
+                            "output_tokens": 345,
+                            "reasoning_output_tokens": 100,
+                            "total_tokens": 12345,
+                        },
+                        "total_token_usage": {
+                            "input_tokens": 20000,
+                            "cached_input_tokens": 10000,
+                            "output_tokens": 2000,
+                            "reasoning_output_tokens": 1000,
+                            "total_tokens": 22000,
+                        },
+                        "model_context_window": 353400,
+                    },
+                },
+            },
+        ]
+        rollout.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
+        status = self.manager.catalog._codex_rollout_status(rollout)
+
+        self.assertEqual(12345, status["contextUsedTokens"])
+        self.assertEqual(353400, status["contextWindowTokens"])
+        self.assertEqual("auto", status["reasoningSummary"])
+        self.assertEqual("default", status["collaborationMode"])
+        self.assertTrue(status["networkAccess"])
+        self.assertEqual([str(self.workspace / "AGENTS.md")], status["agentsFiles"])
+
+    def test_codex_status_reads_account_limits_and_reports_worker_policy(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+
+        status = self.manager.codex_status(session["id"])
+
+        self.assertEqual("plus", status["account"]["planType"])
+        self.assertEqual(40, status["rateLimits"]["primary"]["usedPercent"])
+        self.assertEqual(25, status["rateLimits"]["secondary"]["usedPercent"])
+        self.assertEqual(2, status["rateLimitResetCreditsAvailable"])
+        self.assertEqual("workspace-write", status["sandboxMode"])
+        self.assertTrue(status["networkAccess"])
+        self.assertEqual("never", status["approvalPolicy"])
+
     def test_grok_command_catalog_includes_builtins_and_installed_skills(self):
         skill = Path(self.temporary.name, ".grok", "skills", "verify", "SKILL.md")
         skill.parent.mkdir(parents=True)
@@ -267,6 +378,14 @@ class DurableJobsTest(unittest.TestCase):
             with urllib.request.urlopen(commands_request, timeout=2) as response:
                 commands = json.load(response)
             self.assertEqual([], commands["commands"])
+
+            status_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{created['session']['id']}/status",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(status_request, timeout=2) as response:
+                status = json.load(response)
+            self.assertEqual(40, status["status"]["rateLimits"]["primary"]["usedPercent"])
 
             with self.assertRaises(urllib.error.HTTPError) as unauthorized:
                 urllib.request.urlopen(base + "/api/v1/sessions?backend=codex&cwd=/", timeout=2)

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-import selectors
+import queue
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +69,55 @@ class LegacyCatalog:
             self.store.import_history(session_id, history)
         except Exception as error:
             LOGGER.warning("Could not import history for %s session %s: %s", session["backend"], session_id, error)
+
+    def codex_thread_status(self, session: dict[str, Any]) -> dict[str, Any]:
+        backend_id = str(session.get("backendSessionId") or "").strip()
+        status = self._codex_status_base(session)
+        if not backend_id:
+            return status
+        result = self._codex_rpc(
+            "thread/read",
+            {"threadId": backend_id, "includeTurns": False},
+        )
+        return self._merge_codex_thread_status(status, result.get("thread") or {})
+
+    def codex_status(self, session: dict[str, Any]) -> dict[str, Any]:
+        backend_id = str(session.get("backendSessionId") or "").strip()
+        requests = [
+            ("account/read", {"refreshToken": False}),
+            ("account/rateLimits/read", {}),
+        ]
+        if backend_id:
+            requests.append(
+                ("thread/read", {"threadId": backend_id, "includeTurns": False}),
+            )
+        results = self._codex_rpc_many(requests)
+        status = self._codex_status_base(session)
+        thread_result = results.get("thread/read") or {}
+        status = self._merge_codex_thread_status(status, thread_result.get("thread") or {})
+
+        account = (results.get("account/read") or {}).get("account") or {}
+        if isinstance(account, dict):
+            status["account"] = {
+                "type": account.get("type"),
+                "email": account.get("email"),
+                "planType": account.get("planType"),
+            }
+
+        limits_result = results.get("account/rateLimits/read") or {}
+        limits_by_id = limits_result.get("rateLimitsByLimitId")
+        rate_limits = None
+        if isinstance(limits_by_id, dict):
+            rate_limits = limits_by_id.get("codex")
+        if not isinstance(rate_limits, dict):
+            candidate = limits_result.get("rateLimits")
+            rate_limits = candidate if isinstance(candidate, dict) else None
+        if rate_limits is not None:
+            status["rateLimits"] = rate_limits
+        reset_credits = limits_result.get("rateLimitResetCredits")
+        if isinstance(reset_credits, dict):
+            status["rateLimitResetCreditsAvailable"] = reset_credits.get("availableCount")
+        return status
 
     def _sync_codex(self, cwd: str, limit: int) -> None:
         result = self._codex_rpc(
@@ -182,6 +232,168 @@ class LegacyCatalog:
         return history
 
     @staticmethod
+    def _codex_status_base(session: dict[str, Any]) -> dict[str, Any]:
+        backend_id = str(session.get("backendSessionId") or "").strip()
+        return {
+            "modelId": session.get("modelId"),
+            "modelName": session.get("modelName") or session.get("modelId"),
+            "reasoningEffort": session.get("reasoningEffort"),
+            "cwd": session.get("cwd"),
+            "sessionId": backend_id or session.get("id"),
+            "durableSessionId": session.get("id"),
+            "contextUsedTokens": session.get("usedTokens"),
+            "contextWindowTokens": session.get("contextWindowTokens"),
+        }
+
+    def _merge_codex_thread_status(
+        self,
+        status: dict[str, Any],
+        thread: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = dict(status)
+        if not isinstance(thread, dict):
+            return merged
+        for source, target in (
+            ("id", "sessionId"),
+            ("name", "threadName"),
+            ("forkedFromId", "forkedFrom"),
+            ("cwd", "cwd"),
+            ("cliVersion", "cliVersion"),
+            ("modelProvider", "modelProvider"),
+        ):
+            value = thread.get(source)
+            if value is not None and str(value).strip():
+                merged[target] = value
+        rollout_path = thread.get("path")
+        if rollout_path:
+            merged.update(self._codex_rollout_status(Path(str(rollout_path))))
+        return merged
+
+    @classmethod
+    def _codex_rollout_status(cls, path: Path) -> dict[str, Any]:
+        if not path.is_file():
+            return {}
+        turn_context: dict[str, Any] | None = None
+        token_info: dict[str, Any] | None = None
+        agents_files: list[str] | None = None
+        for event in cls._reverse_jsonl(path):
+            event_type = event.get("type")
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if turn_context is None and event_type == "turn_context":
+                turn_context = payload
+            elif (
+                token_info is None
+                and event_type == "event_msg"
+                and payload.get("type") == "token_count"
+                and isinstance(payload.get("info"), dict)
+            ):
+                token_info = payload["info"]
+            elif agents_files is None and event_type == "world_state":
+                state = payload.get("state")
+                if isinstance(state, dict):
+                    agents_files = cls._agents_md_paths(state.get("agents_md"))
+            if turn_context is not None and token_info is not None and agents_files is not None:
+                break
+
+        status: dict[str, Any] = {}
+        if turn_context is not None:
+            collaboration = turn_context.get("collaboration_mode")
+            collaboration_mode = (
+                collaboration.get("mode") if isinstance(collaboration, dict) else collaboration
+            )
+            sandbox = turn_context.get("sandbox_policy")
+            status.update(
+                {
+                    "modelId": turn_context.get("model"),
+                    "modelName": turn_context.get("model"),
+                    "reasoningEffort": turn_context.get("effort"),
+                    "reasoningSummary": turn_context.get("summary"),
+                    "approvalPolicy": turn_context.get("approval_policy"),
+                    "approvalsReviewer": turn_context.get("approvals_reviewer"),
+                    "collaborationMode": collaboration_mode,
+                }
+            )
+            if isinstance(sandbox, dict):
+                status["sandboxMode"] = sandbox.get("type")
+                status["networkAccess"] = sandbox.get("network_access")
+        if token_info is not None:
+            last = token_info.get("last_token_usage")
+            total = token_info.get("total_token_usage")
+            if isinstance(last, dict):
+                status["lastTokenUsage"] = cls._camel_token_usage(last)
+                status["contextUsedTokens"] = last.get("total_tokens")
+            if isinstance(total, dict):
+                status["totalTokenUsage"] = cls._camel_token_usage(total)
+            status["contextWindowTokens"] = token_info.get("model_context_window")
+        if agents_files is not None:
+            status["agentsFiles"] = agents_files
+        return {key: value for key, value in status.items() if value is not None}
+
+    @staticmethod
+    def _camel_token_usage(usage: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "inputTokens": usage.get("input_tokens"),
+            "cachedInputTokens": usage.get("cached_input_tokens"),
+            "outputTokens": usage.get("output_tokens"),
+            "reasoningOutputTokens": usage.get("reasoning_output_tokens"),
+            "totalTokens": usage.get("total_tokens"),
+        }
+
+    @classmethod
+    def _agents_md_paths(cls, value: Any) -> list[str]:
+        paths: list[str] = []
+
+        def visit(item: Any) -> None:
+            if isinstance(item, dict):
+                path_value = item.get("path")
+                directory = item.get("directory")
+                if isinstance(path_value, str) and path_value.strip():
+                    paths.append(path_value)
+                elif isinstance(directory, str) and directory.strip():
+                    paths.append(str(Path(directory) / "AGENTS.md"))
+                for nested in item.values():
+                    if isinstance(nested, (dict, list)):
+                        visit(nested)
+            elif isinstance(item, list):
+                for nested in item:
+                    visit(nested)
+
+        visit(value)
+        return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _reverse_jsonl(path: Path):
+        with path.open("rb") as source:
+            source.seek(0, 2)
+            position = source.tell()
+            buffer = b""
+            while position > 0:
+                size = min(65_536, position)
+                position -= size
+                source.seek(position)
+                buffer = source.read(size) + buffer
+                lines = buffer.split(b"\n")
+                buffer = lines[0]
+                for raw in reversed(lines[1:]):
+                    if not raw.strip():
+                        continue
+                    try:
+                        value = json.loads(raw)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(value, dict):
+                        yield value
+            if buffer.strip():
+                try:
+                    value = json.loads(buffer)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return
+                if isinstance(value, dict):
+                    yield value
+
+    @staticmethod
     def _codex_tool(item_type: str, item: dict[str, Any]) -> tuple[str, str | None]:
         if item_type == "commandExecution":
             title = _content_text(item.get("command")) or str(item.get("command") or "Command")
@@ -266,7 +478,12 @@ class LegacyCatalog:
         return history
 
     def _codex_rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        selector: selectors.BaseSelector | None = None
+        return self._codex_rpc_many([(method, params)]).get(method, {})
+
+    def _codex_rpc_many(
+        self,
+        requests_to_make: list[tuple[str, dict[str, Any]]],
+    ) -> dict[str, dict[str, Any]]:
         process = subprocess.Popen(
             [self.codex_bin, "app-server"],
             stdin=subprocess.PIPE,
@@ -291,32 +508,59 @@ class LegacyCatalog:
                     },
                 },
                 {"method": "initialized", "params": {}},
-                {"method": method, "id": 2, "params": params},
             ]
+            request_ids: dict[int, str] = {}
+            for request_id, (method, params) in enumerate(requests_to_make, start=2):
+                requests.append({"method": method, "id": request_id, "params": params})
+                request_ids[request_id] = method
             for request in requests:
                 process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
             process.stdin.flush()
 
-            selector = selectors.DefaultSelector()
-            selector.register(process.stdout, selectors.EVENT_READ)
+            messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+            def read_messages() -> None:
+                assert process.stdout is not None
+                try:
+                    for line in process.stdout:
+                        try:
+                            value = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(value, dict):
+                            messages.put(value)
+                finally:
+                    messages.put(None)
+
+            reader = threading.Thread(target=read_messages, name="codex-rpc-reader", daemon=True)
+            reader.start()
             deadline = time.monotonic() + 15
+            results: dict[str, dict[str, Any]] = {}
             while time.monotonic() < deadline:
-                ready = selector.select(timeout=max(0.0, deadline - time.monotonic()))
-                if not ready:
+                try:
+                    message = messages.get(timeout=max(0.0, deadline - time.monotonic()))
+                except queue.Empty:
                     break
-                line = process.stdout.readline()
-                if not line:
+                if message is None:
                     break
-                message = json.loads(line)
-                if message.get("id") != 2:
+                method = request_ids.get(message.get("id"))
+                if method is None:
                     continue
                 if message.get("error"):
-                    raise RuntimeError(str(message["error"].get("message") or message["error"]))
-                return message.get("result") or {}
-            raise TimeoutError(f"Codex app-server timed out during {method}")
+                    LOGGER.warning(
+                        "Codex app-server %s failed: %s",
+                        method,
+                        message["error"].get("message") or message["error"],
+                    )
+                    results[method] = {}
+                else:
+                    result = message.get("result")
+                    results[method] = result if isinstance(result, dict) else {}
+                if len(results) == len(request_ids):
+                    return results
+            missing = ", ".join(method for method in request_ids.values() if method not in results)
+            raise TimeoutError(f"Codex app-server timed out during {missing}")
         finally:
-            if selector is not None:
-                selector.close()
             process.terminate()
             try:
                 process.wait(timeout=3)

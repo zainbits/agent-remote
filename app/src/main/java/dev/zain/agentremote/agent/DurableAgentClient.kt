@@ -85,6 +85,18 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
         return parseSessions(root.optJSONArray("sessions"))
     }
 
+    suspend fun fetchCodexStatus(): CodexStatusSnapshot {
+        check(kind == BackendKind.CODEX) { "Status details are only available for Codex" }
+        val id = sessionId ?: error("Not connected")
+        val root = request(
+            method = "GET",
+            path = "/api/v1/sessions/${encodePath(id)}/status",
+        )
+        val status = root.optJSONObject("status")
+            ?: error("Durable host returned no Codex status")
+        return parseCodexStatus(status)
+    }
+
     override suspend fun connectNew(baseUrl: String, secret: String, workingDirectory: String) {
         val connectionGeneration = beginConnection(baseUrl, secret, workingDirectory)
         try {
@@ -466,6 +478,83 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
         }
     }
 
+    private fun parseCodexStatus(status: JSONObject): CodexStatusSnapshot {
+        val account = status.optJSONObject("account")
+        val limits = status.optJSONObject("rateLimits")
+        return CodexStatusSnapshot(
+            cliVersion = status.optNullableString("cliVersion"),
+            modelId = status.optNullableString("modelId"),
+            modelName = status.optNullableString("modelName")
+                ?: status.optNullableString("modelId"),
+            modelProvider = status.optNullableString("modelProvider"),
+            reasoningEffort = status.optNullableString("reasoningEffort"),
+            reasoningSummary = status.optNullableString("reasoningSummary"),
+            cwd = status.optNullableString("cwd"),
+            sandboxMode = status.optNullableString("sandboxMode"),
+            networkAccess = status.optNullableBoolean("networkAccess"),
+            approvalPolicy = status.optNullableString("approvalPolicy"),
+            approvalsReviewer = status.optNullableString("approvalsReviewer"),
+            agentsFiles = status.optJSONArray("agentsFiles").toStringList(),
+            accountType = account?.optNullableString("type"),
+            accountEmail = account?.optNullableString("email"),
+            accountPlanType = account?.optNullableString("planType"),
+            collaborationMode = status.optNullableString("collaborationMode"),
+            threadName = status.optNullableString("threadName"),
+            sessionId = status.optNullableString("sessionId"),
+            forkedFrom = status.optNullableString("forkedFrom"),
+            contextUsedTokens = status.optNullableLong("contextUsedTokens"),
+            contextWindowTokens = status.optNullableLong("contextWindowTokens"),
+            lastTokenUsage = status.optJSONObject("lastTokenUsage").toCodexTokenUsage(),
+            totalTokenUsage = status.optJSONObject("totalTokenUsage").toCodexTokenUsage(),
+            primaryRateLimit = limits?.optJSONObject("primary").toRateLimitWindow(),
+            secondaryRateLimit = limits?.optJSONObject("secondary").toRateLimitWindow(),
+            credits = limits?.optJSONObject("credits")?.let {
+                CodexCredits(
+                    hasCredits = it.optBoolean("hasCredits", false),
+                    unlimited = it.optBoolean("unlimited", false),
+                    balance = it.optNullableString("balance"),
+                )
+            },
+            spendLimit = limits?.optJSONObject("individualLimit")?.let {
+                CodexSpendLimit(
+                    used = it.optNullableString("used"),
+                    limit = it.optNullableString("limit"),
+                    remainingPercent = it.optNullableInt("remainingPercent"),
+                    resetsAtEpochSeconds = it.optNullableLong("resetsAt"),
+                )
+            },
+            rateLimitResetCreditsAvailable =
+                status.optNullableLong("rateLimitResetCreditsAvailable"),
+        )
+    }
+
+    private fun JSONObject?.toCodexTokenUsage(): CodexTokenUsage? = this?.let {
+        CodexTokenUsage(
+            inputTokens = it.optNullableLong("inputTokens"),
+            cachedInputTokens = it.optNullableLong("cachedInputTokens"),
+            outputTokens = it.optNullableLong("outputTokens"),
+            reasoningOutputTokens = it.optNullableLong("reasoningOutputTokens"),
+            totalTokens = it.optNullableLong("totalTokens"),
+        )
+    }
+
+    private fun JSONObject?.toRateLimitWindow(): CodexRateLimitWindow? = this?.let {
+        CodexRateLimitWindow(
+            usedPercent = it.optNullableInt("usedPercent"),
+            windowDurationMinutes = it.optNullableLong("windowDurationMins"),
+            resetsAtEpochSeconds = it.optNullableLong("resetsAt"),
+        )
+    }
+
+    private fun JSONArray?.toStringList(): List<String> {
+        if (this == null) return emptyList()
+        return buildList {
+            for (index in 0 until length()) {
+                optString(index).takeIf { it.isNotBlank() }?.let(::add)
+            }
+        }
+    }
+
     private val JSONObject.isActive: Boolean
         get() = optString("status") in setOf("queued", "running", "cancelling")
 
@@ -477,6 +566,9 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
 
     private fun JSONObject.optNullableInt(key: String): Int? =
         takeIf { has(key) && !isNull(key) }?.optInt(key)
+
+    private fun JSONObject.optNullableBoolean(key: String): Boolean? =
+        takeIf { has(key) && !isNull(key) }?.optBoolean(key)
 
     private fun String.toSessionStatus(): SessionStatus = when (lowercase()) {
         "queued" -> SessionStatus.QUEUED

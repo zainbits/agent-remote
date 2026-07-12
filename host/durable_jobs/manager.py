@@ -15,11 +15,14 @@ from typing import Any
 
 from .catalog import LegacyCatalog
 from .metadata import MetadataProvider
-from .store import ConflictError, JobStore, NotFoundError
+from .store import ConflictError, JobStore, NotFoundError, StoreError
 
 
 MAX_DETAIL_CHARS = 16_000
 LOGGER = logging.getLogger("agentremote.host.manager")
+CODEX_SANDBOX_MODE = "workspace-write"
+CODEX_APPROVAL_POLICY = "never"
+CODEX_NETWORK_ACCESS_CONFIG = "sandbox_workspace_write.network_access=true"
 
 
 def _text(value: Any) -> str:
@@ -136,10 +139,34 @@ class JobManager:
     def session_bundle(self, session_id: str) -> dict[str, Any]:
         if self.import_legacy:
             self.catalog.import_history_if_needed(session_id)
-        self._refresh_metadata(session_id)
+        session = self._refresh_metadata(session_id)
+        if session["backend"] == "codex" and session.get("backendSessionId"):
+            self._refresh_codex_thread_metadata(session_id)
         bundle = self.store.session_bundle(session_id)
         bundle["commands"] = self.metadata.commands_for(bundle["session"]["backend"])
         return bundle
+
+    def codex_status(self, session_id: str) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        if session["backend"] != "codex":
+            raise StoreError("Status is only available for Codex sessions")
+        status = self.catalog.codex_status(session)
+        # These values are host-owned worker policy, so report what the next turn
+        # will actually use even when an older rollout predates this configuration.
+        status["sandboxMode"] = CODEX_SANDBOX_MODE
+        status["networkAccess"] = True
+        status["approvalPolicy"] = CODEX_APPROVAL_POLICY
+        usage = {
+            "modelId": status.get("modelId"),
+            "modelName": status.get("modelName"),
+            "reasoningEffort": status.get("reasoningEffort"),
+            "usedTokens": status.get("contextUsedTokens"),
+            "contextWindowTokens": status.get("contextWindowTokens"),
+        }
+        if any(value is not None for value in usage.values()):
+            self.store.update_usage(session_id, usage)
+            self.notify(session_id)
+        return status
 
     def command_catalog(self, session_id: str) -> list[dict[str, Any]]:
         session = self.store.get_session(session_id)
@@ -228,7 +255,9 @@ class JobManager:
                     "--json",
                     "--skip-git-repo-check",
                     "-c",
-                    'approval_policy="never"',
+                    f'approval_policy="{CODEX_APPROVAL_POLICY}"',
+                    "-c",
+                    CODEX_NETWORK_ACCESS_CONFIG,
                     backend_id,
                     "-",
                 ]
@@ -240,11 +269,13 @@ class JobManager:
                 "never",
                 "--skip-git-repo-check",
                 "--sandbox",
-                "workspace-write",
+                CODEX_SANDBOX_MODE,
                 "--cd",
                 cwd,
                 "-c",
-                'approval_policy="never"',
+                f'approval_policy="{CODEX_APPROVAL_POLICY}"',
+                "-c",
+                CODEX_NETWORK_ACCESS_CONFIG,
                 "-",
             ]
         command = [
@@ -367,6 +398,8 @@ class JobManager:
                         turn["prompt"],
                         compact_completed,
                     )
+                else:
+                    self._refresh_codex_thread_metadata(session["id"])
                 self.store.finish_turn(turn_id, "completed", stop_reason=stop_reason or "completed")
             self.notify(session["id"])
         except FileNotFoundError as error:
@@ -548,6 +581,26 @@ class JobManager:
         except Exception as error:
             # Metadata enriches the UI; it must never make a durable turn unavailable.
             LOGGER.warning("Could not refresh %s metadata: %s", session["backend"], error)
+        return session
+
+    def _refresh_codex_thread_metadata(self, session_id: str) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        if session["backend"] != "codex" or not session.get("backendSessionId"):
+            return session
+        try:
+            status = self.catalog.codex_thread_status(session)
+            usage = {
+                "modelId": status.get("modelId"),
+                "modelName": status.get("modelName"),
+                "reasoningEffort": status.get("reasoningEffort"),
+                "usedTokens": status.get("contextUsedTokens"),
+                "contextWindowTokens": status.get("contextWindowTokens"),
+            }
+            if any(value is not None for value in usage.values()):
+                session = self.store.update_usage(session_id, usage)
+                self.notify(session_id)
+        except Exception as error:
+            LOGGER.warning("Could not refresh Codex thread status: %s", error)
         return session
 
     def _finalize_grok_command(

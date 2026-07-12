@@ -44,6 +44,64 @@ data class AgentUsage(
     val costCurrency: String? = null,
 )
 
+data class CodexTokenUsage(
+    val inputTokens: Long? = null,
+    val cachedInputTokens: Long? = null,
+    val outputTokens: Long? = null,
+    val reasoningOutputTokens: Long? = null,
+    val totalTokens: Long? = null,
+)
+
+data class CodexRateLimitWindow(
+    val usedPercent: Int? = null,
+    val windowDurationMinutes: Long? = null,
+    val resetsAtEpochSeconds: Long? = null,
+)
+
+data class CodexCredits(
+    val hasCredits: Boolean = false,
+    val unlimited: Boolean = false,
+    val balance: String? = null,
+)
+
+data class CodexSpendLimit(
+    val used: String? = null,
+    val limit: String? = null,
+    val remainingPercent: Int? = null,
+    val resetsAtEpochSeconds: Long? = null,
+)
+
+data class CodexStatusSnapshot(
+    val cliVersion: String? = null,
+    val modelId: String? = null,
+    val modelName: String? = null,
+    val modelProvider: String? = null,
+    val reasoningEffort: String? = null,
+    val reasoningSummary: String? = null,
+    val cwd: String? = null,
+    val sandboxMode: String? = null,
+    val networkAccess: Boolean? = null,
+    val approvalPolicy: String? = null,
+    val approvalsReviewer: String? = null,
+    val agentsFiles: List<String> = emptyList(),
+    val accountType: String? = null,
+    val accountEmail: String? = null,
+    val accountPlanType: String? = null,
+    val collaborationMode: String? = null,
+    val threadName: String? = null,
+    val sessionId: String? = null,
+    val forkedFrom: String? = null,
+    val contextUsedTokens: Long? = null,
+    val contextWindowTokens: Long? = null,
+    val lastTokenUsage: CodexTokenUsage? = null,
+    val totalTokenUsage: CodexTokenUsage? = null,
+    val primaryRateLimit: CodexRateLimitWindow? = null,
+    val secondaryRateLimit: CodexRateLimitWindow? = null,
+    val credits: CodexCredits? = null,
+    val spendLimit: CodexSpendLimit? = null,
+    val rateLimitResetCreditsAvailable: Long? = null,
+)
+
 enum class SlashCommandSource {
     /** Implemented by AgentRemote itself. */
     APP,

@@ -11,6 +11,7 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `POST` | `/api/v1/sessions` | Create a durable session from `{ backend, cwd }` |
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
 | `GET` | `/api/v1/sessions/{id}/commands` | Refresh the backend-specific slash-command catalog |
+| `GET` | `/api/v1/sessions/{id}/status` | Read live Codex account limits plus native thread configuration/context status |
 | `POST` | `/api/v1/sessions/{id}/turns` | Queue `{ prompt }`; returns `202` immediately |
 | `GET` | `/api/v1/sessions/{id}/events?after=N&wait=20` | Long-poll replayable events after cursor `N` |
 | `POST` | `/api/v1/sessions/{id}/cancel` | Request cancellation of the active turn |
@@ -30,6 +31,8 @@ The server writes the user message and `turn.queued` event transactionally befor
 Clients first fetch the session snapshot and its `latestEventId`, then poll strictly after that cursor. Event IDs are durable SQLite row IDs, so reconnecting never depends on an in-memory stream.
 
 Session snapshots and `usage.updated` events include the merged model name/ID, reasoning effort, used tokens, and context capacity when the backend reports them. Grok snapshots also include headless-compatible built-ins and installed skills. Informational slash reports are persisted as ordinary assistant output so they survive observer disconnects and replay.
+
+Codex workers keep workspace-write filesystem isolation but explicitly enable command networking for both new and resumed turns. The Codex status endpoint reads current account/rate-limit snapshots through app-server and combines them with the thread rollout's last-token/context-window data; account details are returned transiently and are not persisted in the durable database.
 
 ## Storage
 
