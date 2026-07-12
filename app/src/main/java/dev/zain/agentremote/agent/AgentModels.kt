@@ -44,6 +44,16 @@ data class AgentUsage(
     val costCurrency: String? = null,
 )
 
+data class AgentModelOption(
+    val id: String,
+    val name: String,
+    val description: String? = null,
+    val contextWindowTokens: Long? = null,
+    val reasoningEfforts: List<String> = emptyList(),
+    val defaultReasoningEffort: String? = null,
+    val isDefault: Boolean = false,
+)
+
 data class CodexTokenUsage(
     val inputTokens: Long? = null,
     val cachedInputTokens: Long? = null,

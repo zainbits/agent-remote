@@ -97,6 +97,27 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
         return parseCodexStatus(status)
     }
 
+    suspend fun fetchModels(): List<AgentModelOption> {
+        check(sessionId != null) { "Not connected" }
+        val root = request(
+            method = "GET",
+            path = "/api/v1/models?backend=${encode(kind.apiName)}",
+        )
+        return parseModels(root.optJSONArray("models"))
+    }
+
+    suspend fun selectModel(modelId: String): AgentUsage {
+        val id = sessionId ?: error("Not connected")
+        val root = request(
+            method = "POST",
+            path = "/api/v1/sessions/${encodePath(id)}/model",
+            body = JSONObject().put("modelId", modelId),
+        )
+        val session = root.optJSONObject("session")
+            ?: error("Durable host returned no session")
+        return parseUsage(session)
+    }
+
     override suspend fun connectNew(
         baseUrl: String,
         secret: String,
@@ -388,16 +409,18 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
     }
 
     private suspend fun emitUsage(session: JSONObject) {
-        val usage = AgentUsage(
-            usedTokens = session.optNullableLong("usedTokens"),
-            contextWindowTokens = session.optNullableLong("contextWindowTokens"),
-            modelId = session.optNullableString("modelId"),
-            modelName = session.optNullableString("modelName")
-                ?: session.optNullableString("modelId"),
-            reasoningEffort = session.optNullableString("reasoningEffort"),
-        )
+        val usage = parseUsage(session)
         if (usage != AgentUsage()) events.emit(AgentEvent.UsageChanged(usage))
     }
+
+    private fun parseUsage(session: JSONObject): AgentUsage = AgentUsage(
+        usedTokens = session.optNullableLong("usedTokens"),
+        contextWindowTokens = session.optNullableLong("contextWindowTokens"),
+        modelId = session.optNullableString("modelId"),
+        modelName = session.optNullableString("modelName")
+            ?: session.optNullableString("modelId"),
+        reasoningEffort = session.optNullableString("reasoningEffort"),
+    )
 
     private suspend fun emitCommands(commands: JSONArray?) {
         if (commands == null) return
@@ -478,6 +501,28 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                         messageCount = item.optNullableInt("messageCount"),
                         modelId = item.optNullableString("modelId"),
                         status = item.optString("status").toSessionStatus(),
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun parseModels(array: JSONArray?): List<AgentModelOption> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val id = item.optString("id")
+                if (id.isBlank()) continue
+                add(
+                    AgentModelOption(
+                        id = id,
+                        name = item.optString("name").ifBlank { id },
+                        description = item.optNullableString("description"),
+                        contextWindowTokens = item.optNullableLong("contextWindowTokens"),
+                        reasoningEfforts = item.optJSONArray("reasoningEfforts").toStringList(),
+                        defaultReasoningEffort = item.optNullableString("defaultReasoningEffort"),
+                        isDefault = item.optBoolean("isDefault", false),
                     ),
                 )
             }

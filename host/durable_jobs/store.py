@@ -57,11 +57,13 @@ class JobStore:
             }
             if "model_name" not in columns:
                 connection.execute("ALTER TABLE sessions ADD COLUMN model_name TEXT")
+            if "model_override" not in columns:
+                connection.execute("ALTER TABLE sessions ADD COLUMN model_override TEXT")
             if "codex_full_access" not in columns:
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN codex_full_access INTEGER NOT NULL DEFAULT 1"
                 )
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
         os.chmod(self.database_path, 0o600)
 
     @staticmethod
@@ -94,6 +96,7 @@ class JobStore:
             "activeTurnId": row["active_turn_id"],
             "modelId": row["model_id"],
             "modelName": row["model_name"],
+            "modelOverride": row["model_override"],
             "reasoningEffort": row["reasoning_effort"],
             "usedTokens": row["used_tokens"],
             "contextWindowTokens": row["context_window_tokens"],
@@ -176,6 +179,68 @@ class JobStore:
                 now,
             )
         return self.get_session(session_id)
+
+    def set_model(
+        self,
+        session_id: str,
+        model_id: str,
+        model_name: str,
+        reasoning_effort: str | None,
+        context_window_tokens: int | None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                raise NotFoundError("Session not found")
+            if current["status"] in ACTIVE_STATUSES:
+                raise ConflictError("Cannot change model while a turn is active")
+            connection.execute(
+                """
+                UPDATE sessions SET
+                    model_override = ?,
+                    model_id = ?,
+                    model_name = ?,
+                    reasoning_effort = ?,
+                    context_window_tokens = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    model_id,
+                    model_id,
+                    model_name,
+                    reasoning_effort,
+                    context_window_tokens,
+                    now,
+                    session_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Session not found")
+            session = self._session_dict(row)
+            self._event(
+                connection,
+                session_id,
+                None,
+                "usage.updated",
+                {
+                    "modelId": session["modelId"],
+                    "modelName": session["modelName"],
+                    "reasoningEffort": session["reasoningEffort"],
+                    "usedTokens": session["usedTokens"],
+                    "contextWindowTokens": session["contextWindowTokens"],
+                },
+                now,
+            )
+        return session
 
     def import_session(
         self,

@@ -106,7 +106,10 @@ class JobManager:
         self.store = store
         self.codex_bin = codex_bin or os.environ.get("AGENTREMOTE_CODEX_BIN", "codex")
         self.grok_bin = grok_bin or os.environ.get("AGENTREMOTE_GROK_BIN", "grok")
-        self.metadata = metadata or MetadataProvider(grok_bin=self.grok_bin)
+        self.metadata = metadata or MetadataProvider(
+            grok_bin=self.grok_bin,
+            codex_bin=self.codex_bin,
+        )
         self.executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="agent-job")
         self._lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen[str]] = {}
@@ -158,6 +161,10 @@ class JobManager:
         if session["backend"] != "codex":
             raise StoreError("Status is only available for Codex sessions")
         status = self.catalog.codex_status(session)
+        if session.get("modelOverride"):
+            status["modelId"] = session["modelId"]
+            status["modelName"] = session["modelName"]
+            status["reasoningEffort"] = session["reasoningEffort"]
         # These values are host-owned worker policy, so report what the next turn
         # will actually use even when an older rollout predates this configuration.
         status["sandboxMode"] = (
@@ -180,6 +187,40 @@ class JobManager:
     def command_catalog(self, session_id: str) -> list[dict[str, Any]]:
         session = self.store.get_session(session_id)
         return self.metadata.commands_for(session["backend"])
+
+    def model_catalog(self, backend: str) -> list[dict[str, Any]]:
+        normalized = backend.strip().lower()
+        if normalized not in {"grok", "codex"}:
+            raise StoreError("backend must be grok or codex")
+        return self.metadata.models_for(normalized)
+
+    def select_model(self, session_id: str, model_id: str) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        requested = model_id.strip()
+        model = next(
+            (item for item in self.metadata.models_for(session["backend"])
+             if item["id"] == requested),
+            None,
+        )
+        if model is None:
+            raise StoreError("Model is not available for this backend")
+        efforts = model.get("reasoningEfforts") or []
+        current_effort = session.get("reasoningEffort")
+        if current_effort in efforts:
+            reasoning_effort = current_effort
+        else:
+            reasoning_effort = model.get("defaultReasoningEffort")
+            if reasoning_effort not in efforts:
+                reasoning_effort = efforts[0] if efforts else None
+        updated = self.store.set_model(
+            session_id,
+            model["id"],
+            model["name"],
+            reasoning_effort,
+            model.get("contextWindowTokens"),
+        )
+        self.notify(session_id)
+        return updated
 
     def start_turn(self, session_id: str, prompt: str) -> dict[str, Any]:
         turn = self.store.create_turn(session_id, prompt)
@@ -257,6 +298,13 @@ class JobManager:
         backend_id = session.get("backendSessionId")
         if session["backend"] == "codex":
             full_access = bool(session.get("codexFullAccess", True))
+            model_args: list[str] = []
+            if session.get("modelOverride"):
+                model_args.extend(["--model", session["modelOverride"]])
+                if session.get("reasoningEffort"):
+                    model_args.extend(
+                        ["-c", f'model_reasoning_effort="{session["reasoningEffort"]}"']
+                    )
             permission_args = (
                 [CODEX_FULL_ACCESS_FLAG]
                 if full_access
@@ -276,6 +324,7 @@ class JobManager:
                     "resume",
                     "--json",
                     "--skip-git-repo-check",
+                    *model_args,
                     *permission_args,
                     backend_id,
                     "-",
@@ -289,6 +338,7 @@ class JobManager:
                 "--skip-git-repo-check",
                 "--cd",
                 cwd,
+                *model_args,
                 *permission_args,
                 "-",
             ]
@@ -302,6 +352,11 @@ class JobManager:
             "--cwd",
             cwd,
         ]
+        if session.get("modelOverride"):
+            model_args = ["--model", session["modelOverride"]]
+            if session.get("reasoningEffort"):
+                model_args.extend(["--reasoning-effort", session["reasoningEffort"]])
+            command[1:1] = model_args
         if backend_id:
             command[1:1] = ["--resume", backend_id]
         return command
@@ -606,12 +661,19 @@ class JobManager:
             return session
         try:
             status = self.catalog.codex_thread_status(session)
+            selected = bool(session.get("modelOverride"))
             usage = {
-                "modelId": status.get("modelId"),
-                "modelName": status.get("modelName"),
-                "reasoningEffort": status.get("reasoningEffort"),
+                "modelId": session.get("modelId") if selected else status.get("modelId"),
+                "modelName": session.get("modelName") if selected else status.get("modelName"),
+                "reasoningEffort": (
+                    session.get("reasoningEffort") if selected else status.get("reasoningEffort")
+                ),
                 "usedTokens": status.get("contextUsedTokens"),
-                "contextWindowTokens": status.get("contextWindowTokens"),
+                "contextWindowTokens": (
+                    session.get("contextWindowTokens")
+                    if selected
+                    else status.get("contextWindowTokens")
+                ),
             }
             if any(value is not None for value in usage.values()):
                 session = self.store.update_usage(session_id, usage)

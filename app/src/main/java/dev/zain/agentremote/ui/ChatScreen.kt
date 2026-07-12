@@ -34,6 +34,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -45,6 +46,8 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -76,6 +79,7 @@ import dev.zain.agentremote.ChatUiState
 import dev.zain.agentremote.CommandOutputState
 import dev.zain.agentremote.agent.ChatMessage
 import dev.zain.agentremote.agent.ChatRole
+import dev.zain.agentremote.agent.AgentModelOption
 import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
@@ -90,6 +94,7 @@ fun ChatScreen(
     onSend: () -> Unit,
     onCancel: () -> Unit,
     onSelectSlashCommand: (SlashCommand) -> Unit,
+    onSelectModel: (AgentModelOption) -> Unit,
     onDismissCommandOutput: () -> Unit,
     onDisconnect: () -> Unit,
     onReconnect: () -> Unit,
@@ -233,14 +238,23 @@ fun ChatScreen(
             MessageComposer(
                 draft = state.draft,
                 agentName = state.settings.backendKind.displayName,
+                modelId = state.usage.modelId,
                 modelName = state.usage.modelName ?: state.usage.modelId,
                 reasoningEffort = state.usage.reasoningEffort,
+                modelOptions = state.modelOptions,
+                modelSelectionEnabled = connected &&
+                    !state.busy &&
+                    !state.requestInFlight &&
+                    !state.modelSelectionBusy,
+                modelSelectionBusy = state.modelSelectionBusy,
                 inputEnabled = !state.busy || connected,
                 requestInFlight = state.requestInFlight,
                 cancellationRequested = state.cancellationRequested,
                 sendEnabled = state.draft.isNotBlank() &&
                     (connected || isLocalCommand) &&
+                    !state.modelSelectionBusy &&
                     (!state.busy || canSendWhileBusy),
+                onSelectModel = onSelectModel,
                 onDraftChange = onDraftChange,
                 onSend = onSend,
                 onCancel = onCancel,
@@ -310,13 +324,18 @@ private fun ChatHistory(
 private fun MessageComposer(
     draft: String,
     agentName: String,
+    modelId: String?,
     modelName: String?,
     reasoningEffort: String?,
+    modelOptions: List<AgentModelOption>,
+    modelSelectionEnabled: Boolean,
+    modelSelectionBusy: Boolean,
     inputEnabled: Boolean,
     requestInFlight: Boolean,
     cancellationRequested: Boolean,
     sendEnabled: Boolean,
     onDraftChange: (String) -> Unit,
+    onSelectModel: (AgentModelOption) -> Unit,
     onSend: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
@@ -376,8 +395,13 @@ private fun MessageComposer(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 ComposerModelRail(
+                    modelId = modelId,
                     modelName = modelName ?: "$agentName model",
                     reasoningEffort = reasoningEffort,
+                    modelOptions = modelOptions,
+                    selectionEnabled = modelSelectionEnabled,
+                    selectionBusy = modelSelectionBusy,
+                    onSelectModel = onSelectModel,
                     modifier = Modifier.weight(1f),
                 )
 
@@ -416,10 +440,16 @@ private fun MessageComposer(
 
 @Composable
 private fun ComposerModelRail(
+    modelId: String?,
     modelName: String,
     reasoningEffort: String?,
+    modelOptions: List<AgentModelOption>,
+    selectionEnabled: Boolean,
+    selectionBusy: Boolean,
+    onSelectModel: (AgentModelOption) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var expanded by rememberSaveable { mutableStateOf(false) }
     val effortLabel = reasoningEffort
         ?.let { effort ->
             when (effort.lowercase()) {
@@ -430,47 +460,122 @@ private fun ComposerModelRail(
         ?.let { "$it effort" }
         ?: "Effort —"
 
-    Surface(
-        modifier = modifier,
-        color = MaterialTheme.colorScheme.surfaceContainerHighest,
-        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-        shape = RoundedCornerShape(18.dp),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
+    LaunchedEffect(selectionEnabled) {
+        if (!selectionEnabled) expanded = false
+    }
+
+    Box(modifier = modifier) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(
+                    enabled = selectionEnabled && modelOptions.isNotEmpty(),
+                    onClick = { expanded = true },
+                ),
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            shape = RoundedCornerShape(18.dp),
         ) {
-            Icon(
-                imageVector = Icons.Default.Memory,
-                contentDescription = null,
-                modifier = Modifier.size(15.dp),
-                tint = MaterialTheme.colorScheme.primary,
-            )
-            Text(
-                text = modelName,
-                modifier = Modifier.weight(1f),
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Spacer(
-                modifier = Modifier
-                    .size(width = 1.dp, height = 16.dp)
-                    .background(MaterialTheme.colorScheme.outlineVariant),
-            )
-            Icon(
-                imageVector = Icons.Default.Psychology,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.tertiary,
-            )
-            Text(
-                text = effortLabel,
-                style = MaterialTheme.typography.labelMedium,
-                maxLines = 1,
-            )
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Memory,
+                    contentDescription = null,
+                    modifier = Modifier.size(15.dp),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    text = modelName,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(
+                    modifier = Modifier
+                        .size(width = 1.dp, height = 16.dp)
+                        .background(MaterialTheme.colorScheme.outlineVariant),
+                )
+                Icon(
+                    imageVector = Icons.Default.Psychology,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = MaterialTheme.colorScheme.tertiary,
+                )
+                Text(
+                    text = effortLabel,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                )
+                when {
+                    selectionBusy -> CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                    )
+                    modelOptions.isNotEmpty() -> Icon(
+                        imageVector = if (expanded) {
+                            Icons.Default.ExpandLess
+                        } else {
+                            Icons.Default.ExpandMore
+                        },
+                        contentDescription = "Choose model",
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+            modifier = Modifier.widthIn(min = 280.dp, max = 360.dp),
+        ) {
+            modelOptions.forEach { model ->
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text(
+                                text = model.name,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = if (model.id == modelId) {
+                                    FontWeight.SemiBold
+                                } else {
+                                    FontWeight.Normal
+                                },
+                            )
+                            model.description?.let { description ->
+                                Text(
+                                    text = if (model.isDefault) {
+                                        "Default · $description"
+                                    } else {
+                                        description
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    },
+                    trailingIcon = if (model.id == modelId) {
+                        {
+                            Icon(Icons.Default.Check, contentDescription = "Selected")
+                        }
+                    } else {
+                        null
+                    },
+                    onClick = {
+                        expanded = false
+                        onSelectModel(model)
+                    },
+                    enabled = selectionEnabled && model.id != modelId,
+                )
+            }
         }
     }
 }

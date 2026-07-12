@@ -21,6 +21,29 @@ import os
 import sys
 import time
 
+if sys.argv[1:3] == ["debug", "models"]:
+    print(json.dumps({"models": [
+        {
+            "slug": "gpt-test",
+            "display_name": "GPT Test",
+            "description": "Default test model",
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+            "context_window": 4096,
+            "visibility": "list"
+        },
+        {
+            "slug": "gpt-fast",
+            "display_name": "GPT Fast",
+            "description": "Fast test model",
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [{"effort": "low"}],
+            "context_window": 2048,
+            "visibility": "list"
+        }
+    ]}))
+    raise SystemExit(0)
+
 if "app-server" in sys.argv:
     for line in sys.stdin:
         request = json.loads(line)
@@ -34,6 +57,8 @@ if "app-server" in sys.argv:
                 "cliVersion": "0.test",
                 "cwd": os.getcwd(),
                 "modelProvider": "openai",
+                "model": "gpt-old",
+                "reasoningEffort": "high",
             }}
         elif method == "account/read":
             result = {"requiresOpenaiAuth": True, "account": {
@@ -104,9 +129,35 @@ class DurableJobsTest(unittest.TestCase):
         self.store = JobStore(root / "jobs.sqlite3")
         self.metadata = MetadataProvider(
             grok_bin=str(self.grok),
+            codex_bin=str(self.codex),
             home=root,
             probe_grok=False,
         )
+        self.metadata._grok_probe_attempted = True
+        self.metadata._grok_model_state = {
+            "currentModelId": "grok-test",
+            "availableModels": [
+                {
+                    "modelId": "grok-test",
+                    "name": "Grok Test",
+                    "description": "Default test model",
+                    "_meta": {
+                        "totalContextTokens": 500000,
+                        "reasoningEffort": "high",
+                        "reasoningEfforts": [
+                            {"value": "low"},
+                            {"value": "high"},
+                        ],
+                    },
+                },
+                {
+                    "modelId": "grok-fast",
+                    "name": "Grok Fast",
+                    "description": "Fast test model",
+                    "_meta": {"totalContextTokens": 200000},
+                },
+            ],
+        }
         self.manager = JobManager(
             self.store,
             max_workers=3,
@@ -251,6 +302,49 @@ class DurableJobsTest(unittest.TestCase):
         self.assertIn("resume", resumed)
         self.assertIn("sandbox_workspace_write.network_access=true", resumed)
         self.assertIn('sandbox_mode="workspace-write"', resumed)
+
+    def test_selected_model_is_persisted_and_applied_to_new_and_resumed_turns(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+
+        selected = self.manager.select_model(session["id"], "gpt-fast")
+
+        self.assertEqual("gpt-fast", selected["modelOverride"])
+        self.assertEqual("GPT Fast", selected["modelName"])
+        self.assertEqual("low", selected["reasoningEffort"])
+        self.assertEqual(2048, selected["contextWindowTokens"])
+        new_command = self.manager._command(selected, "first")
+        self.assertEqual("gpt-fast", new_command[new_command.index("--model") + 1])
+        self.assertIn('model_reasoning_effort="low"', new_command)
+
+        self.store.set_backend_session_id(session["id"], "existing-thread")
+        resumed = self.manager._command(self.store.get_session(session["id"]), "next")
+        self.assertIn("resume", resumed)
+        self.assertEqual("gpt-fast", resumed[resumed.index("--model") + 1])
+
+        bundle = self.manager.session_bundle(session["id"])
+        self.assertEqual("gpt-fast", bundle["session"]["modelId"])
+        self.assertEqual("GPT Fast", bundle["session"]["modelName"])
+
+    def test_grok_selected_model_is_applied_without_unsupported_effort(self):
+        session = self.manager.create_session("grok", str(self.workspace))
+
+        selected = self.manager.select_model(session["id"], "grok-fast")
+        command = self.manager._command(selected, "first", "/tmp/prompt")
+
+        self.assertEqual("grok-fast", selected["modelOverride"])
+        self.assertIsNone(selected["reasoningEffort"])
+        self.assertEqual("grok-fast", command[command.index("--model") + 1])
+        self.assertNotIn("--reasoning-effort", command)
+
+    def test_model_change_is_rejected_while_turn_is_active(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        self.manager.start_turn(session["id"], "WAIT_FOR_CANCEL")
+
+        with self.assertRaises(ConflictError):
+            self.manager.select_model(session["id"], "gpt-fast")
+
+        self.assertTrue(self.manager.cancel_session(session["id"]))
+        self._wait_terminal(session["id"])
 
     def test_codex_rollout_status_matches_native_context_fields(self):
         rollout = self.workspace / "rollout.jsonl"
@@ -421,6 +515,24 @@ class DurableJobsTest(unittest.TestCase):
                 commands = json.load(response)
             self.assertEqual([], commands["commands"])
 
+            models_request = urllib.request.Request(
+                base + "/api/v1/models?backend=codex",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(models_request, timeout=2) as response:
+                models = json.load(response)
+            self.assertEqual(["gpt-test", "gpt-fast"], [item["id"] for item in models["models"]])
+
+            select_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{created['session']['id']}/model",
+                data=json.dumps({"modelId": "gpt-fast"}).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(select_request, timeout=2) as response:
+                selected = json.load(response)
+            self.assertEqual("gpt-fast", selected["session"]["modelOverride"])
+
             status_request = urllib.request.Request(
                 base + f"/api/v1/sessions/{created['session']['id']}/status",
                 headers={"Authorization": f"Bearer {token}"},
@@ -472,8 +584,9 @@ class DurableJobsTest(unittest.TestCase):
             version = connection.execute("PRAGMA user_version").fetchone()[0]
 
         self.assertIn("model_name", columns)
+        self.assertIn("model_override", columns)
         self.assertIn("codex_full_access", columns)
-        self.assertEqual(3, version)
+        self.assertEqual(4, version)
 
     def test_legacy_session_is_adopted_once_with_history(self):
         first = self.store.import_session(

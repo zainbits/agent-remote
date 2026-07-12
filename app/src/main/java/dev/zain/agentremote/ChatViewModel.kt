@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.zain.agentremote.agent.AgentEvent
+import dev.zain.agentremote.agent.AgentModelOption
 import dev.zain.agentremote.agent.AgentRequestCancelledException
 import dev.zain.agentremote.agent.AgentUsage
 import dev.zain.agentremote.agent.ChatMessage
@@ -69,6 +70,8 @@ data class ChatUiState(
     val statusLine: String = "Disconnected",
     val slashCommands: List<SlashCommand> = emptyList(),
     val usage: AgentUsage = AgentUsage(),
+    val modelOptions: List<AgentModelOption> = emptyList(),
+    val modelSelectionBusy: Boolean = false,
     val commandOutput: CommandOutputState? = null,
     val sessions: List<SessionSummary> = emptyList(),
     val sessionsLoading: Boolean = false,
@@ -426,6 +429,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     draft = "",
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
+                    modelOptions = emptyList(),
+                    modelSelectionBusy = false,
                     commandOutput = null,
                 )
             }
@@ -490,6 +495,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     draft = "",
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
+                    modelOptions = emptyList(),
+                    modelSelectionBusy = false,
                     commandOutput = null,
                 )
             }
@@ -543,6 +550,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     draft = "",
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
+                    modelOptions = emptyList(),
+                    modelSelectionBusy = false,
                     commandOutput = null,
                     activeSessionTitle = null,
                     historyLoading = false,
@@ -573,6 +582,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     },
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
+                    modelOptions = emptyList(),
+                    modelSelectionBusy = false,
                     commandOutput = null,
                     historyLoading = false,
                 )
@@ -870,6 +881,58 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun selectModel(model: AgentModelOption) {
+        val state = _ui.value
+        if (state.connection !is ConnectionState.Connected ||
+            state.busy ||
+            state.requestInFlight ||
+            state.modelSelectionBusy ||
+            model.id == state.usage.modelId
+        ) {
+            return
+        }
+        val selectedBackend = activeBackendKind
+        _ui.update { it.copy(modelSelectionBusy = true) }
+        viewModelScope.launch {
+            runCatching { durableBackend(selectedBackend).selectModel(model.id) }
+                .onSuccess { usage ->
+                    if (selectedBackend != activeBackendKind) return@onSuccess
+                    _ui.update { current ->
+                        current.copy(
+                            modelSelectionBusy = false,
+                            usage = current.usage.copy(
+                                modelId = usage.modelId,
+                                modelName = usage.modelName,
+                                reasoningEffort = usage.reasoningEffort,
+                                contextWindowTokens = usage.contextWindowTokens,
+                            ),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    if (selectedBackend != activeBackendKind) return@onFailure
+                    _ui.update { it.copy(modelSelectionBusy = false) }
+                    pushSystem(
+                        "Couldn't change model: ${error.message ?: error::class.java.simpleName}",
+                    )
+                }
+        }
+    }
+
+    private fun refreshModelOptions() {
+        val selectedBackend = activeBackendKind
+        viewModelScope.launch {
+            runCatching { durableBackend(selectedBackend).fetchModels() }
+                .onSuccess { models ->
+                    if (selectedBackend == activeBackendKind &&
+                        _ui.value.screen == AppScreen.CHAT
+                    ) {
+                        _ui.update { it.copy(modelOptions = models) }
+                    }
+                }
+        }
+    }
+
     private fun beginConnectionAction(sessionId: String?, cwd: String): Long {
         stopSessionStatusPolling()
         reconnectJob?.cancel()
@@ -928,6 +991,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         messages = emptyList(),
                         historyLoading = true,
                         usage = AgentUsage(),
+                        modelOptions = emptyList(),
+                        modelSelectionBusy = false,
                         slashCommands = localSlashCommandsFor(),
                         busy = false,
                         reconnecting = true,
@@ -1568,6 +1633,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         .ifBlank { activeSessionCwdForReconnect }
                     hasConnectedSession = true
                     connectionDesired = true
+                    refreshModelOptions()
                 }
 
                 val shouldReconnect = connectionEnded &&
@@ -1621,6 +1687,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         reconnecting = shouldReconnect ||
                             (displayState is ConnectionState.Connecting && it.reconnecting),
                         canReconnect = activeSessionIdForReconnect != null,
+                        modelSelectionBusy = false,
                     )
                 }
                 if (requestWasInterrupted && interruptedCommand != null) {

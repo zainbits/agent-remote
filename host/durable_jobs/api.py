@@ -84,6 +84,13 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
         try:
             route = self._route(parsed.path)
             query = urllib.parse.parse_qs(parsed.query)
+            if route == ["api", "v1", "models"]:
+                backend = str(query.get("backend", [""])[0])
+                self._send(
+                    HTTPStatus.OK,
+                    {"models": self.server.manager.model_catalog(backend)},
+                )
+                return
             if route == ["api", "v1", "sessions"]:
                 backend = query.get("backend", [""])[0].lower()
                 cwd = query.get("cwd", [""])[0]
@@ -148,6 +155,14 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
                 body = self._json_body()
                 turn = self.server.manager.start_turn(route[3], str(body.get("prompt") or ""))
                 self._send(HTTPStatus.ACCEPTED, {"turn": turn})
+                return
+            if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "model":
+                body = self._json_body()
+                session = self.server.manager.select_model(
+                    route[3],
+                    str(body.get("modelId") or ""),
+                )
+                self._send(HTTPStatus.OK, {"session": session})
                 return
             if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "cancel":
                 self._json_body()
