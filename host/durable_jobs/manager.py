@@ -10,8 +10,9 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from .catalog import LegacyCatalog
 from .metadata import MetadataProvider
@@ -25,6 +26,14 @@ CODEX_FULL_ACCESS_MODE = "danger-full-access"
 CODEX_FULL_ACCESS_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 CODEX_APPROVAL_POLICY = "never"
 CODEX_NETWORK_ACCESS_CONFIG = "sandbox_workspace_write.network_access=true"
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_PENDING_ATTACHMENTS = 16
+IMAGE_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 
 
 def _text(value: Any) -> str:
@@ -39,6 +48,18 @@ def _text(value: Any) -> str:
             if key in value:
                 return _text(value[key])
     return str(value)
+
+
+def _image_mime(header: bytes) -> str | None:
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 class _StreamMessages:
@@ -118,6 +139,7 @@ class JobManager:
         self._versions: dict[str, int] = {}
         self.catalog = LegacyCatalog(store, self.codex_bin)
         self.import_legacy = os.environ.get("AGENTREMOTE_IMPORT_LEGACY", "1") != "0"
+        self._cleanup_stale_attachments()
         self.store.fail_orphaned_turns()
 
     def _condition(self, session_id: str) -> threading.Condition:
@@ -222,14 +244,100 @@ class JobManager:
         self.notify(session_id)
         return updated
 
-    def start_turn(self, session_id: str, prompt: str) -> dict[str, Any]:
-        turn = self.store.create_turn(session_id, prompt)
+    def upload_attachment(
+        self,
+        session_id: str,
+        file_name: str,
+        declared_mime_type: str,
+        size_bytes: int,
+        source: BinaryIO,
+    ) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        if session["status"] in {"queued", "running", "cancelling"}:
+            raise ConflictError("Cannot upload an image while a turn is active")
+        if size_bytes <= 0 or size_bytes > MAX_ATTACHMENT_BYTES:
+            raise StoreError("Image must be between 1 byte and 20 MiB")
+        if declared_mime_type and not declared_mime_type.lower().startswith("image/"):
+            raise StoreError("Attachment must be an image")
+        if self.store.pending_attachment_count(session_id) >= MAX_PENDING_ATTACHMENTS:
+            raise ConflictError("Too many unsent images; wait for older uploads to expire")
+
+        attachment_id = str(uuid.uuid4())
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".upload-",
+            dir=self.store.attachment_directory,
+        )
+        temporary = Path(temporary_path)
+        final_path: Path | None = None
+        header = bytearray()
+        try:
+            remaining = size_bytes
+            with os.fdopen(descriptor, "wb") as target:
+                os.fchmod(target.fileno(), 0o600)
+                while remaining:
+                    chunk = source.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        raise StoreError("Image upload ended before Content-Length")
+                    if len(header) < 16:
+                        header.extend(chunk[:16 - len(header)])
+                    target.write(chunk)
+                    remaining -= len(chunk)
+            mime_type = _image_mime(bytes(header))
+            if mime_type is None:
+                raise StoreError("Only PNG, JPEG, GIF, and WebP images are supported")
+            stored_name = f"{attachment_id}{IMAGE_MIME_EXTENSIONS[mime_type]}"
+            final_path = self.store.attachment_directory / stored_name
+            os.replace(temporary, final_path)
+            raw_display_name = file_name.replace("\\", "/").split("/")[-1].strip()
+            display_name = "".join(
+                character for character in raw_display_name
+                if ord(character) >= 32 and character != "\x7f"
+            )[:200]
+            if not display_name:
+                display_name = f"image{IMAGE_MIME_EXTENSIONS[mime_type]}"
+            try:
+                return self.store.register_attachment(
+                    session_id,
+                    attachment_id,
+                    stored_name,
+                    display_name,
+                    mime_type,
+                    size_bytes,
+                )
+            except Exception:
+                final_path.unlink(missing_ok=True)
+                raise
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _cleanup_stale_attachments(self) -> None:
+        for temporary in self.store.attachment_directory.glob(".upload-*"):
+            temporary.unlink(missing_ok=True)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z")
+        for stored_name in self.store.pop_stale_pending_attachments(cutoff):
+            (self.store.attachment_directory / stored_name).unlink(missing_ok=True)
+
+    def start_turn(
+        self,
+        session_id: str,
+        prompt: str,
+        attachment_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        turn = self.store.create_turn(session_id, prompt, attachment_ids)
         self.notify(session_id)
         future = self.executor.submit(self._run_turn, turn["id"])
         with self._lock:
             self._futures[turn["id"]] = future
         future.add_done_callback(lambda _: self._forget_future(turn["id"]))
-        return turn
+        return {
+            **turn,
+            "attachments": [
+                {key: value for key, value in attachment.items() if key != "path"}
+                for attachment in turn["attachments"]
+            ],
+        }
 
     def _forget_future(self, turn_id: str) -> None:
         with self._lock:
@@ -293,9 +401,11 @@ class JobManager:
         session: dict[str, Any],
         prompt: str,
         prompt_path: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> list[str]:
         cwd = session["cwd"]
         backend_id = session.get("backendSessionId")
+        attached_images = attachments or []
         if session["backend"] == "codex":
             full_access = bool(session.get("codexFullAccess", True))
             model_args: list[str] = []
@@ -317,6 +427,11 @@ class JobManager:
                     CODEX_NETWORK_ACCESS_CONFIG,
                 ]
             )
+            image_args = [
+                argument
+                for attachment in attached_images
+                for argument in ("--image", attachment["path"])
+            ]
             if backend_id:
                 return [
                     self.codex_bin,
@@ -326,6 +441,7 @@ class JobManager:
                     "--skip-git-repo-check",
                     *model_args,
                     *permission_args,
+                    *image_args,
                     backend_id,
                     "-",
                 ]
@@ -340,12 +456,17 @@ class JobManager:
                 cwd,
                 *model_args,
                 *permission_args,
+                *image_args,
                 "-",
             ]
+        prompt_args = (
+            ["--prompt-json", self._grok_prompt_json(prompt, attached_images)]
+            if attached_images
+            else ["--prompt-file", prompt_path or prompt]
+        )
         command = [
             self.grok_bin,
-            "--prompt-file",
-            prompt_path or prompt,
+            *prompt_args,
             "--output-format",
             "streaming-json",
             "--always-approve",
@@ -360,6 +481,32 @@ class JobManager:
         if backend_id:
             command[1:1] = ["--resume", backend_id]
         return command
+
+    @classmethod
+    def _grok_prompt_json(
+        cls,
+        prompt: str,
+        attachments: list[dict[str, Any]],
+    ) -> str:
+        content: list[dict[str, Any]] = []
+        effective_prompt = cls._effective_grok_prompt(prompt)
+        if effective_prompt:
+            content.append({"type": "text", "text": effective_prompt})
+        for attachment in attachments:
+            content.append(
+                {
+                    "type": "resource_link",
+                    "uri": Path(attachment["path"]).resolve().as_uri(),
+                    "name": attachment["fileName"],
+                    "mimeType": attachment["mimeType"],
+                    "size": attachment["sizeBytes"],
+                }
+            )
+        return json.dumps(
+            {"type": "acp", "content": content},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
     @staticmethod
     def _effective_grok_prompt(prompt: str) -> str:
@@ -383,7 +530,7 @@ class JobManager:
         stop_reason: str | None = None
         compact_completed = False
         try:
-            if session["backend"] == "grok":
+            if session["backend"] == "grok" and not turn["attachments"]:
                 descriptor, prompt_path = tempfile.mkstemp(
                     prefix=f"prompt-{turn_id[:8]}-",
                     suffix=".txt",
@@ -392,7 +539,12 @@ class JobManager:
                 )
                 with os.fdopen(descriptor, "w", encoding="utf-8") as prompt_file:
                     prompt_file.write(self._effective_grok_prompt(turn["prompt"]))
-            command = self._command(session, turn["prompt"], prompt_path)
+            command = self._command(
+                session,
+                turn["prompt"],
+                prompt_path,
+                turn["attachments"],
+            )
             process = subprocess.Popen(
                 command,
                 cwd=session["cwd"],
@@ -585,7 +737,7 @@ class JobManager:
             elif item_type:
                 item_id = f"{turn_id}:{source_item_id or uuid.uuid4()}"
                 title, detail = self._codex_tool(item_type, item)
-                self.store.upsert_tool(
+                changed = self.store.upsert_tool(
                     session["id"],
                     turn_id,
                     item_id,
@@ -594,7 +746,8 @@ class JobManager:
                     item_type,
                     detail,
                 )
-                self.notify(session["id"])
+                if changed:
+                    self.notify(session["id"])
         elif event_type == "turn.completed":
             usage = event.get("usage") or {}
             if usage:
@@ -745,3 +898,4 @@ class JobManager:
             if process.poll() is None:
                 self._signal_process(process, signal.SIGTERM)
         self.executor.shutdown(wait=True, cancel_futures=False)
+        self.store.close()

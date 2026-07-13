@@ -29,27 +29,63 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+class _ConnectionLease:
+    """Serialize one short transaction on the store's persistent connection."""
+
+    def __init__(self, store: "JobStore"):
+        self.store = store
+
+    def __enter__(self) -> sqlite3.Connection:
+        self.store._connection_lock.acquire()
+        if self.store._closed:
+            self.store._connection_lock.release()
+            raise StoreError("Database is closed")
+        try:
+            return self.store._connection.__enter__()
+        except Exception:
+            self.store._connection_lock.release()
+            raise
+
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> bool:
+        try:
+            return bool(
+                self.store._connection.__exit__(exception_type, exception, traceback)
+            )
+        finally:
+            self.store._connection_lock.release()
+
+
 class JobStore:
-    """Small SQLite repository with one short-lived connection per transaction."""
+    """Small SQLite repository serialized through one durable WAL connection."""
 
     def __init__(self, database_path: str | Path):
         self.database_path = Path(database_path).expanduser().resolve()
         self.database_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.attachment_directory = self.database_path.parent / "attachments"
+        self.attachment_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._schema_lock = threading.Lock()
+        self._connection_lock = threading.RLock()
+        self._closed = False
+        self._connection = sqlite3.connect(
+            self.database_path,
+            timeout=30.0,
+            check_same_thread=False,
+        )
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 30000")
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 30000")
-        return connection
+    def _connect(self) -> _ConnectionLease:
+        return _ConnectionLease(self)
 
     def _initialize(self) -> None:
         schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
         with self._schema_lock, self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("PRAGMA wal_autocheckpoint = 1000")
+            connection.execute("PRAGMA journal_size_limit = 8388608")
             connection.executescript(schema)
             columns = {
                 row["name"]
@@ -76,8 +112,16 @@ class JobStore:
                 "CREATE INDEX IF NOT EXISTS messages_session_ordinal "
                 "ON messages(session_id, ordinal)"
             )
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
         os.chmod(self.database_path, 0o600)
+        os.chmod(self.attachment_directory, 0o700)
+
+    def close(self) -> None:
+        with self._connection_lock:
+            if self._closed:
+                return
+            self._connection.close()
+            self._closed = True
 
     @staticmethod
     def _initialize_message_ordinals(connection: sqlite3.Connection) -> None:
@@ -203,7 +247,10 @@ class JobStore:
         }
 
     @staticmethod
-    def _turn_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _turn_dict(
+        row: sqlite3.Row,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "id": row["id"],
             "sessionId": row["session_id"],
@@ -216,10 +263,14 @@ class JobStore:
             "createdAt": row["created_at"],
             "startedAt": row["started_at"],
             "completedAt": row["completed_at"],
+            "attachments": attachments or [],
         }
 
     @staticmethod
-    def _message_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _message_dict(
+        row: sqlite3.Row,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "id": row["id"],
             "turnId": row["turn_id"],
@@ -231,7 +282,90 @@ class JobStore:
             "ordinal": row["ordinal"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
+            "attachments": attachments or [],
         }
+
+    def _attachment_dict(
+        self,
+        row: sqlite3.Row,
+        include_path: bool = False,
+    ) -> dict[str, Any]:
+        attachment = {
+            "id": row["id"],
+            "fileName": row["file_name"],
+            "mimeType": row["mime_type"],
+            "sizeBytes": row["size_bytes"],
+        }
+        if include_path:
+            attachment["path"] = str(self.attachment_directory / row["stored_name"])
+        return attachment
+
+    def register_attachment(
+        self,
+        session_id: str,
+        attachment_id: str,
+        stored_name: str,
+        file_name: str,
+        mime_type: str,
+        size_bytes: int,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as connection:
+            session = connection.execute(
+                "SELECT status FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("Session not found")
+            if session["status"] in ACTIVE_STATUSES:
+                raise ConflictError("Cannot upload an image while a turn is active")
+            connection.execute(
+                """
+                INSERT INTO attachments(
+                    id, session_id, stored_name, file_name, mime_type, size_bytes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment_id,
+                    session_id,
+                    stored_name,
+                    file_name,
+                    mime_type,
+                    size_bytes,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+        return self._attachment_dict(row)
+
+    def pending_attachment_count(self, session_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM attachments
+                WHERE session_id = ? AND turn_id IS NULL
+                """,
+                (session_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def pop_stale_pending_attachments(self, before: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stored_name FROM attachments
+                WHERE turn_id IS NULL AND created_at < ?
+                """,
+                (before,),
+            ).fetchall()
+            connection.execute(
+                "DELETE FROM attachments WHERE turn_id IS NULL AND created_at < ?",
+                (before,),
+            )
+        return [str(row["stored_name"]) for row in rows]
 
     def create_session(
         self,
@@ -538,20 +672,49 @@ class JobStore:
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY ordinal, rowid",
                 (session_id,),
             ).fetchall()
+            attachment_rows = connection.execute(
+                """
+                SELECT * FROM attachments
+                WHERE session_id = ? AND turn_id IS NOT NULL
+                ORDER BY turn_id, turn_ordinal, rowid
+                """,
+                (session_id,),
+            ).fetchall()
             latest_event = connection.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?",
                 (session_id,),
             ).fetchone()[0]
+        attachments_by_turn: dict[str, list[dict[str, Any]]] = {}
+        for row in attachment_rows:
+            attachments_by_turn.setdefault(row["turn_id"], []).append(
+                self._attachment_dict(row)
+            )
         return {
             "session": self._session_dict(session_row),
-            "messages": [self._message_dict(row) for row in messages],
+            "messages": [
+                self._message_dict(
+                    row,
+                    attachments_by_turn.get(row["turn_id"], [])
+                    if row["role"] == "user"
+                    else [],
+                )
+                for row in messages
+            ],
             "latestEventId": int(latest_event),
         }
 
-    def create_turn(self, session_id: str, prompt: str) -> dict[str, Any]:
+    def create_turn(
+        self,
+        session_id: str,
+        prompt: str,
+        attachment_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         text = prompt.strip()
-        if not text:
-            raise StoreError("Prompt cannot be empty")
+        requested_attachments = list(dict.fromkeys(attachment_ids or []))
+        if len(requested_attachments) > 4:
+            raise StoreError("A turn can include at most 4 images")
+        if not text and not requested_attachments:
+            raise StoreError("Prompt or image attachment is required")
         turn_id = str(uuid.uuid4())
         message_id = str(uuid.uuid4())
         now = utc_now()
@@ -561,6 +724,21 @@ class JobStore:
                 raise NotFoundError("Session not found")
             if session["status"] in ACTIVE_STATUSES:
                 raise ConflictError("This session already has an active turn")
+            attachment_rows: list[sqlite3.Row] = []
+            if requested_attachments:
+                placeholders = ",".join("?" for _ in requested_attachments)
+                rows = connection.execute(
+                    f"SELECT * FROM attachments WHERE id IN ({placeholders})",
+                    requested_attachments,
+                ).fetchall()
+                by_id = {row["id"]: row for row in rows}
+                if len(by_id) != len(requested_attachments):
+                    raise StoreError("One or more image attachments were not found")
+                attachment_rows = [by_id[attachment_id] for attachment_id in requested_attachments]
+                if any(row["session_id"] != session_id for row in attachment_rows):
+                    raise StoreError("Image attachment belongs to a different session")
+                if any(row["turn_id"] is not None for row in attachment_rows):
+                    raise ConflictError("Image attachment has already been sent")
             connection.execute(
                 """
                 INSERT INTO turns(id, session_id, prompt, status, created_at)
@@ -568,6 +746,14 @@ class JobStore:
                 """,
                 (turn_id, session_id, text, now),
             )
+            for position, attachment_id in enumerate(requested_attachments):
+                connection.execute(
+                    """
+                    UPDATE attachments SET turn_id = ?, turn_ordinal = ?
+                    WHERE id = ?
+                    """,
+                    (turn_id, position, attachment_id),
+                )
             connection.execute(
                 """
                 INSERT INTO messages(
@@ -583,7 +769,10 @@ class JobStore:
             )
             title = session["title"]
             if title.startswith("New "):
-                title = text.splitlines()[0][:120] or title
+                title = text.splitlines()[0][:120] if text else (
+                    "Image attachment" if len(requested_attachments) == 1 else
+                    f"{len(requested_attachments)} image attachments"
+                )
             connection.execute(
                 """
                 UPDATE sessions
@@ -597,19 +786,33 @@ class JobStore:
                 session_id,
                 turn_id,
                 "message.created",
-                {"messageId": message_id, "role": "user", "text": text},
+                {
+                    "messageId": message_id,
+                    "role": "user",
+                    "text": text,
+                    "attachments": [self._attachment_dict(row) for row in attachment_rows],
+                },
                 now,
             )
             self._event(connection, session_id, turn_id, "turn.queued", {"turnId": turn_id}, now)
-            row = connection.execute("SELECT * FROM turns WHERE id = ?", (turn_id,)).fetchone()
-        return self._turn_dict(row)
+        return self.get_turn(turn_id)
 
     def get_turn(self, turn_id: str) -> dict[str, Any]:
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            attachment_rows = connection.execute(
+                """
+                SELECT * FROM attachments WHERE turn_id = ?
+                ORDER BY turn_ordinal, rowid
+                """,
+                (turn_id,),
+            ).fetchall()
         if row is None:
             raise NotFoundError("Turn not found")
-        return self._turn_dict(row)
+        return self._turn_dict(
+            row,
+            [self._attachment_dict(item, include_path=True) for item in attachment_rows],
+        )
 
     def mark_turn_running(self, turn_id: str, worker_pid: int) -> bool:
         now = utc_now()
@@ -886,9 +1089,27 @@ class JobStore:
         status: str | None,
         kind: str | None,
         detail: str | None,
-    ) -> None:
+    ) -> bool:
         now = utc_now()
         with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            if current is not None:
+                if (
+                    current["session_id"] != session_id
+                    or current["turn_id"] != turn_id
+                    or current["role"] != "tool"
+                ):
+                    raise StoreError("Backend tool id was reused for a different timeline item")
+                if (
+                    current["text"] == title
+                    and current["status"] == status
+                    and current["kind"] == kind
+                    and current["detail"] == detail
+                ):
+                    return False
             connection.execute(
                 """
                 INSERT INTO messages(
@@ -933,6 +1154,7 @@ class JobStore:
                 },
                 now,
             )
+        return True
 
     def update_usage(self, session_id: str, usage: dict[str, Any]) -> dict[str, Any]:
         def optional_int(*keys: str) -> int | None:

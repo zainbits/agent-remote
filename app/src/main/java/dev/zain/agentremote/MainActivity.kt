@@ -149,6 +149,8 @@ class MainActivity : ComponentActivity() {
                                     ChatScreen(
                                         state = state,
                                         onDraftChange = vm::onDraftChange,
+                                        onImagesSelected = vm::addImages,
+                                        onRemoveImage = vm::removeImage,
                                         onSend = vm::send,
                                         onCancel = vm::cancelCurrentRequest,
                                         onSelectSlashCommand = vm::selectSlashCommand,

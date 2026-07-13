@@ -1,11 +1,17 @@
 package dev.zain.agentremote.ui
 
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia
+import androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -38,6 +44,8 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Memory
@@ -49,6 +57,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -68,8 +77,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -81,6 +92,7 @@ import dev.zain.agentremote.agent.ChatMessage
 import dev.zain.agentremote.agent.ChatRole
 import dev.zain.agentremote.agent.AgentModelOption
 import dev.zain.agentremote.agent.ConnectionState
+import dev.zain.agentremote.agent.ImageAttachment
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
 import dev.zain.agentremote.data.NetworkProfile
@@ -91,6 +103,8 @@ import dev.zain.agentremote.data.displayName
 fun ChatScreen(
     state: ChatUiState,
     onDraftChange: (String) -> Unit,
+    onImagesSelected: (List<Uri>) -> Unit,
+    onRemoveImage: (String) -> Unit,
     onSend: () -> Unit,
     onCancel: () -> Unit,
     onSelectSlashCommand: (SlashCommand) -> Unit,
@@ -101,6 +115,10 @@ fun ChatScreen(
     onBack: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
+    val imagePicker = rememberLauncherForActivityResult(
+        contract = PickMultipleVisualMedia(4),
+        onResult = onImagesSelected,
+    )
     val connected = state.connection is ConnectionState.Connected
     val cwd = when (val c = state.connection) {
         is ConnectionState.Connected -> c.cwd.ifBlank { state.settings.workingDirectory }
@@ -231,12 +249,15 @@ fun ChatScreen(
             )
 
             val commandName = slashCommandName(state.draft)
-            val isLocalCommand = state.slashCommands.any {
+            val isLocalCommand = state.pendingImages.isEmpty() && state.slashCommands.any {
                 it.source == SlashCommandSource.APP && it.name.equals(commandName, ignoreCase = true)
             }
             val canSendWhileBusy = commandName == "stop" || commandName == "cancel"
             MessageComposer(
                 draft = state.draft,
+                pendingImages = state.pendingImages,
+                attachmentError = state.attachmentError,
+                attachmentSelectionBusy = state.attachmentSelectionBusy,
                 agentName = state.settings.backendKind.displayName,
                 modelId = state.usage.modelId,
                 modelName = state.usage.modelName ?: state.usage.modelId,
@@ -250,12 +271,22 @@ fun ChatScreen(
                 inputEnabled = !state.busy || connected,
                 requestInFlight = state.requestInFlight,
                 cancellationRequested = state.cancellationRequested,
-                sendEnabled = state.draft.isNotBlank() &&
+                attachmentEnabled = connected &&
+                    !state.busy &&
+                    !state.requestInFlight &&
+                    !state.attachmentSelectionBusy &&
+                    !state.modelSelectionBusy,
+                sendEnabled = (state.draft.isNotBlank() || state.pendingImages.isNotEmpty()) &&
                     (connected || isLocalCommand) &&
+                    !state.attachmentSelectionBusy &&
                     !state.modelSelectionBusy &&
                     (!state.busy || canSendWhileBusy),
                 onSelectModel = onSelectModel,
                 onDraftChange = onDraftChange,
+                onAttachImages = {
+                    imagePicker.launch(PickVisualMediaRequest(PickVisualMedia.ImageOnly))
+                },
+                onRemoveImage = onRemoveImage,
                 onSend = onSend,
                 onCancel = onCancel,
                 modifier = Modifier
@@ -291,6 +322,7 @@ private fun ChatHistory(
         latest?.text?.length,
         latest?.detail?.length,
         latest?.toolStatus,
+        latest?.attachments?.size,
     ) {
         if (followLatest && !listState.isScrollInProgress && messages.isNotEmpty()) {
             listState.scrollToItem(0)
@@ -323,6 +355,9 @@ private fun ChatHistory(
 @Composable
 private fun MessageComposer(
     draft: String,
+    pendingImages: List<ImageAttachment>,
+    attachmentError: String?,
+    attachmentSelectionBusy: Boolean,
     agentName: String,
     modelId: String?,
     modelName: String?,
@@ -333,8 +368,11 @@ private fun MessageComposer(
     inputEnabled: Boolean,
     requestInFlight: Boolean,
     cancellationRequested: Boolean,
+    attachmentEnabled: Boolean,
     sendEnabled: Boolean,
     onDraftChange: (String) -> Unit,
+    onAttachImages: () -> Unit,
+    onRemoveImage: (String) -> Unit,
     onSelectModel: (AgentModelOption) -> Unit,
     onSend: () -> Unit,
     onCancel: () -> Unit,
@@ -355,6 +393,31 @@ private fun MessageComposer(
         Column(
             modifier = Modifier.padding(start = 10.dp, top = 8.dp, end = 8.dp, bottom = 8.dp),
         ) {
+            if (pendingImages.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    pendingImages.forEach { image ->
+                        AttachmentThumbnail(
+                            attachment = image,
+                            onRemove = { onRemoveImage(image.id) },
+                        )
+                    }
+                }
+            }
+
+            attachmentError?.let { message ->
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                )
+            }
+
             BasicTextField(
                 value = draft,
                 onValueChange = onDraftChange,
@@ -394,6 +457,21 @@ private fun MessageComposer(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                FilledTonalIconButton(
+                    onClick = onAttachImages,
+                    enabled = attachmentEnabled && pendingImages.size < 4,
+                    modifier = Modifier.size(48.dp),
+                ) {
+                    if (attachmentSelectionBusy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(Icons.Default.AddPhotoAlternate, contentDescription = "Attach images")
+                    }
+                }
+
                 ComposerModelRail(
                     modelId = modelId,
                     modelName = modelName ?: "$agentName model",
@@ -433,6 +511,69 @@ private fun MessageComposer(
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send message")
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttachmentThumbnail(
+    attachment: ImageAttachment,
+    onRemove: (() -> Unit)? = null,
+) {
+    Box(modifier = Modifier.size(68.dp)) {
+        Surface(
+            modifier = Modifier
+                .fillMaxSize()
+                .clip(RoundedCornerShape(14.dp)),
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            shape = RoundedCornerShape(14.dp),
+        ) {
+            val thumbnail = attachment.thumbnail
+            if (thumbnail != null) {
+                Image(
+                    bitmap = thumbnail,
+                    contentDescription = attachment.fileName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Column(
+                    modifier = Modifier.padding(6.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Icon(
+                        Icons.Default.Photo,
+                        contentDescription = null,
+                        modifier = Modifier.size(26.dp),
+                    )
+                    Text(
+                        text = attachment.fileName,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+        if (onRemove != null) {
+            IconButton(
+                onClick = onRemove,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(2.dp)
+                    .size(24.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.68f)),
+            ) {
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = "Remove ${attachment.fileName}",
+                    tint = Color.White,
+                    modifier = Modifier.size(16.dp),
+                )
             }
         }
     }
@@ -786,11 +927,25 @@ private fun UserBubble(message: ChatMessage) {
             modifier = Modifier.widthIn(max = 340.dp),
             shadowElevation = 1.dp,
         ) {
-            Text(
-                text = message.text + if (message.streaming) "▍" else "",
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                style = MaterialTheme.typography.bodyLarge,
-            )
+            Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp)) {
+                if (message.attachments.isNotEmpty()) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(bottom = if (message.text.isNotBlank()) 8.dp else 0.dp),
+                    ) {
+                        message.attachments.forEach { attachment ->
+                            AttachmentThumbnail(attachment)
+                        }
+                    }
+                }
+                if (message.text.isNotBlank() || message.streaming) {
+                    Text(
+                        text = message.text + if (message.streaming) "▍" else "",
+                        modifier = Modifier.padding(horizontal = 4.dp),
+                        style = MaterialTheme.typography.bodyLarge,
+                    )
+                }
+            }
         }
     }
 }

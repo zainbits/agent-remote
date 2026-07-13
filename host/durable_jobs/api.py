@@ -55,13 +55,7 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
         return False
 
     def _json_body(self) -> dict[str, Any]:
-        raw_length = self.headers.get("Content-Length", "0")
-        try:
-            length = int(raw_length)
-        except ValueError as error:
-            raise StoreError("Invalid Content-Length") from error
-        if length <= 0 or length > MAX_BODY_BYTES:
-            raise StoreError("Request body must be between 1 byte and 1 MiB")
+        length = self._content_length(MAX_BODY_BYTES)
         try:
             value = json.loads(self.rfile.read(length))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -69,6 +63,18 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(value, dict):
             raise StoreError("Request body must be a JSON object")
         return value
+
+    def _content_length(self, maximum: int) -> int:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except ValueError as error:
+            raise StoreError("Invalid Content-Length") from error
+        if length <= 0 or length > maximum:
+            if maximum == MAX_BODY_BYTES:
+                raise StoreError("Request body must be between 1 byte and 1 MiB")
+            raise StoreError("Image must be between 1 byte and 20 MiB")
+        return length
 
     @staticmethod
     def _route(path: str) -> list[str]:
@@ -153,8 +159,31 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
                 return
             if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "turns":
                 body = self._json_body()
-                turn = self.server.manager.start_turn(route[3], str(body.get("prompt") or ""))
+                attachment_ids = body.get("attachmentIds") or []
+                if not isinstance(attachment_ids, list) or not all(
+                    isinstance(item, str) for item in attachment_ids
+                ):
+                    raise StoreError("attachmentIds must be an array of strings")
+                turn = self.server.manager.start_turn(
+                    route[3],
+                    str(body.get("prompt") or ""),
+                    attachment_ids,
+                )
                 self._send(HTTPStatus.ACCEPTED, {"turn": turn})
+                return
+            if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "attachments":
+                length = self._content_length(20 * 1024 * 1024)
+                raw_name = self.headers.get("X-File-Name", "")
+                if len(raw_name) > 1024:
+                    raise StoreError("Image filename is too long")
+                attachment = self.server.manager.upload_attachment(
+                    route[3],
+                    urllib.parse.unquote_plus(raw_name),
+                    self.headers.get("Content-Type", "").split(";", 1)[0].strip(),
+                    length,
+                    self.rfile,
+                )
+                self._send(HTTPStatus.CREATED, {"attachment": attachment})
                 return
             if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "model":
                 body = self._json_body()

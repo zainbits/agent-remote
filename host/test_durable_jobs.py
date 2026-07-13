@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sqlite3
@@ -10,6 +11,7 @@ import urllib.request
 from pathlib import Path
 
 from host.durable_jobs.api import DurableHTTPServer
+from host.durable_jobs.catalog import LegacyCatalog
 from host.durable_jobs.manager import JobManager
 from host.durable_jobs.metadata import MetadataProvider
 from host.durable_jobs.store import ConflictError, JobStore
@@ -121,6 +123,12 @@ prompt = ""
 if "--prompt-file" in sys.argv:
     with open(sys.argv[sys.argv.index("--prompt-file") + 1], encoding="utf-8") as source:
         prompt = source.read().strip()
+elif "--prompt-json" in sys.argv:
+    value = json.loads(sys.argv[sys.argv.index("--prompt-json") + 1])
+    prompt = "\n".join(
+        block.get("text", "") for block in value.get("content", [])
+        if block.get("type") == "text"
+    ).strip()
 print(json.dumps({"type": "thought", "data": "checking"}), flush=True)
 if prompt == "/session-info":
     print(json.dumps({"type": "text", "data": (
@@ -226,6 +234,24 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("codex-result", bundle["messages"][-1]["text"])
         self.assertIn("turn.completed", [event["type"] for event in events])
 
+    def test_legacy_catalog_sync_is_cached_and_single_flight_per_key(self):
+        catalog = LegacyCatalog(
+            self.store,
+            codex_bin=str(self.codex),
+            sync_ttl_seconds=30,
+        )
+        calls: list[tuple[str, int]] = []
+        catalog._sync_codex = lambda cwd, limit: calls.append((cwd, limit))
+
+        catalog.sync("codex", str(self.workspace), 50)
+        catalog.sync("codex", str(self.workspace), 50)
+        catalog.sync("codex", str(self.workspace), 100)
+
+        self.assertEqual(
+            [(str(self.workspace), 50), (str(self.workspace), 100)],
+            calls,
+        )
+
     def test_codex_interleaved_items_keep_live_and_replay_order(self):
         session = self.manager.create_session("codex", str(self.workspace))
         self.manager.start_turn(session["id"], "INTERLEAVED")
@@ -294,6 +320,33 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual(1, event_types.count("message.replaced"))
         self.assertEqual(1, event_types.count("message.completed"))
 
+    def test_unchanged_tool_snapshots_do_not_duplicate_replay_events(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        turn = self.store.create_turn(session["id"], "tool snapshot test")
+        message_id = f'{turn["id"]}:tool'
+
+        self.assertTrue(
+            self.store.upsert_tool(
+                session["id"], turn["id"], message_id,
+                "Command", "in_progress", "command_execution", "output",
+            )
+        )
+        self.assertFalse(
+            self.store.upsert_tool(
+                session["id"], turn["id"], message_id,
+                "Command", "in_progress", "command_execution", "output",
+            )
+        )
+        self.assertTrue(
+            self.store.upsert_tool(
+                session["id"], turn["id"], message_id,
+                "Command", "completed", "command_execution", "output",
+            )
+        )
+
+        events = self.store.events_after(session["id"], 0)
+        self.assertEqual(2, [event["type"] for event in events].count("tool.updated"))
+
     def test_grok_turn_is_persisted(self):
         session = self.manager.create_session("grok", str(self.workspace))
         self.manager.start_turn(session["id"], "run grok")
@@ -303,6 +356,60 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("grok-session-test", terminal["backendSessionId"])
         self.assertEqual("grok-result", bundle["messages"][-1]["text"])
         self.assertEqual(["user", "thought", "assistant"], [m["role"] for m in bundle["messages"]])
+
+    def test_images_are_durable_and_mapped_to_backend_commands(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        image_bytes = b"\x89PNG\r\n\x1a\n" + b"test-image"
+        attachment = self.manager.upload_attachment(
+            session["id"],
+            "screen.png",
+            "image/png",
+            len(image_bytes),
+            io.BytesIO(image_bytes),
+        )
+
+        turn = self.store.create_turn(session["id"], "", [attachment["id"]])
+        command = self.manager._command(
+            session,
+            turn["prompt"],
+            attachments=turn["attachments"],
+        )
+        bundle = self.store.session_bundle(session["id"])
+        event = next(
+            item for item in self.store.events_after(session["id"], 0)
+            if item["type"] == "message.created"
+        )
+
+        self.assertEqual("", bundle["messages"][0]["text"])
+        self.assertEqual("screen.png", bundle["messages"][0]["attachments"][0]["fileName"])
+        self.assertNotIn("path", bundle["messages"][0]["attachments"][0])
+        self.assertEqual("screen.png", event["data"]["attachments"][0]["fileName"])
+        self.assertEqual(
+            turn["attachments"][0]["path"],
+            command[command.index("--image") + 1],
+        )
+        self.assertTrue(Path(turn["attachments"][0]["path"]).is_file())
+
+        self.store.finish_turn(turn["id"], "completed")
+        with self.assertRaises(ConflictError):
+            self.store.create_turn(session["id"], "reuse", [attachment["id"]])
+
+    def test_grok_images_use_compact_acp_resource_links(self):
+        session = self.manager.create_session("grok", str(self.workspace))
+        attachment = {
+            "path": str(self.workspace / "image.png"),
+            "fileName": "image.png",
+            "mimeType": "image/png",
+            "sizeBytes": 123,
+        }
+
+        command = self.manager._command(session, "inspect this", attachments=[attachment])
+        payload = json.loads(command[command.index("--prompt-json") + 1])
+
+        self.assertEqual("acp", payload["type"])
+        self.assertEqual(["text", "resource_link"], [item["type"] for item in payload["content"]])
+        self.assertEqual("inspect this", payload["content"][0]["text"])
+        self.assertEqual("image/png", payload["content"][1]["mimeType"])
 
     def test_grok_context_alias_returns_report_and_updates_usage(self):
         session = self.manager.create_session("grok", str(self.workspace))
@@ -623,6 +730,35 @@ class DurableJobsTest(unittest.TestCase):
                 selected = json.load(response)
             self.assertEqual("gpt-fast", selected["session"]["modelOverride"])
 
+            image_bytes = b"\x89PNG\r\n\x1a\n" + b"api-image"
+            upload_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{created['session']['id']}/attachments",
+                data=image_bytes,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "image/png",
+                    "X-File-Name": "phone%20screen.png",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(upload_request, timeout=2) as response:
+                uploaded = json.load(response)
+            self.assertEqual("phone screen.png", uploaded["attachment"]["fileName"])
+
+            turn_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{created['session']['id']}/turns",
+                data=json.dumps({
+                    "prompt": "inspect",
+                    "attachmentIds": [uploaded["attachment"]["id"]],
+                }).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(turn_request, timeout=2) as response:
+                queued = json.load(response)
+            self.assertEqual("phone screen.png", queued["turn"]["attachments"][0]["fileName"])
+            self.assertNotIn("path", queued["turn"]["attachments"][0])
+
             status_request = urllib.request.Request(
                 base + f"/api/v1/sessions/{created['session']['id']}/status",
                 headers={"Authorization": f"Bearer {token}"},
@@ -642,6 +778,16 @@ class DurableJobsTest(unittest.TestCase):
     def test_database_permissions_are_private(self):
         mode = os.stat(self.store.database_path).st_mode & 0o777
         self.assertEqual(0o600, mode)
+
+    def test_database_uses_one_serialized_full_sync_wal_connection(self):
+        with self.store._connect() as first:
+            first_identity = id(first)
+            self.assertEqual("wal", first.execute("PRAGMA journal_mode").fetchone()[0])
+            self.assertEqual(2, first.execute("PRAGMA synchronous").fetchone()[0])
+            self.assertEqual(1000, first.execute("PRAGMA wal_autocheckpoint").fetchone()[0])
+            self.assertEqual(8 * 1024 * 1024, first.execute("PRAGMA journal_size_limit").fetchone()[0])
+        with self.store._connect() as second:
+            self.assertEqual(first_identity, id(second))
 
     def test_existing_v1_database_adds_current_session_columns(self):
         path = Path(self.temporary.name, "v1.sqlite3")
@@ -674,13 +820,17 @@ class DurableJobsTest(unittest.TestCase):
             message_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(messages)")
             }
+            attachment_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(attachments)")
+            }
             version = connection.execute("PRAGMA user_version").fetchone()[0]
 
         self.assertIn("model_name", columns)
         self.assertIn("model_override", columns)
         self.assertIn("codex_full_access", columns)
         self.assertIn("ordinal", message_columns)
-        self.assertEqual(5, version)
+        self.assertIn("stored_name", attachment_columns)
+        self.assertEqual(6, version)
 
     def test_v4_migration_repairs_coalesced_codex_timeline(self):
         path = Path(self.temporary.name, "v4-timeline.sqlite3")
@@ -762,7 +912,7 @@ class DurableJobsTest(unittest.TestCase):
             [message["ordinal"] for message in bundle["messages"]],
         )
         with migrated._connect() as connection:
-            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(6, connection.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
 
     def test_legacy_session_is_adopted_once_with_history(self):

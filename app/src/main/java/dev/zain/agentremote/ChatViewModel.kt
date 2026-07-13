@@ -1,6 +1,10 @@
 package dev.zain.agentremote
 
 import android.app.Application
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Size
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.zain.agentremote.agent.AgentEvent
@@ -13,6 +17,7 @@ import dev.zain.agentremote.agent.CodexRateLimitWindow
 import dev.zain.agentremote.agent.CodexStatusSnapshot
 import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.DurableAgentClient
+import dev.zain.agentremote.agent.ImageAttachment
 import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
@@ -23,6 +28,7 @@ import dev.zain.agentremote.data.NetworkProfile
 import dev.zain.agentremote.data.SettingsRepository
 import dev.zain.agentremote.data.displayName
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +38,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.NumberFormat
 import java.time.Instant
@@ -62,6 +69,9 @@ data class ChatUiState(
     val connection: ConnectionState = ConnectionState.Disconnected,
     val messages: List<ChatMessage> = emptyList(),
     val draft: String = "",
+    val pendingImages: List<ImageAttachment> = emptyList(),
+    val attachmentError: String? = null,
+    val attachmentSelectionBusy: Boolean = false,
     val busy: Boolean = false,
     val requestInFlight: Boolean = false,
     val cancellationRequested: Boolean = false,
@@ -82,8 +92,14 @@ data class ChatUiState(
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(application)
-    private val grokBackend = DurableAgentClient(BackendKind.GROK_BUILD)
-    private val codexBackend = DurableAgentClient(BackendKind.CODEX)
+    private val grokBackend = DurableAgentClient(
+        BackendKind.GROK_BUILD,
+        application.contentResolver,
+    )
+    private val codexBackend = DurableAgentClient(
+        BackendKind.CODEX,
+        application.contentResolver,
+    )
     private val sessionsByBackend = mutableMapOf<BackendKind, List<SessionSummary>>()
     private val sessionErrorsByBackend = mutableMapOf<BackendKind, String?>()
     private var activeBackendKind: BackendKind = BackendKind.GROK_BUILD
@@ -245,6 +261,110 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onDraftChange(value: String) {
         _ui.update { it.copy(draft = value) }
+    }
+
+    fun addImages(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val current = _ui.value.pendingImages
+        val existingUris = current.mapNotNull { it.localUri?.toString() }.toSet()
+        val remaining = MAX_IMAGE_ATTACHMENTS - current.size
+        if (remaining <= 0) {
+            _ui.update { it.copy(attachmentError = "You can attach up to 4 images.") }
+            return
+        }
+        val candidates = uris
+            .distinctBy(Uri::toString)
+            .filterNot { it.toString() in existingUris }
+        val selected = candidates.take(remaining)
+        val overLimit = candidates.size > selected.size
+        if (selected.isEmpty()) {
+            _ui.update { it.copy(attachmentError = null) }
+            return
+        }
+        _ui.update { it.copy(attachmentSelectionBusy = true, attachmentError = null) }
+        viewModelScope.launch {
+            val loaded = withContext(Dispatchers.IO) {
+                selected.map { uri -> runCatching { pickedImage(uri) } }
+            }
+            val images = loaded.mapNotNull(Result<ImageAttachment>::getOrNull)
+            val firstError = loaded.firstNotNullOfOrNull { result ->
+                result.exceptionOrNull()?.message
+            }
+            _ui.update { state ->
+                state.copy(
+                    pendingImages = (state.pendingImages + images)
+                        .distinctBy { it.localUri?.toString() ?: it.id }
+                        .take(MAX_IMAGE_ATTACHMENTS),
+                    attachmentError = firstError ?: if (overLimit) {
+                        "You can attach up to 4 images."
+                    } else {
+                        null
+                    },
+                    attachmentSelectionBusy = false,
+                )
+            }
+        }
+    }
+
+    fun removeImage(id: String) {
+        _ui.update { state ->
+            state.copy(
+                pendingImages = state.pendingImages.filterNot { it.id == id },
+                attachmentError = null,
+            )
+        }
+    }
+
+    private fun pickedImage(uri: Uri): ImageAttachment {
+        val resolver = getApplication<Application>().contentResolver
+        val reportedMimeType = resolver.getType(uri)?.lowercase()
+        val mimeType = when (reportedMimeType) {
+            "image/jpg" -> "image/jpeg"
+            else -> reportedMimeType
+        } ?: throw IllegalArgumentException("The selected item has no image type.")
+        require(mimeType in SUPPORTED_IMAGE_MIME_TYPES) {
+            "Choose a PNG, JPEG, GIF, or WebP image."
+        }
+        var fileName: String? = null
+        var sizeBytes: Long? = null
+        resolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+            null,
+            null,
+            null,
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (nameIndex >= 0 && !cursor.isNull(nameIndex)) fileName = cursor.getString(nameIndex)
+                if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) sizeBytes = cursor.getLong(sizeIndex)
+            }
+        }
+        if (sizeBytes == null || sizeBytes < 0L) {
+            sizeBytes = resolver.openAssetFileDescriptor(uri, "r")?.use { descriptor ->
+                descriptor.length.takeIf { it >= 0L }
+            }
+        }
+        val length = sizeBytes ?: throw IllegalArgumentException("Couldn't determine image size.")
+        require(length in 1..MAX_IMAGE_BYTES) { "Each image must be 20 MiB or smaller." }
+        val extension = when (mimeType) {
+            "image/png" -> "png"
+            "image/jpeg" -> "jpg"
+            "image/gif" -> "gif"
+            else -> "webp"
+        }
+        val thumbnail = runCatching {
+            resolver.loadThumbnail(uri, Size(256, 256), null).asImageBitmap()
+        }.getOrNull()
+        return ImageAttachment(
+            id = UUID.randomUUID().toString(),
+            fileName = fileName?.takeIf { it.isNotBlank() } ?: "image.$extension",
+            mimeType = mimeType,
+            sizeBytes = length,
+            localUri = uri,
+            thumbnail = thumbnail,
+        )
     }
 
     fun refreshSessions() {
@@ -428,6 +548,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     historyLoading = false,
                     messages = emptyList(),
                     draft = "",
+                    pendingImages = emptyList(),
+                    attachmentError = null,
+                    attachmentSelectionBusy = false,
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     modelOptions = emptyList(),
@@ -494,6 +617,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     historyLoading = true,
                     messages = emptyList(),
                     draft = "",
+                    pendingImages = emptyList(),
+                    attachmentError = null,
+                    attachmentSelectionBusy = false,
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     modelOptions = emptyList(),
@@ -549,6 +675,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     statusLine = "Disconnected",
                     messages = emptyList(),
                     draft = "",
+                    pendingImages = emptyList(),
+                    attachmentError = null,
+                    attachmentSelectionBusy = false,
                     slashCommands = localSlashCommandsFor(),
                     usage = AgentUsage(),
                     modelOptions = emptyList(),
@@ -672,10 +801,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun send() {
-        val text = _ui.value.draft.trim()
-        if (text.isEmpty()) return
-        if (runLocalSlashCommand(text)) return
-        val commandName = slashCommandName(text)
+        val initialState = _ui.value
+        val text = initialState.draft.trim()
+        val images = initialState.pendingImages
+        if (initialState.attachmentSelectionBusy) return
+        if (text.isEmpty() && images.isEmpty()) return
+        if (images.isEmpty() && runLocalSlashCommand(text)) return
+        val commandName = slashCommandName(text).takeIf { images.isEmpty() }
         if (!backend.isConnected()) {
             if (commandName != null) {
                 showCommandOutput(
@@ -704,6 +836,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         _ui.update { state ->
             state.copy(
                 draft = "",
+                pendingImages = emptyList(),
+                attachmentError = null,
+                attachmentSelectionBusy = false,
                 busy = true,
                 requestInFlight = true,
                 cancellationRequested = false,
@@ -719,6 +854,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         id = UUID.randomUUID().toString(),
                         role = ChatRole.USER,
                         text = text,
+                        attachments = images,
                     )
                 } else {
                     state.messages
@@ -726,7 +862,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
-            runCatching { backend.sendPrompt(text) }
+            runCatching { backend.sendPrompt(text, images) }
                 .onFailure { e ->
                     // A disconnected/replaced session can finish an old request later.
                     if (activePromptGeneration != generation) return@onFailure
@@ -1747,7 +1883,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     suppressLoadedSlashTurn = event.text.trimStart().startsWith('/')
                 }
                 if (suppressLoadedSlashTurn) return
-                appendStreaming(ChatRole.USER, event.text)
+                appendStreaming(
+                    ChatRole.USER,
+                    event.text,
+                    attachments = event.attachments,
+                )
             }
             is AgentEvent.AssistantDelta -> {
                 val command = activeSlashCommand
@@ -1925,6 +2065,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         messageId: String? = null,
         replace: Boolean = false,
         completed: Boolean = false,
+        attachments: List<ImageAttachment> = emptyList(),
     ) {
         if (!messageId.isNullOrBlank()) {
             _ui.update { state ->
@@ -1938,6 +2079,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             messages[existingIndex] = previous.copy(
                                 text = if (replace) delta else previous.text + delta,
                                 streaming = !completed,
+                                attachments = if (attachments.isNotEmpty()) {
+                                    attachments
+                                } else {
+                                    previous.attachments
+                                },
                             )
                         },
                     )
@@ -1954,6 +2100,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             role = role,
                             text = delta,
                             streaming = !completed,
+                            attachments = attachments,
                         ),
                     )
                 }
@@ -1987,6 +2134,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         role = role,
                         text = delta,
                         streaming = true,
+                        attachments = attachments,
                     ),
                 )
             }
@@ -2102,6 +2250,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
+        const val MAX_IMAGE_ATTACHMENTS = 4
+        const val MAX_IMAGE_BYTES = 20L * 1024L * 1024L
+        val SUPPORTED_IMAGE_MIME_TYPES = setOf(
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+        )
         const val CODEX_CONTEXT_BASELINE_TOKENS = 12_000L
         const val RECONNECT_ATTEMPT_TIMEOUT_MILLIS = 25_000L
         const val SESSION_STATUS_POLL_INTERVAL_MILLIS = 2_000L

@@ -13,7 +13,8 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
 | `GET` | `/api/v1/sessions/{id}/commands` | Refresh the backend-specific slash-command catalog |
 | `GET` | `/api/v1/sessions/{id}/status` | Read live Codex account limits plus native thread configuration/context status |
-| `POST` | `/api/v1/sessions/{id}/turns` | Queue `{ prompt }`; returns `202` immediately |
+| `POST` | `/api/v1/sessions/{id}/attachments` | Stream one image body with `Content-Type` and URL-encoded `X-File-Name`; returns durable attachment metadata |
+| `POST` | `/api/v1/sessions/{id}/turns` | Queue `{ prompt, attachmentIds? }`; returns `202` immediately |
 | `POST` | `/api/v1/sessions/{id}/model` | Select `{ modelId }` for future turns in an idle session |
 | `GET` | `/api/v1/sessions/{id}/events?after=N&wait=20` | Long-poll replayable events after cursor `N` |
 | `POST` | `/api/v1/sessions/{id}/cancel` | Request cancellation of the active turn |
@@ -30,6 +31,8 @@ The server writes the user message and `turn.queued` event transactionally befor
 - `turn.failed`
 - `turn.cancelled`
 
+Up to four PNG, JPEG, GIF, or WebP images (20 MiB each) can be uploaded before a turn. Uploads are private mode-`600` files under the durable data directory, become owned by the turn transactionally, and are included in message replay metadata. Unsent uploads expire after one day. Codex receives each file through its native repeated `--image` option; Grok receives ACP resource-link content blocks.
+
 Clients first fetch the session snapshot and its `latestEventId`, then poll strictly after that cursor. Event IDs are durable SQLite row IDs, so reconnecting never depends on an in-memory stream.
 
 Session snapshots and `usage.updated` events include the merged model name/ID, reasoning effort, used tokens, and context capacity when the backend reports them. Grok snapshots also include headless-compatible built-ins and installed skills. Informational slash reports are persisted as ordinary assistant output so they survive observer disconnects and replay.
@@ -42,6 +45,8 @@ The service wrapper also exports non-interactive toolchain paths for Linuxbrew, 
 
 ## Storage
 
-`schema.sql` is the tracked schema. SQLite uses WAL journaling, full synchronous commits, foreign keys, a 30-second busy timeout, and a mode-`600` database inside a mode-`700` data directory.
+`schema.sql` is the tracked schema. SQLite uses one process-wide serialized connection with WAL journaling, full synchronous commits, foreign keys, a 30-second busy timeout, a 1000-page automatic checkpoint, and an 8-MiB journal size limit. The database is mode `600` inside a mode-`700` data directory.
+
+Legacy-session discovery is single-flight and cached for 30 seconds per backend, workspace, and list limit. `AGENTREMOTE_LEGACY_SYNC_TTL_SECONDS` can tune that interval; failed discovery is retried after at most five seconds.
 
 The database contains prompts and agent output and must not be committed. The bearer token is also runtime-only and mode `600`.

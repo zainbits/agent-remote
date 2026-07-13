@@ -8,7 +8,7 @@ AgentRemote is only the controller and live viewer. The checked-in host service 
 
 - `host/agentremotesrv`: installs and manages the user-level host service.
 - `host/durable_jobs/`: authenticated HTTP API, worker pool, CLI event normalization, and legacy-session adoption.
-- SQLite in WAL mode stores durable sessions, turns, messages, status, usage, and replay events.
+- SQLite in WAL mode stores durable sessions, turns, messages, image-attachment metadata, status, usage, and replay events.
 - Codex runs through documented `codex exec --json` sessions and resumes by Codex thread ID.
 - Grok runs through `grok --output-format streaming-json` and resumes by Grok session ID.
 - The Android client long-polls persisted events. Disconnecting only removes that observer.
@@ -65,6 +65,7 @@ Host overrides:
 - `AGENTREMOTE_CODEX_BIN=/path/to/codex`
 - `AGENTREMOTE_GROK_BIN=/path/to/grok`
 - `AGENTREMOTE_IMPORT_LEGACY=0` to disable discovery of pre-durable CLI sessions
+- `AGENTREMOTE_LEGACY_SYNC_TTL_SECONDS=N` to change the 30-second legacy-discovery cache
 
 Put persistent overrides in a systemd user-service override, then restart the service.
 
@@ -94,7 +95,7 @@ In **Settings** configure:
 
 The LAN/Tailnet chips select the saved URL. Tailscale encrypts Tailnet traffic; use HTTPS or another trusted encrypted tunnel if exposing the API by another route. Never expose port `2440` directly to the public internet.
 
-Existing Grok and Codex sessions are discovered and adopted automatically. Their histories are imported lazily when first opened, and later prompts resume the original backend session ID.
+Existing Grok and Codex sessions are discovered and adopted automatically. Discovery is cached and single-flight for 30 seconds per backend, workspace, and list limit so frequent Android status refreshes do not repeatedly launch the Codex app-server or rescan Grok history. Their histories are imported lazily when first opened, and later prompts resume the original backend session ID.
 
 ## Behavior
 
@@ -105,6 +106,7 @@ Existing Grok and Codex sessions are discovered and adopted automatically. Their
 - **Stop**, `/stop`, and `/cancel` explicitly cancel only the open session's active turn.
 - `/new`, `/clear`, `/home`, and `/disconnect` detach without stopping host work.
 - The composer shows the backend's effective model and reasoning effort.
+- The composer can pick, preview, remove, and send up to four images with a text prompt or as an image-only turn. Images stream to private durable host storage before the turn is queued, so host execution remains independent of the phone.
 - Grok built-ins and installed skills populate slash autocomplete; Codex exposes app-local commands only.
 - Grok `/context`, `/usage`, and `/session-info` return durable live usage reports, while Codex renders those reports from its persisted usage state.
 - Silent Grok outcomes such as `/compact` receive a persisted completion report instead of an empty panel.

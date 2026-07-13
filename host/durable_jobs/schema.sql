@@ -24,6 +24,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS sessions_backend_identity
     ON sessions(backend, backend_session_id)
     WHERE backend_session_id IS NOT NULL;
 
+CREATE INDEX IF NOT EXISTS sessions_backend_cwd_updated
+    ON sessions(backend, cwd, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS turns (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -58,6 +61,21 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_session_created
     ON messages(session_id, created_at);
 
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    turn_id TEXT REFERENCES turns(id) ON DELETE CASCADE,
+    turn_ordinal INTEGER,
+    stored_name TEXT NOT NULL UNIQUE,
+    file_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS attachments_session_turn
+    ON attachments(session_id, turn_id, turn_ordinal);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -70,4 +88,4 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_session_id
     ON events(session_id, id);
 
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;

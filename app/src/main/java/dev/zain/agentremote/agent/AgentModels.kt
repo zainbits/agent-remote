@@ -1,5 +1,8 @@
 package dev.zain.agentremote.agent
 
+import android.net.Uri
+import androidx.compose.ui.graphics.ImageBitmap
+
 enum class ChatRole {
     USER,
     ASSISTANT,
@@ -7,6 +10,17 @@ enum class ChatRole {
     TOOL,
     SYSTEM,
 }
+
+data class ImageAttachment(
+    val id: String,
+    val fileName: String,
+    val mimeType: String,
+    val sizeBytes: Long,
+    /** Present while the picked image is still readable on this Android process. */
+    val localUri: Uri? = null,
+    /** Small UI-only preview; the original image is streamed separately. */
+    val thumbnail: ImageBitmap? = null,
+)
 
 /**
  * One renderable chat block. Tools are keyed by [toolCallId] so updates merge
@@ -23,6 +37,7 @@ data class ChatMessage(
     val toolKind: String? = null,
     /** Expanded body: input path, output snippet, etc. */
     val detail: String? = null,
+    val attachments: List<ImageAttachment> = emptyList(),
 )
 
 /** A command the chat composer can complete after the user types `/`. */
@@ -163,7 +178,11 @@ sealed class AgentEvent {
     data class ConnectionChanged(val state: ConnectionState) : AgentEvent()
     data class SlashCommandsChanged(val commands: List<SlashCommand>) : AgentEvent()
     data class UsageChanged(val usage: AgentUsage) : AgentEvent()
-    data class UserDelta(val text: String, val promptIndex: Long? = null) : AgentEvent()
+    data class UserDelta(
+        val text: String,
+        val promptIndex: Long? = null,
+        val attachments: List<ImageAttachment> = emptyList(),
+    ) : AgentEvent()
     data class AssistantDelta(
         val text: String,
         val messageId: String? = null,

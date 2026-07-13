@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import subprocess
 import threading
@@ -14,6 +15,8 @@ from .store import JobStore
 
 
 LOGGER = logging.getLogger("agentremote.host.catalog")
+DEFAULT_SYNC_TTL_SECONDS = 30.0
+FAILED_SYNC_TTL_SECONDS = 5.0
 
 
 def _iso_epoch_seconds(value: Any) -> str | None:
@@ -42,19 +45,58 @@ def _content_text(content: Any) -> str:
 class LegacyCatalog:
     """Lazily adopts existing CLI sessions into the durable catalog."""
 
-    def __init__(self, store: JobStore, codex_bin: str = "codex"):
+    def __init__(
+        self,
+        store: JobStore,
+        codex_bin: str = "codex",
+        sync_ttl_seconds: float | None = None,
+    ):
         self.store = store
         self.codex_bin = codex_bin
+        if sync_ttl_seconds is None:
+            try:
+                sync_ttl_seconds = float(
+                    os.environ.get(
+                        "AGENTREMOTE_LEGACY_SYNC_TTL_SECONDS",
+                        DEFAULT_SYNC_TTL_SECONDS,
+                    )
+                )
+            except ValueError:
+                sync_ttl_seconds = DEFAULT_SYNC_TTL_SECONDS
+        self.sync_ttl_seconds = max(0.0, sync_ttl_seconds)
+        self._sync_lock = threading.Lock()
+        self._sync_deadlines: dict[tuple[str, str, int], float] = {}
 
     def sync(self, backend: str, cwd: str, limit: int) -> None:
-        try:
-            if backend == "codex":
-                self._sync_codex(cwd, limit)
-            elif backend == "grok":
-                self._sync_grok(cwd, limit)
-        except Exception as error:
-            # Legacy discovery must never make durable sessions unavailable.
-            LOGGER.warning("Could not refresh legacy %s sessions: %s", backend, error)
+        normalized_backend = backend.strip().lower()
+        normalized_limit = max(1, min(limit, 200))
+        key = (normalized_backend, str(Path(cwd).expanduser().resolve()), normalized_limit)
+
+        # Session cards can refresh every two seconds while a turn is active.
+        # Discovery is much heavier than the SQLite-backed status list (Codex
+        # launches app-server), so make each key single-flight and reuse a
+        # recent result. Holding the lock also prevents duplicate launches when
+        # two Android refreshes arrive together.
+        with self._sync_lock:
+            now = time.monotonic()
+            if now < self._sync_deadlines.get(key, 0.0):
+                return
+            try:
+                if normalized_backend == "codex":
+                    self._sync_codex(cwd, normalized_limit)
+                elif normalized_backend == "grok":
+                    self._sync_grok(cwd, normalized_limit)
+                else:
+                    return
+            except Exception as error:
+                # Legacy discovery must never make durable sessions unavailable.
+                LOGGER.warning("Could not refresh legacy %s sessions: %s", normalized_backend, error)
+                self._sync_deadlines[key] = time.monotonic() + min(
+                    self.sync_ttl_seconds,
+                    FAILED_SYNC_TTL_SECONDS,
+                )
+            else:
+                self._sync_deadlines[key] = time.monotonic() + self.sync_ttl_seconds
 
     def import_history_if_needed(self, session_id: str) -> None:
         session = self.store.get_session(session_id)

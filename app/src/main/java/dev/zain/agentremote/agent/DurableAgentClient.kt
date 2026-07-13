@@ -1,5 +1,6 @@
 package dev.zain.agentremote.agent
 
+import android.content.ContentResolver
 import dev.zain.agentremote.data.BackendKind
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -14,10 +15,14 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
+import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -30,7 +35,10 @@ import java.util.concurrent.atomic.AtomicLong
  * Observer/controller for host-owned jobs. Closing this client only detaches the UI;
  * the durable host process remains the owner of every queued or running turn.
  */
-class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
+class DurableAgentClient(
+    private val kind: BackendKind,
+    private val contentResolver: ContentResolver,
+) : AgentBackend {
     override val name: String = when (kind) {
         BackendKind.GROK_BUILD -> "Grok"
         BackendKind.CODEX -> "Codex"
@@ -39,7 +47,7 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val generation = AtomicLong(0)
@@ -178,6 +186,10 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
     }
 
     override suspend fun sendPrompt(text: String) {
+        sendPrompt(text, emptyList())
+    }
+
+    suspend fun sendPrompt(text: String, images: List<ImageAttachment>) {
         val id = sessionId ?: error("Not connected")
         val completion = CompletableDeferred<String?>()
         synchronized(stateLock) {
@@ -185,10 +197,16 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             activeTurnCompletion = completion
         }
         try {
+            val attachmentIds = JSONArray()
+            images.forEach { image ->
+                attachmentIds.put(uploadImage(id, image))
+            }
             request(
                 method = "POST",
                 path = "/api/v1/sessions/${encodePath(id)}/turns",
-                body = JSONObject().put("prompt", text),
+                body = JSONObject()
+                    .put("prompt", text)
+                    .put("attachmentIds", attachmentIds),
             )
             completion.await()
         } finally {
@@ -196,6 +214,32 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                 if (activeTurnCompletion === completion) activeTurnCompletion = null
             }
         }
+    }
+
+    private suspend fun uploadImage(sessionId: String, image: ImageAttachment): String {
+        val uri = image.localUri ?: error("Selected image is no longer available")
+        val request = Request.Builder()
+            .url(
+                baseUrl.trimEnd('/') +
+                    "/api/v1/sessions/${encodePath(sessionId)}/attachments",
+            )
+            .header("Authorization", "Bearer $secret")
+            .header("Accept", "application/json")
+            .header("X-File-Name", encode(image.fileName))
+            .post(
+                ContentUriRequestBody(
+                    contentResolver = contentResolver,
+                    uri = uri,
+                    mimeType = image.mimeType,
+                    sizeBytes = image.sizeBytes,
+                ),
+            )
+            .build()
+        val root = executeJsonRequest(request)
+        return root.optJSONObject("attachment")
+            ?.optString("id")
+            ?.takeIf { it.isNotBlank() }
+            ?: error("Durable host returned no attachment ID")
     }
 
     override suspend fun cancelCurrentRequest(): Boolean {
@@ -331,6 +375,7 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                     AgentEvent.UserDelta(
                         text = data.optString("text"),
                         promptIndex = event.optLong("id"),
+                        attachments = parseAttachments(data.optJSONArray("attachments")),
                     ),
                 )
             }
@@ -348,7 +393,11 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                     ),
                 )
                 "user" -> events.emit(
-                    AgentEvent.UserDelta(data.optString("delta"), event.optLong("id")),
+                    AgentEvent.UserDelta(
+                        data.optString("delta"),
+                        event.optLong("id"),
+                        parseAttachments(data.optJSONArray("attachments")),
+                    ),
                 )
             }
             "message.replaced" -> when (data.optString("role")) {
@@ -421,7 +470,13 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             previousTurn = turnId
             val text = message.optString("text")
             when (message.optString("role")) {
-                "user" -> events.emit(AgentEvent.UserDelta(text, promptIndex))
+                "user" -> events.emit(
+                    AgentEvent.UserDelta(
+                        text,
+                        promptIndex,
+                        parseAttachments(message.optJSONArray("attachments")),
+                    ),
+                )
                 "assistant" -> events.emit(
                     AgentEvent.AssistantDelta(
                         text = text,
@@ -492,7 +547,7 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
         baseUrl: String = this.baseUrl,
         secret: String = this.secret,
         trackAsPoll: Boolean = false,
-    ): JSONObject = withContext(Dispatchers.IO) {
+    ): JSONObject {
         val requestBuilder = Request.Builder()
             .url(baseUrl.trimEnd('/') + path)
             .header("Authorization", "Bearer $secret")
@@ -505,7 +560,14 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             )
             else -> error("Unsupported HTTP method: $method")
         }
-        val call = http.newCall(requestBuilder.build())
+        return executeJsonRequest(requestBuilder.build(), trackAsPoll)
+    }
+
+    private suspend fun executeJsonRequest(
+        request: Request,
+        trackAsPoll: Boolean = false,
+    ): JSONObject = withContext(Dispatchers.IO) {
+        val call = http.newCall(request)
         if (trackAsPoll) synchronized(stateLock) { activePollCall = call }
         try {
             call.execute().use { response ->
@@ -523,6 +585,26 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
         } finally {
             if (trackAsPoll) synchronized(stateLock) {
                 if (activePollCall === call) activePollCall = null
+            }
+        }
+    }
+
+    private fun parseAttachments(array: JSONArray?): List<ImageAttachment> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val id = item.optString("id")
+                val mimeType = item.optString("mimeType")
+                if (id.isBlank() || !mimeType.startsWith("image/")) continue
+                add(
+                    ImageAttachment(
+                        id = id,
+                        fileName = item.optString("fileName").ifBlank { "Image" },
+                        mimeType = mimeType,
+                        sizeBytes = item.optLong("sizeBytes", 0L),
+                    ),
+                )
             }
         }
     }
@@ -699,5 +781,23 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
 
         private fun encodePath(value: String): String =
             URLEncoder.encode(value, StandardCharsets.UTF_8.toString()).replace("+", "%20")
+    }
+}
+
+private class ContentUriRequestBody(
+    private val contentResolver: ContentResolver,
+    private val uri: android.net.Uri,
+    private val mimeType: String,
+    private val sizeBytes: Long,
+) : RequestBody() {
+    override fun contentType() = mimeType.toMediaTypeOrNull()
+
+    override fun contentLength(): Long = sizeBytes
+
+    override fun writeTo(sink: BufferedSink) {
+        val written = contentResolver.openInputStream(uri)?.use { input ->
+            sink.writeAll(input.source())
+        } ?: error("Selected image is no longer available")
+        check(written == sizeBytes) { "Selected image changed while it was uploading" }
     }
 }
