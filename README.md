@@ -102,7 +102,7 @@ Existing Grok and Codex sessions are discovered and adopted automatically. Disco
 - Back/Home detaches from the session without cancelling its active turn.
 - **New session** can start while other sessions remain queued or running.
 - Session cards show `Queued`, `Running`, `Stopping`, `Failed`, or `Stopped` when applicable.
-- Sessions can be renamed and pinned; pinned sessions stay above the recency-sorted list.
+- Sessions can be renamed and pinned; pinned sessions appear in a dedicated section above the unpinned recent-session list.
 - A blue dot marks a session whose background turn finished and has not been opened yet.
 - Reopening a running session restores persisted history and resumes live observation.
 - **Stop**, `/stop`, and `/cancel` explicitly cancel only the open session's active turn.

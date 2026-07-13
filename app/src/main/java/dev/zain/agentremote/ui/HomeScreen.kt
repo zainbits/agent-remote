@@ -91,6 +91,8 @@ fun HomeScreen(
         NetworkProfile.TAILNET -> "Tailnet"
     }
     val backend = state.settings.backendKind
+    val pinnedSessions = state.sessions.filter { it.pinned }
+    val recentSessions = state.sessions.filterNot { it.pinned }
 
     LaunchedEffect(backend) {
         renameSessionId = null
@@ -165,20 +167,35 @@ fun HomeScreen(
                 )
             }
 
-            item {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "Recent sessions",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.weight(1f),
+            if (pinnedSessions.isNotEmpty()) {
+                item {
+                    SessionSectionHeader(
+                        title = "Pinned",
+                        count = pinnedSessions.size,
+                        showPin = true,
                     )
-                    SessionCountPill(state.sessions.size)
                 }
+
+                items(pinnedSessions, key = { it.sessionId }) { session ->
+                    SessionRow(
+                        session = session,
+                        interactionEnabled = interactionEnabled && state.sessionActionId == null,
+                        actionInProgress = state.sessionActionId == session.sessionId,
+                        onClick = { onOpenSession(session) },
+                        onRename = {
+                            renameSessionId = session.sessionId
+                            renameDraft = session.title
+                        },
+                        onTogglePin = { onToggleSessionPin(session) },
+                    )
+                }
+            }
+
+            item {
+                SessionSectionHeader(
+                    title = "Recent sessions",
+                    count = recentSessions.size,
+                )
             }
 
             if (state.sessionsLoading) {
@@ -205,7 +222,7 @@ fun HomeScreen(
                 }
             }
 
-            items(state.sessions, key = { it.sessionId }) { session ->
+            items(recentSessions, key = { it.sessionId }) { session ->
                 SessionRow(
                     session = session,
                     interactionEnabled = interactionEnabled && state.sessionActionId == null,
@@ -322,6 +339,36 @@ private fun SessionCountPill(count: Int) {
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
             style = MaterialTheme.typography.labelMedium,
         )
+    }
+}
+
+@Composable
+private fun SessionSectionHeader(
+    title: String,
+    count: Int,
+    showPin: Boolean = false,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (showPin) {
+            Icon(
+                Icons.Default.PushPin,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.weight(1f),
+        )
+        SessionCountPill(count)
     }
 }
 
