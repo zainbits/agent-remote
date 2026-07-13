@@ -3,19 +3,34 @@ package dev.zain.agentremote.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.WrapText
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -128,7 +143,9 @@ fun MarkdownText(
 
                     is MdBlock.Code -> {
                         CodeBlock(
-                            code = block.code + if (streaming && isLast) "▍" else "",
+                            code = block.code,
+                            language = block.lang,
+                            streaming = streaming && isLast,
                             background = codeBg,
                             color = bodyColor,
                         )
@@ -183,23 +200,86 @@ fun MarkdownText(
 }
 
 @Composable
-private fun CodeBlock(code: String, background: Color, color: Color) {
+@Suppress("DEPRECATION")
+private fun CodeBlock(
+    code: String,
+    language: String?,
+    streaming: Boolean,
+    background: Color,
+    color: Color,
+) {
     val scroll = rememberScrollState()
-    Text(
-        text = code,
-        style = MaterialTheme.typography.bodySmall.copy(
-            fontFamily = FontFamily.Monospace,
-            lineHeight = 18.sp,
-        ),
-        color = color,
+    val clipboard = LocalClipboardManager.current
+    var wrapLines by rememberSaveable { mutableStateOf(false) }
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 6.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(background)
-            .horizontalScroll(scroll)
-            .padding(10.dp),
-    )
+            .background(background),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 10.dp, end = 2.dp),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = language?.uppercase() ?: "Code",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+            IconButton(
+                onClick = { clipboard.setText(AnnotatedString(code)) },
+                enabled = code.isNotEmpty(),
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(
+                    Icons.Default.ContentCopy,
+                    contentDescription = "Copy code block",
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+            IconButton(
+                onClick = { wrapLines = !wrapLines },
+                modifier = Modifier.size(40.dp),
+                colors = IconButtonDefaults.iconButtonColors(
+                    contentColor = if (wrapLines) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                ),
+            ) {
+                Icon(
+                    Icons.Default.WrapText,
+                    contentDescription = if (wrapLines) {
+                        "Disable code line wrapping"
+                    } else {
+                        "Wrap code lines"
+                    },
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
+        Text(
+            text = code + if (streaming) "▍" else "",
+            style = MaterialTheme.typography.bodySmall.copy(
+                fontFamily = FontFamily.Monospace,
+                lineHeight = 18.sp,
+            ),
+            color = color,
+            softWrap = wrapLines,
+            modifier = (if (wrapLines) {
+                Modifier.fillMaxWidth()
+            } else {
+                Modifier.horizontalScroll(scroll)
+            }).padding(start = 10.dp, end = 10.dp, bottom = 10.dp),
+        )
+    }
 }
 
 private sealed class MdBlock {

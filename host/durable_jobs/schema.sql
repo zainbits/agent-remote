@@ -6,6 +6,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     backend_session_id TEXT,
     cwd TEXT NOT NULL,
     title TEXT NOT NULL,
+    title_is_manual INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    unread INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'idle',
     active_turn_id TEXT,
     model_id TEXT,
@@ -88,4 +91,4 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_session_id
     ON events(session_id, id);
 
-PRAGMA user_version = 6;
+PRAGMA user_version = 7;

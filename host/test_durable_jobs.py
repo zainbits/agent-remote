@@ -652,6 +652,33 @@ class DurableJobsTest(unittest.TestCase):
         terminal, _ = self._wait_terminal(session["id"])
         self.assertEqual("cancelled", terminal["status"])
 
+    def test_session_metadata_pin_order_and_unread_lifecycle(self):
+        older = self.store.create_session("codex", str(self.workspace))
+        newer = self.store.create_session("codex", str(self.workspace))
+
+        updated = self.store.update_session_metadata(
+            older["id"],
+            title="Pinned work",
+            pinned=True,
+        )
+        self.assertEqual("Pinned work", updated["title"])
+        self.assertTrue(updated["pinned"])
+        self.assertFalse(updated["unread"])
+        self.assertEqual(
+            older["id"],
+            self.store.list_sessions("codex", str(self.workspace))[0]["id"],
+        )
+
+        turn = self.store.create_turn(older["id"], "a later prompt")
+        self.assertEqual("Pinned work", self.store.get_session(older["id"])["title"])
+        self.assertFalse(self.store.get_session(older["id"])["unread"])
+        self.store.finish_turn(turn["id"], "completed", stop_reason="completed")
+        self.assertTrue(self.store.get_session(older["id"])["unread"])
+
+        read = self.store.update_session_metadata(older["id"], unread=False)
+        self.assertFalse(read["unread"])
+        self.assertFalse(newer["pinned"])
+
     def test_different_sessions_run_concurrently(self):
         first = self.manager.create_session("codex", str(self.workspace))
         second = self.manager.create_session("codex", str(self.workspace))
@@ -689,6 +716,18 @@ class DurableJobsTest(unittest.TestCase):
                 created = json.load(response)
             self.assertEqual("codex", created["session"]["backend"])
             self.assertTrue(created["session"]["codexFullAccess"])
+
+            metadata_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{created['session']['id']}",
+                data=json.dumps({"title": "Phone task", "pinned": True}).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="PATCH",
+            )
+            with urllib.request.urlopen(metadata_request, timeout=2) as response:
+                metadata = json.load(response)
+            self.assertEqual("Phone task", metadata["session"]["title"])
+            self.assertTrue(metadata["session"]["pinned"])
+            self.assertFalse(metadata["session"]["unread"])
 
             sandboxed_request = urllib.request.Request(
                 base + "/api/v1/sessions",
@@ -828,9 +867,12 @@ class DurableJobsTest(unittest.TestCase):
         self.assertIn("model_name", columns)
         self.assertIn("model_override", columns)
         self.assertIn("codex_full_access", columns)
+        self.assertIn("title_is_manual", columns)
+        self.assertIn("pinned", columns)
+        self.assertIn("unread", columns)
         self.assertIn("ordinal", message_columns)
         self.assertIn("stored_name", attachment_columns)
-        self.assertEqual(6, version)
+        self.assertEqual(7, version)
 
     def test_v4_migration_repairs_coalesced_codex_timeline(self):
         path = Path(self.temporary.name, "v4-timeline.sqlite3")
@@ -912,7 +954,7 @@ class DurableJobsTest(unittest.TestCase):
             [message["ordinal"] for message in bundle["messages"]],
         )
         with migrated._connect() as connection:
-            self.assertEqual(6, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual(7, connection.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
 
     def test_legacy_session_is_adopted_once_with_history(self):

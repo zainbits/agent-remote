@@ -102,11 +102,14 @@ Existing Grok and Codex sessions are discovered and adopted automatically. Disco
 - Back/Home detaches from the session without cancelling its active turn.
 - **New session** can start while other sessions remain queued or running.
 - Session cards show `Queued`, `Running`, `Stopping`, `Failed`, or `Stopped` when applicable.
+- Sessions can be renamed and pinned; pinned sessions stay above the recency-sorted list.
+- A blue dot marks a session whose background turn finished and has not been opened yet.
 - Reopening a running session restores persisted history and resumes live observation.
 - **Stop**, `/stop`, and `/cancel` explicitly cancel only the open session's active turn.
 - `/new`, `/clear`, `/home`, and `/disconnect` detach without stopping host work.
 - The composer shows the backend's effective model and reasoning effort.
 - The composer can pick, preview, remove, and send up to four images with a text prompt or as an image-only turn. Images stream to private durable host storage before the turn is queued, so host execution remains independent of the phone.
+- User and assistant messages have whole-message copy actions. Fenced code blocks have independent copy and line-wrap controls.
 - Grok built-ins and installed skills populate slash autocomplete; Codex exposes app-local commands only.
 - Grok `/context`, `/usage`, and `/session-info` return durable live usage reports, while Codex renders those reports from its persisted usage state.
 - Silent Grok outcomes such as `/compact` receive a persisted completion report instead of an empty panel.

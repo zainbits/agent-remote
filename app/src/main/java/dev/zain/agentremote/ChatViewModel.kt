@@ -86,6 +86,7 @@ data class ChatUiState(
     val sessions: List<SessionSummary> = emptyList(),
     val sessionsLoading: Boolean = false,
     val sessionsError: String? = null,
+    val sessionActionId: String? = null,
     val activeSessionTitle: String? = null,
     val historyLoading: Boolean = false,
 )
@@ -372,6 +373,96 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         refreshSessions(_ui.value.settings.backendKind)
     }
 
+    fun renameSession(session: SessionSummary, title: String) {
+        val normalized = title.trim()
+        if (normalized.isBlank() || normalized == session.title) return
+        updateSessionMetadata(session, title = normalized)
+    }
+
+    fun toggleSessionPin(session: SessionSummary) {
+        updateSessionMetadata(session, pinned = !session.pinned)
+    }
+
+    private fun updateSessionMetadata(
+        session: SessionSummary,
+        title: String? = null,
+        pinned: Boolean? = null,
+    ) {
+        val state = _ui.value
+        val kind = state.settings.backendKind
+        val settings = state.settings
+        if (state.sessionActionId != null || settings.durableHostToken.isBlank()) return
+        _ui.update { it.copy(sessionActionId = session.sessionId, sessionsError = null) }
+        viewModelScope.launch {
+            runCatching {
+                durableBackend(kind).updateSessionMetadata(
+                    baseUrl = settings.activeDurableBaseUrl,
+                    secret = settings.durableHostToken,
+                    sessionId = session.sessionId,
+                    title = title,
+                    pinned = pinned,
+                )
+            }.onSuccess { updated ->
+                mergeSessionSummary(kind, updated)
+                _ui.update { current ->
+                    if (current.sessionActionId == session.sessionId) {
+                        current.copy(sessionActionId = null)
+                    } else {
+                        current
+                    }
+                }
+            }.onFailure { error ->
+                _ui.update { current ->
+                    if (current.settings.backendKind == kind) {
+                        current.copy(
+                            sessionActionId = null,
+                            sessionsError = error.message ?: "Couldn't update session",
+                        )
+                    } else {
+                        current.copy(sessionActionId = null)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun markSessionRead(sessionId: String, kind: BackendKind = activeBackendKind) {
+        val settings = _ui.value.settings
+        if (settings.durableHostToken.isBlank()) return
+        sessionsByBackend[kind]
+            ?.firstOrNull { it.sessionId == sessionId && it.unread }
+            ?.let { mergeSessionSummary(kind, it.copy(unread = false)) }
+        viewModelScope.launch {
+            runCatching {
+                durableBackend(kind).updateSessionMetadata(
+                    baseUrl = settings.activeDurableBaseUrl,
+                    secret = settings.durableHostToken,
+                    sessionId = sessionId,
+                    unread = false,
+                )
+            }.onSuccess { updated ->
+                mergeSessionSummary(kind, updated)
+            }
+        }
+    }
+
+    private fun mergeSessionSummary(kind: BackendKind, updated: SessionSummary) {
+        val existing = sessionsByBackend[kind].orEmpty()
+        val merged = (if (existing.any { it.sessionId == updated.sessionId }) {
+            existing.map { if (it.sessionId == updated.sessionId) updated else it }
+        } else {
+            existing + updated
+        })
+            .sortedWith(
+                compareByDescending<SessionSummary> { it.pinned }
+                    .thenByDescending { it.updatedAt ?: it.createdAt.orEmpty() },
+            )
+        sessionsByBackend[kind] = merged
+        _ui.update { state ->
+            if (state.settings.backendKind == kind) state.copy(sessions = merged) else state
+        }
+    }
+
     private fun refreshSessions(kind: BackendKind, showLoading: Boolean = true) {
         val s = _ui.value.settings
         val secret = s.durableHostToken
@@ -601,6 +692,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
         }
         val connectionAction = beginConnectionAction(sessionId = session.sessionId, cwd = cwd)
+        markSessionRead(session.sessionId, activeBackendKind)
         viewModelScope.launch {
             clearChatLocal()
             _ui.update {
@@ -740,6 +832,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
+        activeSessionIdForReconnect?.let { markSessionRead(it, activeBackendKind) }
         val sessionId = activeSessionIdForReconnect
         val needsReconnect = state.reconnecting ||
             state.connection !is ConnectionState.Connected ||
@@ -1969,6 +2062,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 finishActiveRequest()
                 if (stopReason == "loaded") {
                     _ui.update { it.copy(historyLoading = false) }
+                } else if (appInForeground && _ui.value.screen == AppScreen.CHAT) {
+                    activeSessionIdForReconnect?.let {
+                        markSessionRead(it, activeBackendKind)
+                    }
                 }
                 suppressLoadedSlashTurn = false
                 loadedPromptIndex = null

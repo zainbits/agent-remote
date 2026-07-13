@@ -99,6 +99,18 @@ class JobStore:
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN codex_full_access INTEGER NOT NULL DEFAULT 1"
                 )
+            if "title_is_manual" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN title_is_manual INTEGER NOT NULL DEFAULT 0"
+                )
+            if "pinned" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+            if "unread" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN unread INTEGER NOT NULL DEFAULT 0"
+                )
             message_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(messages)").fetchall()
@@ -112,7 +124,7 @@ class JobStore:
                 "CREATE INDEX IF NOT EXISTS messages_session_ordinal "
                 "ON messages(session_id, ordinal)"
             )
-            connection.execute("PRAGMA user_version = 6")
+            connection.execute("PRAGMA user_version = 7")
         os.chmod(self.database_path, 0o600)
         os.chmod(self.attachment_directory, 0o700)
 
@@ -231,6 +243,8 @@ class JobStore:
             "backendSessionId": row["backend_session_id"],
             "cwd": row["cwd"],
             "title": row["title"],
+            "pinned": bool(row["pinned"]),
+            "unread": bool(row["unread"]),
             "status": row["status"],
             "activeTurnId": row["active_turn_id"],
             "modelId": row["model_id"],
@@ -472,6 +486,84 @@ class JobStore:
             )
         return session
 
+    def update_session_metadata(
+        self,
+        session_id: str,
+        *,
+        title: str | None = None,
+        pinned: bool | None = None,
+        unread: bool | None = None,
+    ) -> dict[str, Any]:
+        if title is None and pinned is None and unread is None:
+            raise StoreError("At least one session field is required")
+        normalized_title: str | None = None
+        if title is not None:
+            normalized_title = title.strip()
+            if not normalized_title:
+                raise StoreError("Session title cannot be empty")
+            if len(normalized_title) > 200:
+                raise StoreError("Session title must be 200 characters or fewer")
+
+        now = utc_now()
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                raise NotFoundError("Session not found")
+            changed = (
+                normalized_title is not None
+                and (normalized_title != current["title"] or not current["title_is_manual"])
+            ) or (
+                pinned is not None and pinned != bool(current["pinned"])
+            ) or (
+                unread is not None and unread != bool(current["unread"])
+            )
+            if changed:
+                connection.execute(
+                    """
+                    UPDATE sessions SET
+                        title = COALESCE(?, title),
+                        title_is_manual = CASE WHEN ? IS NULL THEN title_is_manual ELSE 1 END,
+                        pinned = COALESCE(?, pinned),
+                        unread = COALESCE(?, unread)
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_title,
+                        normalized_title,
+                        int(pinned) if pinned is not None else None,
+                        int(unread) if unread is not None else None,
+                        session_id,
+                    ),
+                )
+            row = connection.execute(
+                """
+                SELECT s.*,
+                       (SELECT COUNT(*) FROM messages m
+                        WHERE m.session_id = s.id AND m.role IN ('user', 'assistant')) AS message_count
+                FROM sessions s WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            assert row is not None
+            session = self._session_dict(row)
+            if changed:
+                self._event(
+                    connection,
+                    session_id,
+                    None,
+                    "session.metadata_updated",
+                    {
+                        "title": normalized_title,
+                        "pinned": pinned,
+                        "unread": unread,
+                    },
+                    now,
+                )
+        return session
+
     def import_session(
         self,
         backend: str,
@@ -646,7 +738,7 @@ class JobStore:
                         WHERE m.session_id = s.id AND m.role IN ('user', 'assistant')) AS message_count
                 FROM sessions s
                 WHERE s.backend = ? AND s.cwd = ?
-                ORDER BY s.updated_at DESC
+                ORDER BY s.pinned DESC, s.updated_at DESC
                 LIMIT ?
                 """,
                 (backend.lower(), str(Path(cwd).expanduser().resolve()), max(1, min(limit, 200))),
@@ -768,7 +860,7 @@ class JobStore:
                 (message_id, session_id, turn_id, text, session_id, now, now),
             )
             title = session["title"]
-            if title.startswith("New "):
+            if not bool(session["title_is_manual"]) and title.startswith("New "):
                 title = text.splitlines()[0][:120] if text else (
                     "Image attachment" if len(requested_attachments) == 1 else
                     f"{len(requested_attachments)} image attachments"
@@ -776,7 +868,8 @@ class JobStore:
             connection.execute(
                 """
                 UPDATE sessions
-                SET title = ?, status = 'queued', active_turn_id = ?, last_error = NULL, updated_at = ?
+                SET title = ?, status = 'queued', active_turn_id = ?, unread = 0,
+                    last_error = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (title, turn_id, now, session_id),
@@ -1334,7 +1427,8 @@ class JobStore:
             connection.execute(
                 """
                 UPDATE sessions
-                SET status = ?, active_turn_id = NULL, last_error = ?, updated_at = ?
+                SET status = ?, active_turn_id = NULL, unread = 1,
+                    last_error = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (session_status, error, now, row["session_id"]),

@@ -93,6 +93,30 @@ class DurableAgentClient(
         return parseSessions(root.optJSONArray("sessions"))
     }
 
+    suspend fun updateSessionMetadata(
+        baseUrl: String,
+        secret: String,
+        sessionId: String,
+        title: String? = null,
+        pinned: Boolean? = null,
+        unread: Boolean? = null,
+    ): SessionSummary {
+        val body = JSONObject()
+        title?.let { body.put("title", it) }
+        pinned?.let { body.put("pinned", it) }
+        unread?.let { body.put("unread", it) }
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "PATCH",
+            path = "/api/v1/sessions/${encodePath(sessionId)}",
+            body = body,
+        )
+        return root.optJSONObject("session")
+            ?.let(::parseSession)
+            ?: error("Durable host returned no session")
+    }
+
     suspend fun fetchCodexStatus(): CodexStatusSnapshot {
         check(kind == BackendKind.CODEX) { "Status details are only available for Codex" }
         val id = sessionId ?: error("Not connected")
@@ -558,6 +582,10 @@ class DurableAgentClient(
                 (body ?: JSONObject()).toString()
                     .toRequestBody(JSON_MEDIA_TYPE),
             )
+            "PATCH" -> requestBuilder.patch(
+                (body ?: JSONObject()).toString()
+                    .toRequestBody(JSON_MEDIA_TYPE),
+            )
             else -> error("Unsupported HTTP method: $method")
         }
         return executeJsonRequest(requestBuilder.build(), trackAsPoll)
@@ -614,22 +642,26 @@ class DurableAgentClient(
         return buildList {
             for (index in 0 until array.length()) {
                 val item = array.optJSONObject(index) ?: continue
-                val id = item.optString("id")
-                if (id.isBlank()) continue
-                add(
-                    SessionSummary(
-                        sessionId = id,
-                        title = item.optString("title").ifBlank { "New $name session" },
-                        cwd = item.optString("cwd"),
-                        createdAt = item.optNullableString("createdAt"),
-                        updatedAt = item.optNullableString("updatedAt"),
-                        messageCount = item.optNullableInt("messageCount"),
-                        modelId = item.optNullableString("modelId"),
-                        status = item.optString("status").toSessionStatus(),
-                    ),
-                )
+                parseSession(item)?.let(::add)
             }
         }
+    }
+
+    private fun parseSession(item: JSONObject): SessionSummary? {
+        val id = item.optString("id")
+        if (id.isBlank()) return null
+        return SessionSummary(
+            sessionId = id,
+            title = item.optString("title").ifBlank { "New $name session" },
+            cwd = item.optString("cwd"),
+            createdAt = item.optNullableString("createdAt"),
+            updatedAt = item.optNullableString("updatedAt"),
+            messageCount = item.optNullableInt("messageCount"),
+            modelId = item.optNullableString("modelId"),
+            pinned = item.optBoolean("pinned", false),
+            unread = item.optBoolean("unread", false),
+            status = item.optString("status").toSessionStatus(),
+        )
     }
 
     private fun parseModels(array: JSONArray?): List<AgentModelOption> {

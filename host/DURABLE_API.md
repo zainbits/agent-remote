@@ -11,6 +11,7 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `GET` | `/api/v1/sessions?backend=codex|grok&cwd=…&limit=50` | List and lazily adopt sessions |
 | `POST` | `/api/v1/sessions` | Create a durable session from `{ backend, cwd, codexFullAccess? }` |
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
+| `PATCH` | `/api/v1/sessions/{id}` | Update one or more of `{ title, pinned, unread }` |
 | `GET` | `/api/v1/sessions/{id}/commands` | Refresh the backend-specific slash-command catalog |
 | `GET` | `/api/v1/sessions/{id}/status` | Read live Codex account limits plus native thread configuration/context status |
 | `POST` | `/api/v1/sessions/{id}/attachments` | Stream one image body with `Content-Type` and URL-encoded `X-File-Name`; returns durable attachment metadata |
@@ -24,6 +25,8 @@ Request bodies are limited to 1 MiB. API errors use `{ "error": "…" }` with an
 ## State model
 
 Session status is one of `idle`, `queued`, `running`, `cancelling`, `failed`, or `cancelled`. One session accepts one active turn at a time; distinct sessions execute concurrently up to `AGENTREMOTE_MAX_WORKERS`.
+
+Session summaries include durable `pinned` and `unread` booleans. Lists place pinned sessions first, then order each group by most recent activity. A terminal turn marks its session unread; starting a later turn or an explicit `{ "unread": false }` update clears it. Manual title updates are protected from the automatic first-prompt title generation.
 
 The server writes the user message and `turn.queued` event transactionally before acknowledging a new turn. Workers then persist `turn.started`, normalized message/tool/usage events, and exactly one terminal event:
 
@@ -45,7 +48,7 @@ The service wrapper also exports non-interactive toolchain paths for Linuxbrew, 
 
 ## Storage
 
-`schema.sql` is the tracked schema. SQLite uses one process-wide serialized connection with WAL journaling, full synchronous commits, foreign keys, a 30-second busy timeout, a 1000-page automatic checkpoint, and an 8-MiB journal size limit. The database is mode `600` inside a mode-`700` data directory.
+`schema.sql` is the tracked schema (version 7). SQLite uses one process-wide serialized connection with WAL journaling, full synchronous commits, foreign keys, a 30-second busy timeout, a 1000-page automatic checkpoint, and an 8-MiB journal size limit. The database is mode `600` inside a mode-`700` data directory.
 
 Legacy-session discovery is single-flight and cached for 30 seconds per backend, workspace, and list limit. `AGENTREMOTE_LEGACY_SYNC_TTL_SECONDS` can tune that interval; failed discovery is retried after at most five seconds.
 

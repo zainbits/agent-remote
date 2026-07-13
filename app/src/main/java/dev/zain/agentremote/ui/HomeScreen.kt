@@ -1,5 +1,6 @@
 package dev.zain.agentremote.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,11 +22,14 @@ import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -36,14 +40,24 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
@@ -63,16 +77,24 @@ fun HomeScreen(
     onOpenSession: (SessionSummary) -> Unit,
     onNewSession: () -> Unit,
     onRefresh: () -> Unit,
+    onRenameSession: (SessionSummary, String) -> Unit,
+    onToggleSessionPin: (SessionSummary) -> Unit,
     onSelectBackend: (BackendKind) -> Unit,
     onOpenSettings: () -> Unit,
     interactionEnabled: Boolean = true,
 ) {
+    var renameSessionId by rememberSaveable { mutableStateOf<String?>(null) }
+    var renameDraft by rememberSaveable { mutableStateOf("") }
     val cwd = state.settings.workingDirectory
     val profile = when (state.settings.networkProfile) {
         NetworkProfile.LAN -> "LAN"
         NetworkProfile.TAILNET -> "Tailnet"
     }
     val backend = state.settings.backendKind
+
+    LaunchedEffect(backend) {
+        renameSessionId = null
+    }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.surface,
@@ -186,13 +208,54 @@ fun HomeScreen(
             items(state.sessions, key = { it.sessionId }) { session ->
                 SessionRow(
                     session = session,
-                    interactionEnabled = interactionEnabled,
+                    interactionEnabled = interactionEnabled && state.sessionActionId == null,
+                    actionInProgress = state.sessionActionId == session.sessionId,
                     onClick = { onOpenSession(session) },
+                    onRename = {
+                        renameSessionId = session.sessionId
+                        renameDraft = session.title
+                    },
+                    onTogglePin = { onToggleSessionPin(session) },
                 )
             }
 
             item { Spacer(Modifier.height(72.dp)) }
         }
+    }
+
+    val renameTarget = state.sessions.firstOrNull { it.sessionId == renameSessionId }
+    if (renameTarget != null) {
+        AlertDialog(
+            onDismissRequest = { renameSessionId = null },
+            title = { Text("Rename session") },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it.take(200) },
+                    label = { Text("Session name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onRenameSession(renameTarget, renameDraft)
+                        renameSessionId = null
+                    },
+                    enabled = renameDraft.trim().isNotEmpty() &&
+                        renameDraft.trim() != renameTarget.title &&
+                        state.sessionActionId == null,
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameSessionId = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 
@@ -326,7 +389,10 @@ private fun EmptySessions(backendName: String) {
 private fun SessionRow(
     session: SessionSummary,
     interactionEnabled: Boolean,
+    actionInProgress: Boolean,
     onClick: () -> Unit,
+    onRename: () -> Unit,
+    onTogglePin: () -> Unit,
 ) {
     Card(
         onClick = onClick,
@@ -338,12 +404,63 @@ private fun SessionRow(
         ),
     ) {
         Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
-            Text(
-                text = session.title,
-                style = MaterialTheme.typography.titleSmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (session.unread) {
+                    Box(
+                        modifier = Modifier
+                            .padding(end = 9.dp)
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(UnreadBlue)
+                            .semantics { contentDescription = "Unread session" },
+                    )
+                }
+                Text(
+                    text = session.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                if (actionInProgress) {
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .padding(horizontal = 12.dp)
+                            .size(18.dp),
+                        strokeWidth = 2.dp,
+                    )
+                } else {
+                    IconButton(
+                        onClick = onTogglePin,
+                        enabled = interactionEnabled,
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.PushPin,
+                            contentDescription = if (session.pinned) {
+                                "Unpin session"
+                            } else {
+                                "Pin session"
+                            },
+                            tint = if (session.pinned) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                    IconButton(
+                        onClick = onRename,
+                        enabled = interactionEnabled,
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        Icon(Icons.Default.Edit, contentDescription = "Rename session")
+                    }
+                }
+            }
             Spacer(Modifier.height(4.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -407,6 +524,8 @@ private fun SessionRow(
         }
     }
 }
+
+private val UnreadBlue = Color(0xFF4285F4)
 
 private fun sessionStatusLabel(status: SessionStatus): String? = when (status) {
     SessionStatus.QUEUED -> "Queued"

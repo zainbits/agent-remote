@@ -168,6 +168,23 @@ class JobManager:
             self.catalog.sync(backend, cwd, limit)
         return self.store.list_sessions(backend, cwd, limit)
 
+    def update_session_metadata(
+        self,
+        session_id: str,
+        *,
+        title: str | None = None,
+        pinned: bool | None = None,
+        unread: bool | None = None,
+    ) -> dict[str, Any]:
+        session = self.store.update_session_metadata(
+            session_id,
+            title=title,
+            pinned=pinned,
+            unread=unread,
+        )
+        self.notify(session_id)
+        return session
+
     def session_bundle(self, session_id: str) -> dict[str, Any]:
         if self.import_legacy:
             self.catalog.import_history_if_needed(session_id)

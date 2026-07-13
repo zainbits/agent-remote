@@ -147,6 +147,8 @@ data class SessionSummary(
     /** Null when the backend's list API does not return a cheap message count. */
     val messageCount: Int? = null,
     val modelId: String? = null,
+    val pinned: Boolean = false,
+    val unread: Boolean = false,
     val status: SessionStatus = SessionStatus.IDLE,
 )
 

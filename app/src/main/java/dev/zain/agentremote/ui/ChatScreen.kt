@@ -42,6 +42,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.AddPhotoAlternate
@@ -81,6 +82,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -221,6 +224,7 @@ fun ChatScreen(
             } else {
                 ChatHistory(
                     messages = state.messages,
+                    assistantName = state.settings.backendKind.displayName,
                     emptyText = "Send a prompt to the host agent.\nProject: $cwd",
                     modifier = Modifier
                         .weight(1f)
@@ -300,6 +304,7 @@ fun ChatScreen(
 @Composable
 private fun ChatHistory(
     messages: List<ChatMessage>,
+    assistantName: String,
     emptyText: String,
     modifier: Modifier = Modifier,
 ) {
@@ -347,7 +352,7 @@ private fun ChatHistory(
             }
         }
         items(messages.asReversed(), key = { it.id }) { message ->
-            MessageBlock(message)
+            MessageBlock(message, assistantName)
         }
     }
 }
@@ -899,10 +904,10 @@ private fun slashCommandName(draft: String): String? {
 }
 
 @Composable
-private fun MessageBlock(message: ChatMessage) {
+private fun MessageBlock(message: ChatMessage, assistantName: String) {
     when (message.role) {
         ChatRole.USER -> UserBubble(message)
-        ChatRole.ASSISTANT -> AssistantMessage(message)
+        ChatRole.ASSISTANT -> AssistantMessage(message, assistantName)
         ChatRole.THOUGHT -> ThoughtCollapsible(message)
         ChatRole.TOOL -> ToolCollapsible(message)
         ChatRole.SYSTEM -> SystemBanner(message)
@@ -911,6 +916,15 @@ private fun MessageBlock(message: ChatMessage) {
 
 @Composable
 private fun UserBubble(message: ChatMessage) {
+    val copyText = remember(message.text, message.attachments) {
+        buildString {
+            append(message.text)
+            message.attachments.forEach { attachment ->
+                if (isNotEmpty()) appendLine()
+                append("[Image: ${attachment.fileName}]")
+            }
+        }
+    }
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.End,
@@ -939,11 +953,31 @@ private fun UserBubble(message: ChatMessage) {
                     }
                 }
                 if (message.text.isNotBlank() || message.streaming) {
-                    Text(
-                        text = message.text + if (message.streaming) "▍" else "",
-                        modifier = Modifier.padding(horizontal = 4.dp),
-                        style = MaterialTheme.typography.bodyLarge,
-                    )
+                    Row(verticalAlignment = Alignment.Top) {
+                        Text(
+                            text = message.text + if (message.streaming) "▍" else "",
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = 4.dp, top = 4.dp, bottom = 4.dp),
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        MessageCopyButton(
+                            text = copyText,
+                            contentDescription = "Copy user message",
+                            tint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.82f),
+                        )
+                    }
+                } else if (copyText.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        MessageCopyButton(
+                            text = copyText,
+                            contentDescription = "Copy user message",
+                            tint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.82f),
+                        )
+                    }
                 }
             }
         }
@@ -951,18 +985,52 @@ private fun UserBubble(message: ChatMessage) {
 }
 
 @Composable
-private fun AssistantMessage(message: ChatMessage) {
+private fun AssistantMessage(message: ChatMessage, assistantName: String) {
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text(
-            text = "Grok",
-            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(bottom = 2.dp),
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = assistantName,
+                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(bottom = 2.dp),
+            )
+            MessageCopyButton(
+                text = message.text,
+                contentDescription = "Copy assistant message",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         MarkdownText(
             markdown = message.text,
             streaming = message.streaming,
             modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+@Suppress("DEPRECATION")
+private fun MessageCopyButton(
+    text: String,
+    contentDescription: String,
+    tint: Color,
+) {
+    val clipboard = LocalClipboardManager.current
+    IconButton(
+        onClick = { clipboard.setText(AnnotatedString(text)) },
+        enabled = text.isNotEmpty(),
+        modifier = Modifier.size(36.dp),
+    ) {
+        Icon(
+            Icons.Default.ContentCopy,
+            contentDescription = contentDescription,
+            tint = tint,
+            modifier = Modifier.size(18.dp),
         )
     }
 }

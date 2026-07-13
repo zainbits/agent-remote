@@ -203,6 +203,40 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._handle_error(error)
 
+    def do_PATCH(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        parsed = urllib.parse.urlsplit(self.path)
+        if not self._require_auth():
+            return
+        try:
+            route = self._route(parsed.path)
+            if len(route) == 4 and route[:3] == ["api", "v1", "sessions"]:
+                body = self._json_body()
+                allowed = {"title", "pinned", "unread"}
+                unknown = set(body) - allowed
+                if unknown:
+                    raise StoreError(f"Unknown session fields: {', '.join(sorted(unknown))}")
+                title = body.get("title")
+                pinned = body.get("pinned")
+                unread = body.get("unread")
+                if title is not None and not isinstance(title, str):
+                    raise StoreError("title must be a string")
+                if pinned is not None and not isinstance(pinned, bool):
+                    raise StoreError("pinned must be a boolean")
+                if unread is not None and not isinstance(unread, bool):
+                    raise StoreError("unread must be a boolean")
+                session = self.server.manager.update_session_metadata(
+                    route[3],
+                    title=title,
+                    pinned=pinned,
+                    unread=unread,
+                )
+                self._send(HTTPStatus.OK, {"session": session})
+                return
+            self.close_connection = True
+            self._send(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
+        except Exception as error:
+            self._handle_error(error)
+
     def _handle_error(self, error: Exception) -> None:
         self.close_connection = True
         if isinstance(error, NotFoundError):
