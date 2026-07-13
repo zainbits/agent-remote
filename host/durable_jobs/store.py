@@ -63,8 +63,103 @@ class JobStore:
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN codex_full_access INTEGER NOT NULL DEFAULT 1"
                 )
-            connection.execute("PRAGMA user_version = 4")
+            message_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            if "ordinal" not in message_columns:
+                connection.execute(
+                    "ALTER TABLE messages ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0"
+                )
+                self._initialize_message_ordinals(connection)
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS messages_session_ordinal "
+                "ON messages(session_id, ordinal)"
+            )
+            connection.execute("PRAGMA user_version = 5")
         os.chmod(self.database_path, 0o600)
+
+    @staticmethod
+    def _initialize_message_ordinals(connection: sqlite3.Connection) -> None:
+        """Backfill explicit timeline order and repair v4 role-coalesced Codex turns."""
+        connection.execute(
+            "CREATE TEMP TABLE message_ordinal_migration(id TEXT PRIMARY KEY, ordinal INTEGER)"
+        )
+        connection.execute(
+            """
+            INSERT INTO message_ordinal_migration(id, ordinal)
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY rowid) - 1
+            FROM messages
+            """
+        )
+        connection.execute(
+            """
+            UPDATE messages
+            SET ordinal = (
+                SELECT migrated.ordinal
+                FROM message_ordinal_migration migrated
+                WHERE migrated.id = messages.id
+            )
+            """
+        )
+
+        # Durable v4 used one early-created assistant row for every Codex item in
+        # a turn. If tools were inserted after that row, its final answer was
+        # appended in place and replay appeared to end on the last tool. Move
+        # only that recognizable legacy aggregate to the end of its own turn.
+        connection.execute(
+            """
+            UPDATE messages AS aggregate
+            SET ordinal = (
+                SELECT COALESCE(MAX(peer.ordinal), aggregate.ordinal) + 1
+                FROM messages peer
+                WHERE peer.turn_id = aggregate.turn_id
+            )
+            WHERE aggregate.role = 'assistant'
+              AND aggregate.turn_id IS NOT NULL
+              AND aggregate.id = aggregate.turn_id || ':assistant'
+              AND EXISTS (
+                  SELECT 1
+                  FROM sessions session
+                  WHERE session.id = aggregate.session_id
+                    AND session.backend = 'codex'
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM messages tool
+                  WHERE tool.turn_id = aggregate.turn_id
+                    AND tool.role = 'tool'
+                    AND tool.ordinal > aggregate.ordinal
+              )
+            """
+        )
+
+        # Normalize positions after the repair. Ties with the following turn's
+        # user row are resolved by original row order, which keeps the repaired
+        # assistant inside its own turn.
+        connection.execute("DELETE FROM message_ordinal_migration")
+        connection.execute(
+            """
+            INSERT INTO message_ordinal_migration(id, ordinal)
+            SELECT id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY session_id
+                       ORDER BY ordinal, rowid
+                   ) - 1
+            FROM messages
+            """
+        )
+        connection.execute(
+            """
+            UPDATE messages
+            SET ordinal = (
+                SELECT migrated.ordinal
+                FROM message_ordinal_migration migrated
+                WHERE migrated.id = messages.id
+            )
+            """
+        )
+        connection.execute("DROP TABLE message_ordinal_migration")
 
     @staticmethod
     def _event(
@@ -133,6 +228,7 @@ class JobStore:
             "status": row["status"],
             "kind": row["kind"],
             "detail": row["detail"],
+            "ordinal": row["ordinal"],
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
         }
@@ -320,6 +416,12 @@ class JobStore:
             ).fetchone()
             if existing is not None:
                 return False
+            next_ordinal = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+            )
             turns: dict[str, str] = {}
             prompts: dict[str, str] = {}
             for item in history:
@@ -355,8 +457,8 @@ class JobStore:
                     """
                     INSERT OR IGNORE INTO messages(
                         id, session_id, turn_id, role, text, status, kind, detail,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?)
+                        ordinal, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -366,10 +468,12 @@ class JobStore:
                         text,
                         item.get("kind"),
                         item.get("detail"),
+                        next_ordinal,
                         now,
                         now,
                     ),
                 )
+                next_ordinal += 1
             connection.execute(
                 "UPDATE sessions SET updated_at = MAX(updated_at, ?) WHERE id = ?",
                 (now, session_id),
@@ -431,7 +535,7 @@ class JobStore:
             if session_row is None:
                 raise NotFoundError("Session not found")
             messages = connection.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY rowid",
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY ordinal, rowid",
                 (session_id,),
             ).fetchall()
             latest_event = connection.execute(
@@ -466,10 +570,16 @@ class JobStore:
             )
             connection.execute(
                 """
-                INSERT INTO messages(id, session_id, turn_id, role, text, created_at, updated_at)
-                VALUES (?, ?, ?, 'user', ?, ?, ?)
+                INSERT INTO messages(
+                    id, session_id, turn_id, role, text, ordinal, created_at, updated_at
+                )
+                VALUES (
+                    ?, ?, ?, 'user', ?,
+                    (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM messages WHERE session_id = ?),
+                    ?, ?
+                )
                 """,
-                (message_id, session_id, turn_id, text, now, now),
+                (message_id, session_id, turn_id, text, session_id, now, now),
             )
             title = session["title"]
             if title.startswith("New "):
@@ -581,10 +691,14 @@ class JobStore:
             connection.execute(
                 """
                 INSERT OR IGNORE INTO messages(
-                    id, session_id, turn_id, role, text, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, '', 'in_progress', ?, ?)
+                    id, session_id, turn_id, role, text, status, ordinal, created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, '', 'in_progress',
+                    (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM messages WHERE session_id = ?),
+                    ?, ?
+                )
                 """,
-                (message_id, session_id, turn_id, role, now, now),
+                (message_id, session_id, turn_id, role, session_id, now, now),
             )
             connection.execute(
                 "UPDATE messages SET text = text || ?, status = 'in_progress', updated_at = ? WHERE id = ?",
@@ -599,12 +713,12 @@ class JobStore:
                 now,
             )
 
-    def complete_message(self, message_id: str) -> None:
+    def complete_message(self, message_id: str) -> bool:
         now = utc_now()
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM messages WHERE id = ?", (message_id,)).fetchone()
-            if row is None:
-                return
+            if row is None or row["status"] == "completed":
+                return False
             connection.execute(
                 "UPDATE messages SET status = 'completed', updated_at = ? WHERE id = ?",
                 (now, message_id),
@@ -617,11 +731,12 @@ class JobStore:
                 {"messageId": message_id, "role": row["role"]},
                 now,
             )
+        return True
 
     def turn_role_text(self, turn_id: str, role: str) -> str:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT text FROM messages WHERE turn_id = ? AND role = ? ORDER BY rowid",
+                "SELECT text FROM messages WHERE turn_id = ? AND role = ? ORDER BY ordinal, rowid",
                 (turn_id, role),
             ).fetchall()
         return "\n".join(str(row["text"] or "") for row in rows).strip()
@@ -636,8 +751,131 @@ class JobStore:
     ) -> None:
         if not text:
             return
-        self.append_message_delta(session_id, turn_id, message_id, role, text)
-        self.complete_message(message_id)
+        self.upsert_message_snapshot(
+            session_id,
+            turn_id,
+            message_id,
+            role,
+            text,
+            completed=True,
+        )
+
+    def upsert_message_snapshot(
+        self,
+        session_id: str,
+        turn_id: str,
+        message_id: str,
+        role: str,
+        text: str,
+        completed: bool,
+    ) -> bool:
+        """Persist an authoritative backend item without duplicating repeated snapshots."""
+        if role not in {"assistant", "thought"}:
+            raise StoreError("Snapshot role must be assistant or thought")
+        value = str(text or "")
+        now = utc_now()
+        changed = False
+        with self._connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            if current is None:
+                if not value:
+                    return False
+                status = "completed" if completed else "in_progress"
+                connection.execute(
+                    """
+                    INSERT INTO messages(
+                        id, session_id, turn_id, role, text, status, ordinal,
+                        created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?,
+                        (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM messages WHERE session_id = ?),
+                        ?, ?
+                    )
+                    """,
+                    (
+                        message_id,
+                        session_id,
+                        turn_id,
+                        role,
+                        value,
+                        status,
+                        session_id,
+                        now,
+                        now,
+                    ),
+                )
+                self._event(
+                    connection,
+                    session_id,
+                    turn_id,
+                    "message.delta",
+                    {"messageId": message_id, "role": role, "delta": value},
+                    now,
+                )
+                if completed:
+                    self._event(
+                        connection,
+                        session_id,
+                        turn_id,
+                        "message.completed",
+                        {"messageId": message_id, "role": role},
+                        now,
+                    )
+                return True
+
+            if (
+                current["session_id"] != session_id
+                or current["turn_id"] != turn_id
+                or current["role"] != role
+            ):
+                raise StoreError("Backend message id was reused for a different timeline item")
+
+            old_text = str(current["text"] or "")
+            new_status = (
+                "completed"
+                if completed or current["status"] == "completed"
+                else "in_progress"
+            )
+            text_changed = value != old_text
+            status_changed = current["status"] != new_status
+            if not text_changed and not status_changed:
+                return False
+            connection.execute(
+                "UPDATE messages SET text = ?, status = ?, updated_at = ? WHERE id = ?",
+                (value, new_status, now, message_id),
+            )
+            if text_changed:
+                if value.startswith(old_text):
+                    event_type = "message.delta"
+                    payload = {
+                        "messageId": message_id,
+                        "role": role,
+                        "delta": value[len(old_text) :],
+                    }
+                else:
+                    event_type = "message.replaced"
+                    payload = {
+                        "messageId": message_id,
+                        "role": role,
+                        "text": value,
+                    }
+                self._event(connection, session_id, turn_id, event_type, payload, now)
+            if new_status == "completed" and (
+                current["status"] != "completed" or text_changed
+            ):
+                self._event(
+                    connection,
+                    session_id,
+                    turn_id,
+                    "message.completed",
+                    {"messageId": message_id, "role": role},
+                    now,
+                )
+            changed = True
+        return changed
 
     def upsert_tool(
         self,
@@ -654,8 +892,13 @@ class JobStore:
             connection.execute(
                 """
                 INSERT INTO messages(
-                    id, session_id, turn_id, role, text, status, kind, detail, created_at, updated_at
-                ) VALUES (?, ?, ?, 'tool', ?, ?, ?, ?, ?, ?)
+                    id, session_id, turn_id, role, text, status, kind, detail,
+                    ordinal, created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, 'tool', ?, ?, ?, ?,
+                    (SELECT COALESCE(MAX(ordinal), -1) + 1 FROM messages WHERE session_id = ?),
+                    ?, ?
+                )
                 ON CONFLICT(id) DO UPDATE SET
                     text = excluded.text,
                     status = excluded.status,
@@ -663,7 +906,18 @@ class JobStore:
                     detail = excluded.detail,
                     updated_at = excluded.updated_at
                 """,
-                (message_id, session_id, turn_id, title, status, kind, detail, now, now),
+                (
+                    message_id,
+                    session_id,
+                    turn_id,
+                    title,
+                    status,
+                    kind,
+                    detail,
+                    session_id,
+                    now,
+                    now,
+                ),
             )
             self._event(
                 connection,

@@ -82,9 +82,31 @@ if "WAIT_FOR_CANCEL" in prompt:
     time.sleep(30)
 if "SLOW" in prompt:
     time.sleep(0.4)
-print(json.dumps({"type": "item.completed", "item": {
-    "id": "agent", "type": "agent_message", "text": "codex-result"
-}}), flush=True)
+if "INTERLEAVED" in prompt:
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": "commentary", "type": "agent_message", "text": "checking first"
+    }}), flush=True)
+    print(json.dumps({"type": "item.started", "item": {
+        "id": "tool", "type": "command_execution", "command": "test command",
+        "status": "in_progress"
+    }}), flush=True)
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": "tool", "type": "command_execution", "command": "test command",
+        "aggregated_output": "done", "exit_code": 0, "status": "completed"
+    }}), flush=True)
+    print(json.dumps({"type": "item.started", "item": {
+        "id": "final", "type": "agent_message", "text": "final "
+    }}), flush=True)
+    print(json.dumps({"type": "item.updated", "item": {
+        "id": "final", "type": "agent_message", "text": "final answer"
+    }}), flush=True)
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": "final", "type": "agent_message", "text": "final answer"
+    }}), flush=True)
+else:
+    print(json.dumps({"type": "item.completed", "item": {
+        "id": "agent", "type": "agent_message", "text": "codex-result"
+    }}), flush=True)
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 10, "output_tokens": 4
 }}), flush=True)
@@ -203,6 +225,74 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual(["user", "assistant"], [item["role"] for item in bundle["messages"]])
         self.assertEqual("codex-result", bundle["messages"][-1]["text"])
         self.assertIn("turn.completed", [event["type"] for event in events])
+
+    def test_codex_interleaved_items_keep_live_and_replay_order(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        self.manager.start_turn(session["id"], "INTERLEAVED")
+
+        _, events = self._wait_terminal(session["id"])
+        bundle = self.store.session_bundle(session["id"])
+        messages = bundle["messages"]
+
+        self.assertEqual(
+            ["user", "assistant", "tool", "assistant"],
+            [message["role"] for message in messages],
+        )
+        self.assertEqual("checking first", messages[1]["text"])
+        self.assertEqual("final answer", messages[-1]["text"])
+        self.assertEqual("completed", messages[-1]["status"])
+        self.assertNotEqual(messages[1]["id"], messages[-1]["id"])
+        self.assertEqual(list(range(4)), [message["ordinal"] for message in messages])
+
+        timeline = []
+        for event in events:
+            if event["type"] == "message.delta":
+                timeline.append((event["type"], event["data"].get("delta")))
+            elif event["type"] == "tool.updated":
+                timeline.append((event["type"], event["data"].get("status")))
+        self.assertEqual(
+            [
+                ("message.delta", "checking first"),
+                ("tool.updated", "in_progress"),
+                ("tool.updated", "completed"),
+                ("message.delta", "final "),
+                ("message.delta", "answer"),
+            ],
+            timeline,
+        )
+
+    def test_message_snapshots_are_idempotent_and_can_replace_text(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        turn = self.store.create_turn(session["id"], "snapshot test")
+        message_id = f'{turn["id"]}:snapshot'
+
+        self.assertTrue(
+            self.store.upsert_message_snapshot(
+                session["id"], turn["id"], message_id, "assistant", "draft", False
+            )
+        )
+        self.assertFalse(
+            self.store.upsert_message_snapshot(
+                session["id"], turn["id"], message_id, "assistant", "draft", False
+            )
+        )
+        self.assertTrue(
+            self.store.upsert_message_snapshot(
+                session["id"], turn["id"], message_id, "assistant", "rewritten", True
+            )
+        )
+        self.assertFalse(
+            self.store.upsert_message_snapshot(
+                session["id"], turn["id"], message_id, "assistant", "rewritten", True
+            )
+        )
+
+        bundle = self.store.session_bundle(session["id"])
+        self.assertEqual("rewritten", bundle["messages"][-1]["text"])
+        self.assertEqual("completed", bundle["messages"][-1]["status"])
+        event_types = [event["type"] for event in self.store.events_after(session["id"], 0)]
+        self.assertEqual(1, event_types.count("message.replaced"))
+        self.assertEqual(1, event_types.count("message.completed"))
 
     def test_grok_turn_is_persisted(self):
         session = self.manager.create_session("grok", str(self.workspace))
@@ -581,12 +671,99 @@ class DurableJobsTest(unittest.TestCase):
         migrated = JobStore(path)
         with migrated._connect() as connection:  # Verify the on-open migration contract.
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(sessions)")}
+            message_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(messages)")
+            }
             version = connection.execute("PRAGMA user_version").fetchone()[0]
 
         self.assertIn("model_name", columns)
         self.assertIn("model_override", columns)
         self.assertIn("codex_full_access", columns)
-        self.assertEqual(4, version)
+        self.assertIn("ordinal", message_columns)
+        self.assertEqual(5, version)
+
+    def test_v4_migration_repairs_coalesced_codex_timeline(self):
+        path = Path(self.temporary.name, "v4-timeline.sqlite3")
+        with sqlite3.connect(path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    backend TEXT NOT NULL,
+                    backend_session_id TEXT,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    active_turn_id TEXT,
+                    model_id TEXT,
+                    model_name TEXT,
+                    model_override TEXT,
+                    reasoning_effort TEXT,
+                    used_tokens INTEGER,
+                    context_window_tokens INTEGER,
+                    codex_full_access INTEGER NOT NULL DEFAULT 1,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE turns (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    stop_reason TEXT,
+                    error TEXT,
+                    cancellation_requested INTEGER NOT NULL DEFAULT 0,
+                    worker_pid INTEGER,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT
+                );
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    role TEXT NOT NULL,
+                    text TEXT NOT NULL DEFAULT '',
+                    status TEXT,
+                    kind TEXT,
+                    detail TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO sessions(
+                    id, backend, cwd, title, status, created_at, updated_at
+                ) VALUES ('session', 'codex', '/tmp', 'Task', 'idle', '2026-01-01', '2026-01-01');
+                INSERT INTO turns(
+                    id, session_id, prompt, status, stop_reason, created_at
+                ) VALUES
+                    ('turn-1', 'session', 'first', 'completed', 'completed', '2026-01-01T00:00:00Z'),
+                    ('turn-2', 'session', 'second', 'completed', 'completed', '2026-01-01T00:01:00Z');
+                INSERT INTO messages(
+                    id, session_id, turn_id, role, text, status, kind, created_at, updated_at
+                ) VALUES
+                    ('user-1', 'session', 'turn-1', 'user', 'first', NULL, NULL, '1', '1'),
+                    ('turn-1:assistant', 'session', 'turn-1', 'assistant', 'commentary + final', 'completed', NULL, '2', '5'),
+                    ('turn-1:tool', 'session', 'turn-1', 'tool', 'tool', 'completed', 'command_execution', '3', '4'),
+                    ('user-2', 'session', 'turn-2', 'user', 'second', NULL, NULL, '6', '6');
+                PRAGMA user_version = 4;
+                """
+            )
+
+        migrated = JobStore(path)
+        bundle = migrated.session_bundle("session")
+
+        self.assertEqual(
+            ["user", "tool", "assistant", "user"],
+            [message["role"] for message in bundle["messages"]],
+        )
+        self.assertEqual(
+            list(range(4)),
+            [message["ordinal"] for message in bundle["messages"]],
+        )
+        with migrated._connect() as connection:
+            self.assertEqual(5, connection.execute("PRAGMA user_version").fetchone()[0])
+            self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
 
     def test_legacy_session_is_adopted_once_with_history(self):
         first = self.store.import_session(

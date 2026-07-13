@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS messages (
     status TEXT,
     kind TEXT,
     detail TEXT,
+    ordinal INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -69,4 +70,4 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_session_id
     ON events(session_id, id);
 
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;

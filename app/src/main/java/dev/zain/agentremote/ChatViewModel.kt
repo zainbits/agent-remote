@@ -109,6 +109,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var nextPromptGeneration: Long = 0
     private var activePromptGeneration: Long? = null
     private var activeSlashCommand: String? = null
+    private val activeCommandMessages = linkedMapOf<String, String>()
     private var suppressLoadedSlashTurn: Boolean = false
     private var loadedPromptIndex: Long? = null
     private var reconnectJob: Job? = null
@@ -695,6 +696,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val generation = ++nextPromptGeneration
         activePromptGeneration = generation
         activeSlashCommand = commandName
+        activeCommandMessages.clear()
         suppressUserEcho = true
         streamingUserId = null
         streamingAssistantId = null
@@ -1062,6 +1064,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         nextPromptGeneration += 1
         activePromptGeneration = null
         activeSlashCommand = null
+        activeCommandMessages.clear()
         suppressLoadedSlashTurn = false
         loadedPromptIndex = null
         streamingUserId = null
@@ -1503,7 +1506,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun appendCommandOutput(command: String, delta: String) {
+    private fun appendCommandOutput(command: String, event: AgentEvent.AssistantDelta) {
+        val messageId = event.messageId
+        val body = if (messageId.isNullOrBlank()) {
+            null
+        } else {
+            val previous = activeCommandMessages[messageId].orEmpty()
+            activeCommandMessages[messageId] = if (event.replace) {
+                event.text
+            } else {
+                previous + event.text
+            }
+            activeCommandMessages.values.joinToString("")
+        }
         _ui.update { state ->
             val current = state.commandOutput
             if (current == null || current.command != command) {
@@ -1511,7 +1526,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 state.copy(
                     commandOutput = current.copy(
-                        body = current.body + delta,
+                        body = body ?: current.body + event.text,
                         status = "Running…",
                         running = true,
                     ),
@@ -1586,6 +1601,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun finishActiveRequest() {
         activePromptGeneration = null
         activeSlashCommand = null
+        activeCommandMessages.clear()
         suppressUserEcho = false
         finalizeStreaming()
         _ui.update {
@@ -1621,6 +1637,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (requestWasInterrupted) {
                     activePromptGeneration = null
                     activeSlashCommand = null
+                    activeCommandMessages.clear()
                     suppressLoadedSlashTurn = false
                     loadedPromptIndex = null
                     suppressUserEcho = false
@@ -1735,9 +1752,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             is AgentEvent.AssistantDelta -> {
                 val command = activeSlashCommand
                 if (command != null) {
-                    appendCommandOutput(command, event.text)
+                    appendCommandOutput(command, event)
                 } else if (!suppressLoadedSlashTurn) {
-                    appendStreaming(ChatRole.ASSISTANT, event.text)
+                    appendStreaming(
+                        role = ChatRole.ASSISTANT,
+                        delta = event.text,
+                        messageId = event.messageId,
+                        replace = event.replace,
+                        completed = event.completed,
+                    )
                 }
             }
             is AgentEvent.ThoughtDelta -> {
@@ -1745,7 +1768,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (command != null) {
                     updateCommandStatus(command, "Working…")
                 } else if (!suppressLoadedSlashTurn) {
-                    appendStreaming(ChatRole.THOUGHT, event.text)
+                    appendStreaming(
+                        role = ChatRole.THOUGHT,
+                        delta = event.text,
+                        messageId = event.messageId,
+                        replace = event.replace,
+                        completed = event.completed,
+                    )
+                }
+            }
+            is AgentEvent.MessageCompleted -> {
+                _ui.update { state ->
+                    state.copy(
+                        messages = state.messages.map { message ->
+                            if (message.id == event.messageId) {
+                                message.copy(streaming = false)
+                            } else {
+                                message
+                            }
+                        },
+                    )
                 }
             }
             is AgentEvent.ToolCall -> {
@@ -1877,7 +1919,47 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun appendStreaming(role: ChatRole, delta: String) {
+    private fun appendStreaming(
+        role: ChatRole,
+        delta: String,
+        messageId: String? = null,
+        replace: Boolean = false,
+        completed: Boolean = false,
+    ) {
+        if (!messageId.isNullOrBlank()) {
+            _ui.update { state ->
+                val existingIndex = state.messages.indexOfLast {
+                    it.id == messageId && it.role == role
+                }
+                if (existingIndex >= 0) {
+                    state.copy(
+                        messages = state.messages.toMutableList().also { messages ->
+                            val previous = messages[existingIndex]
+                            messages[existingIndex] = previous.copy(
+                                text = if (replace) delta else previous.text + delta,
+                                streaming = !completed,
+                            )
+                        },
+                    )
+                } else {
+                    state.copy(
+                        messages = state.messages.map { message ->
+                            if (message.role == role && message.streaming) {
+                                message.copy(streaming = false)
+                            } else {
+                                message
+                            }
+                        } + ChatMessage(
+                            id = messageId,
+                            role = role,
+                            text = delta,
+                            streaming = !completed,
+                        ),
+                    )
+                }
+            }
+            return
+        }
         val idField = when (role) {
             ChatRole.USER -> ::streamingUserId
             ChatRole.ASSISTANT -> ::streamingAssistantId
@@ -1924,11 +2006,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         streamingUserId = null
         streamingAssistantId = null
         streamingThoughtId = null
-        if (ids.isEmpty()) return
         _ui.update { state ->
             state.copy(
                 messages = state.messages.map { msg ->
-                    if (msg.id in ids) msg.copy(streaming = false) else msg
+                    if (
+                        msg.id in ids ||
+                        (
+                            msg.streaming &&
+                                (msg.role == ChatRole.USER ||
+                                    msg.role == ChatRole.ASSISTANT ||
+                                    msg.role == ChatRole.THOUGHT)
+                        )
+                    ) {
+                        msg.copy(streaming = false)
+                    } else {
+                        msg
+                    }
                 },
             )
         }

@@ -335,11 +335,40 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
                 )
             }
             "message.delta" -> when (data.optString("role")) {
-                "assistant" -> events.emit(AgentEvent.AssistantDelta(data.optString("delta")))
-                "thought" -> events.emit(AgentEvent.ThoughtDelta(data.optString("delta")))
+                "assistant" -> events.emit(
+                    AgentEvent.AssistantDelta(
+                        text = data.optString("delta"),
+                        messageId = data.optNullableString("messageId"),
+                    ),
+                )
+                "thought" -> events.emit(
+                    AgentEvent.ThoughtDelta(
+                        text = data.optString("delta"),
+                        messageId = data.optNullableString("messageId"),
+                    ),
+                )
                 "user" -> events.emit(
                     AgentEvent.UserDelta(data.optString("delta"), event.optLong("id")),
                 )
+            }
+            "message.replaced" -> when (data.optString("role")) {
+                "assistant" -> events.emit(
+                    AgentEvent.AssistantDelta(
+                        text = data.optString("text"),
+                        messageId = data.optNullableString("messageId"),
+                        replace = true,
+                    ),
+                )
+                "thought" -> events.emit(
+                    AgentEvent.ThoughtDelta(
+                        text = data.optString("text"),
+                        messageId = data.optNullableString("messageId"),
+                        replace = true,
+                    ),
+                )
+            }
+            "message.completed" -> data.optNullableString("messageId")?.let {
+                events.emit(AgentEvent.MessageCompleted(it))
             }
             "tool.updated" -> events.emit(
                 AgentEvent.ToolUpdate(
@@ -393,8 +422,22 @@ class DurableAgentClient(private val kind: BackendKind) : AgentBackend {
             val text = message.optString("text")
             when (message.optString("role")) {
                 "user" -> events.emit(AgentEvent.UserDelta(text, promptIndex))
-                "assistant" -> events.emit(AgentEvent.AssistantDelta(text))
-                "thought" -> events.emit(AgentEvent.ThoughtDelta(text))
+                "assistant" -> events.emit(
+                    AgentEvent.AssistantDelta(
+                        text = text,
+                        messageId = message.optString("id"),
+                        replace = true,
+                        completed = message.optString("status") != "in_progress",
+                    ),
+                )
+                "thought" -> events.emit(
+                    AgentEvent.ThoughtDelta(
+                        text = text,
+                        messageId = message.optString("id"),
+                        replace = true,
+                        completed = message.optString("status") != "in_progress",
+                    ),
+                )
                 "tool" -> events.emit(
                     AgentEvent.ToolCall(
                         toolCallId = message.optString("id"),

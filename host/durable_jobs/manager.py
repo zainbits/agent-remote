@@ -438,7 +438,7 @@ class JobManager:
                     stderr_parts.append(line)
                     continue
                 if session["backend"] == "codex":
-                    result = self._handle_codex_event(session, turn_id, messages, event)
+                    result = self._handle_codex_event(session, turn_id, event)
                 else:
                     result = self._handle_grok_event(session, turn_id, messages, event)
                 if result.get("stopReason") is not None:
@@ -450,7 +450,8 @@ class JobManager:
 
             return_code = process.wait()
             stderr_thread.join(timeout=1.0)
-            messages.complete()
+            if session["backend"] == "grok":
+                messages.complete()
             cancelled = self.store.cancellation_requested(turn_id)
             if cancelled:
                 self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
@@ -480,7 +481,8 @@ class JobManager:
             )
             self.notify(session["id"])
         except Exception as error:  # Keep the daemon alive and persist every worker failure.
-            messages.flush()
+            if session["backend"] == "grok":
+                messages.flush()
             if self.store.cancellation_requested(turn_id):
                 self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
             else:
@@ -540,7 +542,6 @@ class JobManager:
         self,
         session: dict[str, Any],
         turn_id: str,
-        messages: _StreamMessages,
         event: dict[str, Any],
     ) -> dict[str, Any]:
         event_type = event.get("type", "")
@@ -551,17 +552,38 @@ class JobManager:
         elif event_type in {"item.started", "item.updated", "item.completed"}:
             item = event.get("item") or {}
             item_type = str(item.get("type") or "")
-            item_id = f"{turn_id}:{item.get('id') or uuid.uuid4()}"
+            source_item_id = str(item.get("id") or "").strip()
             completed = event_type == "item.completed"
-            if item_type == "agent_message":
-                messages.append("assistant", _text(item.get("text")))
-                if completed:
-                    messages.flush("assistant")
-            elif item_type in {"reasoning", "plan"}:
-                messages.append("thought", _text(item.get("text") or item.get("summary")))
-                if completed:
-                    messages.flush("thought")
+            # Codex defines each item as a distinct ordered unit. Keep its
+            # backend id all the way into durable storage so progress messages,
+            # tools, and the final answer replay in exactly the emitted order.
+            if item_type in {"agent_message", "reasoning", "plan"}:
+                if not source_item_id and not completed:
+                    return {"stopReason": None, "error": None}
+                item_id = f"{turn_id}:{source_item_id or uuid.uuid4()}"
+                role = "assistant" if item_type == "agent_message" else "thought"
+                text = _text(
+                    item.get("text")
+                    if item_type == "agent_message"
+                    else item.get("text") or item.get("summary")
+                )
+                if text:
+                    changed = self.store.upsert_message_snapshot(
+                        session["id"],
+                        turn_id,
+                        item_id,
+                        role,
+                        text,
+                        completed=completed,
+                    )
+                elif completed:
+                    changed = self.store.complete_message(item_id)
+                else:
+                    changed = False
+                if changed:
+                    self.notify(session["id"])
             elif item_type:
+                item_id = f"{turn_id}:{source_item_id or uuid.uuid4()}"
                 title, detail = self._codex_tool(item_type, item)
                 self.store.upsert_tool(
                     session["id"],

@@ -164,8 +164,19 @@ sealed class AgentEvent {
     data class SlashCommandsChanged(val commands: List<SlashCommand>) : AgentEvent()
     data class UsageChanged(val usage: AgentUsage) : AgentEvent()
     data class UserDelta(val text: String, val promptIndex: Long? = null) : AgentEvent()
-    data class AssistantDelta(val text: String) : AgentEvent()
-    data class ThoughtDelta(val text: String) : AgentEvent()
+    data class AssistantDelta(
+        val text: String,
+        val messageId: String? = null,
+        val replace: Boolean = false,
+        val completed: Boolean = false,
+    ) : AgentEvent()
+    data class ThoughtDelta(
+        val text: String,
+        val messageId: String? = null,
+        val replace: Boolean = false,
+        val completed: Boolean = false,
+    ) : AgentEvent()
+    data class MessageCompleted(val messageId: String) : AgentEvent()
     data class ToolCall(
         val toolCallId: String?,
         val title: String,
