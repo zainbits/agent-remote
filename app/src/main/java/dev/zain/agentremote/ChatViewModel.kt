@@ -67,6 +67,7 @@ data class CommandOutputState(
 data class SessionCleanupUiState(
     val checking: Boolean = false,
     val deleting: Boolean = false,
+    val requestedDays: Int? = null,
     val preview: SessionCleanupReport? = null,
     val message: String? = null,
     val error: String? = null,
@@ -444,9 +445,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun previewOldSessionCleanup(baseUrl: String, secret: String) {
+    fun previewOldSessionCleanup(baseUrl: String, secret: String, olderThanDays: Int) {
         val state = _ui.value
-        if (state.sessionCleanup.busy) return
+        if (state.sessionCleanup.busy || olderThanDays !in setOf(3, 30)) return
         val normalizedBaseUrl = baseUrl.trim()
         val normalizedSecret = secret.trim()
         if (normalizedBaseUrl.isBlank() || normalizedSecret.isBlank()) {
@@ -460,13 +461,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         _ui.update {
-            it.copy(sessionCleanup = SessionCleanupUiState(checking = true))
+            it.copy(
+                sessionCleanup = SessionCleanupUiState(
+                    checking = true,
+                    requestedDays = olderThanDays,
+                ),
+            )
         }
         viewModelScope.launch {
             runCatching {
                 grokBackend.previewSessionCleanup(
                     baseUrl = normalizedBaseUrl,
                     secret = normalizedSecret,
+                    olderThanDays = olderThanDays,
                 )
             }.onSuccess { preview ->
                 _ui.update {
@@ -495,7 +502,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteOldSessions(baseUrl: String, secret: String) {
         val state = _ui.value
-        if (state.sessionCleanup.busy || state.sessionCleanup.preview == null) return
+        val preview = state.sessionCleanup.preview
+        if (state.sessionCleanup.busy || preview == null) return
         val normalizedBaseUrl = baseUrl.trim()
         val normalizedSecret = secret.trim()
         if (normalizedBaseUrl.isBlank() || normalizedSecret.isBlank()) return
@@ -514,6 +522,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 grokBackend.deleteOldSessions(
                     baseUrl = normalizedBaseUrl,
                     secret = normalizedSecret,
+                    olderThanDays = preview.olderThanDays,
                 )
             }.onSuccess { report ->
                 sessionsByBackend.clear()

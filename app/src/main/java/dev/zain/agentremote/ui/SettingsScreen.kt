@@ -60,7 +60,7 @@ fun SettingsScreen(
         workingDirectory: String,
         codexFullAccess: Boolean,
     ) -> Unit,
-    onPreviewOldSessions: (baseUrl: String, token: String) -> Unit,
+    onPreviewOldSessions: (baseUrl: String, token: String, olderThanDays: Int) -> Unit,
     onDeleteOldSessions: (baseUrl: String, token: String) -> Unit,
     onDismissOldSessions: () -> Unit,
 ) {
@@ -218,39 +218,25 @@ fun SettingsScreen(
             Text("Session cleanup", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Permanently delete unpinned, idle Grok and Codex sessions whose latest " +
-                    "activity is more than 30 days old. This checks every workspace and " +
-                    "keeps pinned and active sessions.",
+                    "activity is older than the selected cutoff. Both options check every " +
+                    "workspace and keep pinned and active sessions.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            OutlinedButton(
-                onClick = {
-                    onPreviewOldSessions(cleanupBaseUrl, durableHostToken)
-                },
-                enabled = !sessionCleanup.busy &&
-                    cleanupBaseUrl.isNotBlank() &&
-                    durableHostToken.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = MaterialTheme.colorScheme.error,
-                ),
-            ) {
-                if (sessionCleanup.checking) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        strokeWidth = 2.dp,
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(3, 30).forEach { days ->
+                    OldSessionCleanupButton(
+                        olderThanDays = days,
+                        checking = sessionCleanup.checking &&
+                            sessionCleanup.requestedDays == days,
+                        enabled = !sessionCleanup.busy &&
+                            cleanupBaseUrl.isNotBlank() &&
+                            durableHostToken.isNotBlank(),
+                        onClick = {
+                            onPreviewOldSessions(cleanupBaseUrl, durableHostToken, days)
+                        },
                     )
-                } else {
-                    Icon(Icons.Default.Delete, contentDescription = null)
                 }
-                Text(
-                    if (sessionCleanup.checking) {
-                        "Checking old sessions…"
-                    } else {
-                        "Delete sessions older than 30 days"
-                    },
-                    modifier = Modifier.padding(start = 8.dp),
-                )
             }
             sessionCleanup.message?.let { message ->
                 Text(
@@ -362,6 +348,40 @@ fun SettingsScreen(
                     Text("Cancel")
                 }
             },
+        )
+    }
+}
+
+@Composable
+private fun OldSessionCleanupButton(
+    olderThanDays: Int,
+    checking: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.outlinedButtonColors(
+            contentColor = MaterialTheme.colorScheme.error,
+        ),
+    ) {
+        if (checking) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.dp,
+            )
+        } else {
+            Icon(Icons.Default.Delete, contentDescription = null)
+        }
+        Text(
+            if (checking) {
+                "Checking old sessions…"
+            } else {
+                "Delete sessions older than $olderThanDays days"
+            },
+            modifier = Modifier.padding(start = 8.dp),
         )
     }
 }
