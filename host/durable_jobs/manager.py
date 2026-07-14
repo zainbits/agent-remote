@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -28,6 +29,8 @@ CODEX_APPROVAL_POLICY = "never"
 CODEX_NETWORK_ACCESS_CONFIG = "sandbox_workspace_write.network_access=true"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_PENDING_ATTACHMENTS = 16
+DEFAULT_CLEANUP_DAYS = 30
+MAX_CLEANUP_DAYS = 3650
 IMAGE_MIME_EXTENSIONS = {
     "image/png": ".png",
     "image/jpeg": ".jpg",
@@ -60,6 +63,24 @@ def _image_mime(header: bytes) -> str | None:
     if len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP":
         return "image/webp"
     return None
+
+
+def _timestamp_seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return float(text)
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    normalized = re.sub(r"(\.\d{6})\d+(?=[+-]\d\d:\d\d$)", r"\1", normalized)
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return None
 
 
 class _StreamMessages:
@@ -138,6 +159,7 @@ class JobManager:
         self._conditions: dict[str, threading.Condition] = {}
         self._versions: dict[str, int] = {}
         self._session_operation_locks: dict[str, threading.Lock] = {}
+        self._cleanup_lock = threading.Lock()
         self.catalog = LegacyCatalog(store, self.codex_bin)
         self.import_legacy = os.environ.get("AGENTREMOTE_IMPORT_LEGACY", "1") != "0"
         self._cleanup_stale_attachments()
@@ -207,6 +229,120 @@ class JobManager:
                 LOGGER.warning("Could not remove a deleted session attachment: %s", error)
         self.notify(session_id)
         return {"deleted": True}
+
+    def preview_session_cleanup(self, older_than_days: int = DEFAULT_CLEANUP_DAYS) -> dict[str, Any]:
+        return self._cleanup_summary(self._session_cleanup_inventory(older_than_days))
+
+    def delete_old_sessions(self, older_than_days: int = DEFAULT_CLEANUP_DAYS) -> dict[str, Any]:
+        if not self._cleanup_lock.acquire(blocking=False):
+            raise ConflictError("Session cleanup is already running")
+        try:
+            inventory = self._session_cleanup_inventory(older_than_days)
+            summary = self._cleanup_summary(inventory)
+            deleted = {"grok": 0, "codex": 0, "total": 0}
+            failed = {"grok": 0, "codex": 0, "total": 0}
+            skipped_active = int(summary["skippedActive"])
+            for candidate in inventory["candidates"]:
+                backend = candidate["backend"]
+                try:
+                    local_session = candidate.get("localSession")
+                    if local_session is not None:
+                        self.delete_session(local_session["id"])
+                    else:
+                        self._delete_backend_session(backend, candidate["backendSessionId"])
+                except ConflictError:
+                    skipped_active += 1
+                except StoreError as error:
+                    LOGGER.warning("Could not delete one old %s session: %s", backend, error)
+                    failed[backend] += 1
+                    failed["total"] += 1
+                else:
+                    deleted[backend] += 1
+                    deleted["total"] += 1
+            self.catalog.invalidate()
+            return {
+                **summary,
+                "deleted": deleted,
+                "failed": failed,
+                "skippedActive": skipped_active,
+            }
+        finally:
+            self._cleanup_lock.release()
+
+    def _session_cleanup_inventory(self, older_than_days: int) -> dict[str, Any]:
+        if not 1 <= older_than_days <= MAX_CLEANUP_DAYS:
+            raise StoreError(f"olderThanDays must be between 1 and {MAX_CLEANUP_DAYS}")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+        records: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for session in self.store.cleanup_sessions():
+            backend = session["backend"]
+            backend_id = str(session.get("backendSessionId") or "").strip()
+            key_id = backend_id or f"local:{session['id']}"
+            records[(backend, key_id)] = {
+                "backend": backend,
+                "backendSessionId": backend_id or None,
+                "localSession": session,
+                "timestamps": [_timestamp_seconds(session.get("updatedAt"))],
+            }
+
+        for backend_session in self.catalog.cleanup_sessions():
+            backend = str(backend_session.get("backend") or "").strip().lower()
+            backend_id = str(backend_session.get("backendSessionId") or "").strip()
+            if backend not in {"grok", "codex"} or not backend_id:
+                continue
+            record = records.setdefault(
+                (backend, backend_id),
+                {
+                    "backend": backend,
+                    "backendSessionId": backend_id,
+                    "localSession": None,
+                    "timestamps": [],
+                },
+            )
+            record["timestamps"].append(_timestamp_seconds(backend_session.get("updatedAt")))
+
+        candidates: list[dict[str, Any]] = []
+        skipped_pinned = 0
+        skipped_active = 0
+        cutoff_seconds = cutoff.timestamp()
+        for record in records.values():
+            timestamps = [value for value in record["timestamps"] if value is not None]
+            if not timestamps or max(timestamps) >= cutoff_seconds:
+                continue
+            local_session = record.get("localSession")
+            if local_session is not None and local_session["status"] in {
+                "queued",
+                "running",
+                "cancelling",
+            }:
+                skipped_active += 1
+            elif local_session is not None and local_session["pinned"]:
+                skipped_pinned += 1
+            else:
+                candidates.append(record)
+
+        return {
+            "olderThanDays": older_than_days,
+            "cutoff": cutoff.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "candidates": candidates,
+            "skippedPinned": skipped_pinned,
+            "skippedActive": skipped_active,
+        }
+
+    @staticmethod
+    def _cleanup_summary(inventory: dict[str, Any]) -> dict[str, Any]:
+        eligible = {"grok": 0, "codex": 0, "total": 0}
+        for candidate in inventory["candidates"]:
+            eligible[candidate["backend"]] += 1
+            eligible["total"] += 1
+        return {
+            "olderThanDays": inventory["olderThanDays"],
+            "cutoff": inventory["cutoff"],
+            "eligible": eligible,
+            "skippedPinned": inventory["skippedPinned"],
+            "skippedActive": inventory["skippedActive"],
+        }
 
     def _delete_backend_session(self, backend: str, backend_id: str) -> None:
         command = (

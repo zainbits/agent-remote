@@ -19,6 +19,7 @@ import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.DurableAgentClient
 import dev.zain.agentremote.agent.ImageAttachment
 import dev.zain.agentremote.agent.SessionSummary
+import dev.zain.agentremote.agent.SessionCleanupReport
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
 import dev.zain.agentremote.agent.isActive
@@ -63,6 +64,17 @@ data class CommandOutputState(
     val progress: Float? = null,
 )
 
+data class SessionCleanupUiState(
+    val checking: Boolean = false,
+    val deleting: Boolean = false,
+    val preview: SessionCleanupReport? = null,
+    val message: String? = null,
+    val error: String? = null,
+) {
+    val busy: Boolean
+        get() = checking || deleting
+}
+
 data class ChatUiState(
     val settings: AppSettings = AppSettings(),
     val screen: AppScreen = AppScreen.HOME,
@@ -87,6 +99,7 @@ data class ChatUiState(
     val sessionsLoading: Boolean = false,
     val sessionsError: String? = null,
     val sessionActionId: String? = null,
+    val sessionCleanup: SessionCleanupUiState = SessionCleanupUiState(),
     val activeSessionTitle: String? = null,
     val historyLoading: Boolean = false,
 )
@@ -429,6 +442,122 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+    }
+
+    fun previewOldSessionCleanup(baseUrl: String, secret: String) {
+        val state = _ui.value
+        if (state.sessionCleanup.busy) return
+        val normalizedBaseUrl = baseUrl.trim()
+        val normalizedSecret = secret.trim()
+        if (normalizedBaseUrl.isBlank() || normalizedSecret.isBlank()) {
+            _ui.update {
+                it.copy(
+                    sessionCleanup = SessionCleanupUiState(
+                        error = "Set the durable host URL and token first.",
+                    ),
+                )
+            }
+            return
+        }
+        _ui.update {
+            it.copy(sessionCleanup = SessionCleanupUiState(checking = true))
+        }
+        viewModelScope.launch {
+            runCatching {
+                grokBackend.previewSessionCleanup(
+                    baseUrl = normalizedBaseUrl,
+                    secret = normalizedSecret,
+                )
+            }.onSuccess { preview ->
+                _ui.update {
+                    it.copy(
+                        sessionCleanup = if (preview.eligible.total == 0) {
+                            SessionCleanupUiState(
+                                message = "No unpinned, idle Grok or Codex sessions are " +
+                                    "older than ${preview.olderThanDays} days.",
+                            )
+                        } else {
+                            SessionCleanupUiState(preview = preview)
+                        },
+                    )
+                }
+            }.onFailure { error ->
+                _ui.update {
+                    it.copy(
+                        sessionCleanup = SessionCleanupUiState(
+                            error = error.message ?: "Couldn't check old sessions.",
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun deleteOldSessions(baseUrl: String, secret: String) {
+        val state = _ui.value
+        if (state.sessionCleanup.busy || state.sessionCleanup.preview == null) return
+        val normalizedBaseUrl = baseUrl.trim()
+        val normalizedSecret = secret.trim()
+        if (normalizedBaseUrl.isBlank() || normalizedSecret.isBlank()) return
+        _ui.update {
+            it.copy(
+                sessionCleanup = it.sessionCleanup.copy(
+                    checking = false,
+                    deleting = true,
+                    message = null,
+                    error = null,
+                ),
+            )
+        }
+        viewModelScope.launch {
+            runCatching {
+                grokBackend.deleteOldSessions(
+                    baseUrl = normalizedBaseUrl,
+                    secret = normalizedSecret,
+                )
+            }.onSuccess { report ->
+                sessionsByBackend.clear()
+                sessionErrorsByBackend.clear()
+                val deleted = report.deleted?.total ?: 0
+                val failed = report.failed?.total ?: 0
+                val resultMessage = buildString {
+                    append("Deleted $deleted old session")
+                    if (deleted != 1) append('s')
+                    append(" (Grok ${report.deleted?.grok ?: 0}, ")
+                    append("Codex ${report.deleted?.codex ?: 0}).")
+                    if (failed > 0) {
+                        append(" $failed session")
+                        if (failed != 1) append('s')
+                        append(" could not be deleted.")
+                    }
+                    val protected = report.skippedPinned + report.skippedActive
+                    if (protected > 0) {
+                        append(" Kept $protected pinned or active session")
+                        if (protected != 1) append('s')
+                        append('.')
+                    }
+                }
+                _ui.update {
+                    it.copy(
+                        sessionCleanup = SessionCleanupUiState(message = resultMessage),
+                    )
+                }
+                refreshSessions(_ui.value.settings.backendKind, showLoading = false)
+            }.onFailure { error ->
+                _ui.update {
+                    it.copy(
+                        sessionCleanup = SessionCleanupUiState(
+                            error = error.message ?: "Couldn't delete old sessions.",
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun dismissOldSessionCleanup() {
+        if (_ui.value.sessionCleanup.deleting) return
+        _ui.update { it.copy(sessionCleanup = SessionCleanupUiState()) }
     }
 
     private fun updateSessionMetadata(

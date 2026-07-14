@@ -196,6 +196,27 @@ def load_summaries(cwd_filter: str | None, limit: int) -> list[dict[str, Any]]:
     return items[: max(1, limit)]
 
 
+def load_cleanup_summaries() -> list[dict[str, Any]]:
+    """Read only IDs and activity timestamps for host-wide maintenance."""
+    root = sessions_root()
+    if not root.is_dir():
+        return []
+
+    items: list[dict[str, Any]] = []
+    for summary_path in root.glob("*/*/summary.json"):
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        info = data.get("info") or {}
+        session_id = info.get("id") or summary_path.parent.name
+        created = data.get("created_at")
+        updated = data.get("last_active_at") or data.get("updated_at") or created
+        if session_id:
+            items.append({"sessionId": session_id, "updatedAt": updated})
+    return items
+
+
 class Handler(BaseHTTPRequestHandler):
     secret: str = ""
 

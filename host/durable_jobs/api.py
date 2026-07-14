@@ -90,6 +90,13 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
         try:
             route = self._route(parsed.path)
             query = urllib.parse.parse_qs(parsed.query)
+            if route == ["api", "v1", "session-cleanup"]:
+                days = int(query.get("olderThanDays", ["30"])[0])
+                self._send(
+                    HTTPStatus.OK,
+                    {"cleanup": self.server.manager.preview_session_cleanup(days)},
+                )
+                return
             if route == ["api", "v1", "models"]:
                 backend = str(query.get("backend", [""])[0])
                 self._send(
@@ -243,6 +250,14 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             route = self._route(parsed.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            if route == ["api", "v1", "session-cleanup"]:
+                days = int(query.get("olderThanDays", ["30"])[0])
+                self._send(
+                    HTTPStatus.OK,
+                    {"cleanup": self.server.manager.delete_old_sessions(days)},
+                )
+                return
             if len(route) == 4 and route[:3] == ["api", "v1", "sessions"]:
                 result = self.server.manager.delete_session(route[3])
                 self._send(HTTPStatus.OK, result)

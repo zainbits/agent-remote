@@ -49,6 +49,10 @@ class DurableAgentClient(
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
+    private val maintenanceHttp = http.newBuilder()
+        .readTimeout(5, TimeUnit.MINUTES)
+        .callTimeout(5, TimeUnit.MINUTES)
+        .build()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val generation = AtomicLong(0)
     private val stateLock = Any()
@@ -129,6 +133,40 @@ class DurableAgentClient(
             path = "/api/v1/sessions/${encodePath(sessionId)}",
         )
         check(root.optBoolean("deleted")) { "Durable host did not delete the session" }
+    }
+
+    suspend fun previewSessionCleanup(
+        baseUrl: String,
+        secret: String,
+        olderThanDays: Int = 30,
+    ): SessionCleanupReport {
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "GET",
+            path = "/api/v1/session-cleanup?olderThanDays=$olderThanDays",
+            longRunning = true,
+        )
+        return root.optJSONObject("cleanup")
+            ?.let(::parseSessionCleanup)
+            ?: error("Durable host returned no cleanup preview")
+    }
+
+    suspend fun deleteOldSessions(
+        baseUrl: String,
+        secret: String,
+        olderThanDays: Int = 30,
+    ): SessionCleanupReport {
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "DELETE",
+            path = "/api/v1/session-cleanup?olderThanDays=$olderThanDays",
+            longRunning = true,
+        )
+        return root.optJSONObject("cleanup")
+            ?.let(::parseSessionCleanup)
+            ?: error("Durable host returned no cleanup result")
     }
 
     suspend fun fetchCodexStatus(): CodexStatusSnapshot {
@@ -585,6 +623,7 @@ class DurableAgentClient(
         baseUrl: String = this.baseUrl,
         secret: String = this.secret,
         trackAsPoll: Boolean = false,
+        longRunning: Boolean = false,
     ): JSONObject {
         val requestBuilder = Request.Builder()
             .url(baseUrl.trimEnd('/') + path)
@@ -603,14 +642,15 @@ class DurableAgentClient(
             "DELETE" -> requestBuilder.delete()
             else -> error("Unsupported HTTP method: $method")
         }
-        return executeJsonRequest(requestBuilder.build(), trackAsPoll)
+        return executeJsonRequest(requestBuilder.build(), trackAsPoll, longRunning)
     }
 
     private suspend fun executeJsonRequest(
         request: Request,
         trackAsPoll: Boolean = false,
+        longRunning: Boolean = false,
     ): JSONObject = withContext(Dispatchers.IO) {
-        val call = http.newCall(request)
+        val call = (if (longRunning) maintenanceHttp else http).newCall(request)
         if (trackAsPoll) synchronized(stateLock) { activePollCall = call }
         try {
             call.execute().use { response ->
@@ -676,6 +716,26 @@ class DurableAgentClient(
             pinned = item.optBoolean("pinned", false),
             unread = item.optBoolean("unread", false),
             status = item.optString("status").toSessionStatus(),
+        )
+    }
+
+    private fun parseSessionCleanup(item: JSONObject): SessionCleanupReport {
+        fun counts(name: String): SessionCleanupCounts? {
+            val value = item.optJSONObject(name) ?: return null
+            return SessionCleanupCounts(
+                grok = value.optInt("grok"),
+                codex = value.optInt("codex"),
+                total = value.optInt("total"),
+            )
+        }
+        return SessionCleanupReport(
+            olderThanDays = item.optInt("olderThanDays", 30),
+            cutoff = item.optString("cutoff"),
+            eligible = counts("eligible") ?: SessionCleanupCounts(),
+            skippedPinned = item.optInt("skippedPinned"),
+            skippedActive = item.optInt("skippedActive"),
+            deleted = counts("deleted"),
+            failed = counts("failed"),
         )
     }
 

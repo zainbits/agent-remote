@@ -98,6 +98,69 @@ class LegacyCatalog:
             else:
                 self._sync_deadlines[key] = time.monotonic() + self.sync_ttl_seconds
 
+    def cleanup_sessions(self) -> list[dict[str, Any]]:
+        """List every top-level CLI session eligible for age-based maintenance."""
+        with self._sync_lock:
+            sessions: dict[tuple[str, str], dict[str, Any]] = {}
+            for summary in self._all_grok_summaries():
+                backend_id = str(summary.get("sessionId") or "").strip()
+                if backend_id:
+                    sessions[("grok", backend_id)] = {
+                        "backend": "grok",
+                        "backendSessionId": backend_id,
+                        "updatedAt": summary.get("updatedAt"),
+                    }
+            for thread in self._all_codex_threads():
+                backend_id = str(thread.get("id") or "").strip()
+                if backend_id:
+                    sessions[("codex", backend_id)] = {
+                        "backend": "codex",
+                        "backendSessionId": backend_id,
+                        "updatedAt": _iso_epoch_seconds(thread.get("updatedAt")),
+                    }
+            return list(sessions.values())
+
+    def invalidate(self) -> None:
+        with self._sync_lock:
+            self._sync_deadlines.clear()
+
+    @staticmethod
+    def _all_grok_summaries() -> list[dict[str, Any]]:
+        try:
+            from host.session_index import load_cleanup_summaries
+        except ImportError:
+            from session_index import load_cleanup_summaries
+
+        return load_cleanup_summaries()
+
+    def _all_codex_threads(self) -> list[dict[str, Any]]:
+        threads: list[dict[str, Any]] = []
+        for archived in (False, True):
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                params: dict[str, Any] = {
+                    "archived": archived,
+                    "limit": 200,
+                    "sourceKinds": ["cli", "vscode", "exec", "appServer"],
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                result = self._codex_rpc("thread/list", params)
+                threads.extend(
+                    thread
+                    for thread in result.get("data") or []
+                    if isinstance(thread, dict)
+                )
+                next_cursor = str(result.get("nextCursor") or "").strip()
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        return threads
+
     def import_history_if_needed(self, session_id: str) -> None:
         session = self.store.get_session(session_id)
         backend_id = session.get("backendSessionId")

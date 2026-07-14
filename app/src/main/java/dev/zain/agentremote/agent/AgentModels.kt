@@ -152,6 +152,22 @@ data class SessionSummary(
     val status: SessionStatus = SessionStatus.IDLE,
 )
 
+data class SessionCleanupCounts(
+    val grok: Int = 0,
+    val codex: Int = 0,
+    val total: Int = 0,
+)
+
+data class SessionCleanupReport(
+    val olderThanDays: Int,
+    val cutoff: String,
+    val eligible: SessionCleanupCounts,
+    val skippedPinned: Int,
+    val skippedActive: Int,
+    val deleted: SessionCleanupCounts? = null,
+    val failed: SessionCleanupCounts? = null,
+)
+
 enum class SessionStatus {
     IDLE,
     QUEUED,

@@ -171,8 +171,12 @@ class MainActivity : ComponentActivity() {
                     composable("settings") {
                         SettingsScreen(
                             settings = state.settings,
+                            sessionCleanup = state.sessionCleanup,
                             onBack = { nav.popBackStack() },
                             onSave = vm::saveSettings,
+                            onPreviewOldSessions = vm::previewOldSessionCleanup,
+                            onDeleteOldSessions = vm::deleteOldSessions,
+                            onDismissOldSessions = vm::dismissOldSessionCleanup,
                         )
                     }
                 }

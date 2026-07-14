@@ -1,9 +1,11 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from host.session_index import visible_message_count
+from host.session_index import load_cleanup_summaries, visible_message_count
 
 
 def write_jsonl(path: Path, values: list[dict]) -> None:
@@ -65,6 +67,27 @@ class VisibleMessageCountTest(unittest.TestCase):
         summary_path, summary = self.session([], [], next_trace_turn=3)
 
         self.assertEqual(visible_message_count(summary_path, summary), 6)
+
+    def test_cleanup_summaries_read_only_ids_and_activity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            session_dir = root / "sessions" / "encoded-cwd" / "session-id"
+            session_dir.mkdir(parents=True)
+            (session_dir / "summary.json").write_text(
+                json.dumps({
+                    "info": {"id": "session-id", "cwd": "/workspace"},
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "last_active_at": "2020-02-01T00:00:00Z",
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"GROK_HOME": temporary}):
+                summaries = load_cleanup_summaries()
+
+        self.assertEqual(
+            [{"sessionId": "session-id", "updatedAt": "2020-02-01T00:00:00Z"}],
+            summaries,
+        )
 
 
 if __name__ == "__main__":

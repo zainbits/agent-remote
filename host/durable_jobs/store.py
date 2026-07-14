@@ -747,6 +747,12 @@ class JobStore:
             connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         return [str(row["stored_name"]) for row in attachment_rows]
 
+    def cleanup_sessions(self) -> list[dict[str, Any]]:
+        """Return all durable sessions for host-wide age-based maintenance."""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM sessions").fetchall()
+        return [self._session_dict(row) for row in rows]
+
     def list_sessions(self, backend: str, cwd: str, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(

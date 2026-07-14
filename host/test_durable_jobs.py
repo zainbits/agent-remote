@@ -717,6 +717,133 @@ class DurableJobsTest(unittest.TestCase):
             delete.call_args.args[0],
         )
 
+    def test_old_session_cleanup_merges_full_catalog_and_preserves_protected_sessions(self):
+        old_timestamp = "2020-01-01T00:00:00.000Z"
+        linked_grok = self.store.create_session("grok", str(self.workspace))
+        self.store.set_backend_session_id(linked_grok["id"], "old-linked-grok")
+        local_placeholder = self.store.create_session("codex", str(self.workspace))
+        pinned = self.store.create_session("codex", str(self.workspace))
+        self.store.set_backend_session_id(pinned["id"], "old-pinned-codex")
+        self.store.update_session_metadata(pinned["id"], pinned=True)
+        active = self.store.create_session("grok", str(self.workspace))
+        self.store.set_backend_session_id(active["id"], "old-active-grok")
+        active_turn = self.store.create_turn(active["id"], "still active")
+        recent = self.store.create_session("codex", str(self.workspace))
+        self.store.set_backend_session_id(recent["id"], "recent-linked-codex")
+
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id IN (?, ?, ?, ?)",
+                (
+                    old_timestamp,
+                    linked_grok["id"],
+                    local_placeholder["id"],
+                    pinned["id"],
+                    active["id"],
+                ),
+            )
+
+        catalog = [
+            {
+                "backend": "grok",
+                "backendSessionId": "old-linked-grok",
+                "updatedAt": old_timestamp,
+            },
+            {
+                "backend": "codex",
+                "backendSessionId": "old-external-codex",
+                "updatedAt": old_timestamp,
+            },
+            {
+                "backend": "codex",
+                "backendSessionId": "old-pinned-codex",
+                "updatedAt": old_timestamp,
+            },
+            {
+                "backend": "grok",
+                "backendSessionId": "old-active-grok",
+                "updatedAt": old_timestamp,
+            },
+            {
+                "backend": "codex",
+                "backendSessionId": "recent-linked-codex",
+                "updatedAt": old_timestamp,
+            },
+        ]
+
+        with mock.patch.object(self.manager.catalog, "cleanup_sessions", return_value=catalog):
+            preview = self.manager.preview_session_cleanup(30)
+
+        self.assertEqual({"grok": 1, "codex": 2, "total": 3}, preview["eligible"])
+        self.assertEqual(1, preview["skippedPinned"])
+        self.assertEqual(1, preview["skippedActive"])
+
+        with (
+            mock.patch.object(self.manager.catalog, "cleanup_sessions", return_value=catalog),
+            mock.patch("host.durable_jobs.manager.subprocess.run") as delete,
+        ):
+            delete.return_value.returncode = 0
+            result = self.manager.delete_old_sessions(30)
+
+        self.assertEqual({"grok": 1, "codex": 2, "total": 3}, result["deleted"])
+        self.assertEqual({"grok": 0, "codex": 0, "total": 0}, result["failed"])
+        self.assertEqual(1, result["skippedPinned"])
+        self.assertEqual(1, result["skippedActive"])
+        commands = [call.args[0] for call in delete.call_args_list]
+        self.assertIn([str(self.grok), "sessions", "delete", "old-linked-grok"], commands)
+        self.assertIn([str(self.codex), "delete", "--force", "old-external-codex"], commands)
+        with self.assertRaises(NotFoundError):
+            self.store.get_session(linked_grok["id"])
+        with self.assertRaises(NotFoundError):
+            self.store.get_session(local_placeholder["id"])
+        self.assertTrue(self.store.get_session(pinned["id"])["pinned"])
+        self.assertEqual("queued", self.store.get_session(active["id"])["status"])
+        self.assertEqual(recent["id"], self.store.get_session(recent["id"])["id"])
+        self.store.finish_turn(active_turn["id"], "cancelled")
+
+        with self.assertRaises(StoreError):
+            self.manager.preview_session_cleanup(0)
+
+    def test_cleanup_catalog_includes_grok_and_paginated_codex_archives(self):
+        catalog = LegacyCatalog(self.store, str(self.codex))
+        old_timestamp = "2020-01-01T00:00:00Z"
+
+        def codex_page(_method, params):
+            if params["archived"]:
+                return {
+                    "data": [{"id": "archived-codex", "updatedAt": 2}],
+                    "nextCursor": None,
+                }
+            if params.get("cursor") == "page-2":
+                return {
+                    "data": [{"id": "second-codex", "updatedAt": 3}],
+                    "nextCursor": None,
+                }
+            return {
+                "data": [{"id": "first-codex", "updatedAt": 1}],
+                "nextCursor": "page-2",
+            }
+
+        with (
+            mock.patch.object(
+                catalog,
+                "_all_grok_summaries",
+                return_value=[{"sessionId": "old-grok", "updatedAt": old_timestamp}],
+            ),
+            mock.patch.object(catalog, "_codex_rpc", side_effect=codex_page),
+        ):
+            sessions = catalog.cleanup_sessions()
+
+        self.assertEqual(
+            {
+                ("grok", "old-grok"),
+                ("codex", "first-codex"),
+                ("codex", "second-codex"),
+                ("codex", "archived-codex"),
+            },
+            {(session["backend"], session["backendSessionId"]) for session in sessions},
+        )
+
     def test_session_metadata_pin_order_and_unread_lifecycle(self):
         older = self.store.create_session("codex", str(self.workspace))
         newer = self.store.create_session("codex", str(self.workspace))
@@ -805,6 +932,47 @@ class DurableJobsTest(unittest.TestCase):
             self.assertTrue(deleted["deleted"])
             with self.assertRaises(NotFoundError):
                 self.store.get_session(delete_target["id"])
+
+            preview_payload = {
+                "olderThanDays": 30,
+                "cutoff": "2020-01-01T00:00:00.000Z",
+                "eligible": {"grok": 1, "codex": 2, "total": 3},
+                "skippedPinned": 1,
+                "skippedActive": 0,
+            }
+            with mock.patch.object(
+                self.manager,
+                "preview_session_cleanup",
+                return_value=preview_payload,
+            ) as preview_cleanup:
+                cleanup_preview_request = urllib.request.Request(
+                    base + "/api/v1/session-cleanup?olderThanDays=30",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                with urllib.request.urlopen(cleanup_preview_request, timeout=2) as response:
+                    cleanup_preview = json.load(response)
+            self.assertEqual(3, cleanup_preview["cleanup"]["eligible"]["total"])
+            preview_cleanup.assert_called_once_with(30)
+
+            cleanup_result_payload = {
+                **preview_payload,
+                "deleted": {"grok": 1, "codex": 2, "total": 3},
+                "failed": {"grok": 0, "codex": 0, "total": 0},
+            }
+            with mock.patch.object(
+                self.manager,
+                "delete_old_sessions",
+                return_value=cleanup_result_payload,
+            ) as delete_cleanup:
+                cleanup_delete_request = urllib.request.Request(
+                    base + "/api/v1/session-cleanup?olderThanDays=30",
+                    headers={"Authorization": f"Bearer {token}"},
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(cleanup_delete_request, timeout=2) as response:
+                    cleanup_result = json.load(response)
+            self.assertEqual(3, cleanup_result["cleanup"]["deleted"]["total"])
+            delete_cleanup.assert_called_once_with(30)
 
             sandboxed_request = urllib.request.Request(
                 base + "/api/v1/sessions",
