@@ -383,6 +383,54 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         updateSessionMetadata(session, pinned = !session.pinned)
     }
 
+    fun deleteSession(session: SessionSummary) {
+        val state = _ui.value
+        val kind = state.settings.backendKind
+        val settings = state.settings
+        if (state.sessionActionId != null || settings.durableHostToken.isBlank()) return
+        if (session.status.isActive) {
+            _ui.update { it.copy(sessionsError = "Stop the active turn before deleting this session") }
+            return
+        }
+        _ui.update { it.copy(sessionActionId = session.sessionId, sessionsError = null) }
+        viewModelScope.launch {
+            runCatching {
+                durableBackend(kind).deleteSession(
+                    baseUrl = settings.activeDurableBaseUrl,
+                    secret = settings.durableHostToken,
+                    sessionId = session.sessionId,
+                )
+            }.onSuccess {
+                val remaining = sessionsByBackend[kind]
+                    .orEmpty()
+                    .filterNot { it.sessionId == session.sessionId }
+                sessionsByBackend[kind] = remaining
+                sessionErrorsByBackend[kind] = null
+                _ui.update { current ->
+                    if (current.settings.backendKind == kind) {
+                        current.copy(
+                            sessions = remaining,
+                            sessionActionId = null,
+                            sessionsError = null,
+                        )
+                    } else {
+                        current.copy(sessionActionId = null)
+                    }
+                }
+            }.onFailure { error ->
+                val message = error.message ?: "Couldn't delete session"
+                sessionErrorsByBackend[kind] = message
+                _ui.update { current ->
+                    if (current.settings.backendKind == kind) {
+                        current.copy(sessionActionId = null, sessionsError = message)
+                    } else {
+                        current.copy(sessionActionId = null)
+                    }
+                }
+            }
+        }
+    }
+
     private fun updateSessionMetadata(
         session: SessionSummary,
         title: String? = null,

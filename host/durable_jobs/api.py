@@ -237,6 +237,21 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
         except Exception as error:
             self._handle_error(error)
 
+    def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        parsed = urllib.parse.urlsplit(self.path)
+        if not self._require_auth():
+            return
+        try:
+            route = self._route(parsed.path)
+            if len(route) == 4 and route[:3] == ["api", "v1", "sessions"]:
+                result = self.server.manager.delete_session(route[3])
+                self._send(HTTPStatus.OK, result)
+                return
+            self.close_connection = True
+            self._send(HTTPStatus.NOT_FOUND, {"error": "Endpoint not found"})
+        except Exception as error:
+            self._handle_error(error)
+
     def _handle_error(self, error: Exception) -> None:
         self.close_connection = True
         if isinstance(error, NotFoundError):

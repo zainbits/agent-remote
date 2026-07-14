@@ -12,6 +12,7 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `POST` | `/api/v1/sessions` | Create a durable session from `{ backend, cwd, codexFullAccess? }` |
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
 | `PATCH` | `/api/v1/sessions/{id}` | Update one or more of `{ title, pinned, unread }` |
+| `DELETE` | `/api/v1/sessions/{id}` | Permanently delete an idle durable session and its linked Grok/Codex CLI history |
 | `GET` | `/api/v1/sessions/{id}/commands` | Refresh the backend-specific slash-command catalog |
 | `GET` | `/api/v1/sessions/{id}/status` | Read live Codex account limits plus native thread configuration/context status |
 | `POST` | `/api/v1/sessions/{id}/attachments` | Stream one image body with `Content-Type` and URL-encoded `X-File-Name`; returns durable attachment metadata |
@@ -25,6 +26,8 @@ Request bodies are limited to 1 MiB. API errors use `{ "error": "…" }` with an
 ## State model
 
 Session status is one of `idle`, `queued`, `running`, `cancelling`, `failed`, or `cancelled`. One session accepts one active turn at a time; distinct sessions execute concurrently up to `AGENTREMOTE_MAX_WORKERS`.
+
+Session deletion is permanent and is rejected while a turn is queued, running, or cancelling. For a linked session, the host first invokes the backend's official permanent-delete command (`grok sessions delete` or `codex delete --force`); only after that succeeds does SQLite cascade-delete the durable turns, messages, events, and attachment metadata. Stored attachment files are then removed. An unlinked new-session placeholder has only its durable row removed.
 
 Session summaries include durable `pinned` and `unread` booleans. Lists place pinned sessions first, then order each group by most recent activity. A terminal turn marks its session unread; starting a later turn or an explicit `{ "unread": false }` update clears it. Manual title updates are protected from the automatic first-prompt title generation.
 

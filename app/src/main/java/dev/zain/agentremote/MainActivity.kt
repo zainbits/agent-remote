@@ -118,6 +118,7 @@ class MainActivity : ComponentActivity() {
                                     onRefresh = vm::refreshSessions,
                                     onRenameSession = vm::renameSession,
                                     onToggleSessionPin = vm::toggleSessionPin,
+                                    onDeleteSession = vm::deleteSession,
                                     onSelectBackend = vm::selectBackend,
                                     onOpenSettings = { nav.navigate("settings") },
                                     interactionEnabled =

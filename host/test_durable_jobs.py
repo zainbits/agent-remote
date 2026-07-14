@@ -9,12 +9,13 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 from host.durable_jobs.api import DurableHTTPServer
 from host.durable_jobs.catalog import LegacyCatalog
 from host.durable_jobs.manager import JobManager
 from host.durable_jobs.metadata import MetadataProvider
-from host.durable_jobs.store import ConflictError, JobStore
+from host.durable_jobs.store import ConflictError, JobStore, NotFoundError, StoreError
 
 
 FAKE_CODEX = r'''#!/usr/bin/env python3
@@ -652,6 +653,70 @@ class DurableJobsTest(unittest.TestCase):
         terminal, _ = self._wait_terminal(session["id"])
         self.assertEqual("cancelled", terminal["status"])
 
+    def test_delete_session_removes_backend_history_rows_and_attachments(self):
+        session = self.manager.create_session("grok", str(self.workspace))
+        image_bytes = b"\x89PNG\r\n\x1a\n" + b"delete-image"
+        attachment = self.manager.upload_attachment(
+            session["id"],
+            "delete.png",
+            "image/png",
+            len(image_bytes),
+            io.BytesIO(image_bytes),
+        )
+        attachment_path = Path(self.store.attachment_directory, f"{attachment['id']}.png")
+        turn = self.store.create_turn(session["id"], "delete this", [attachment["id"]])
+        self.store.finish_turn(turn["id"], "completed")
+        self.store.set_backend_session_id(session["id"], "linked-grok-session")
+
+        with mock.patch("host.durable_jobs.manager.subprocess.run") as delete:
+            delete.return_value.returncode = 0
+            result = self.manager.delete_session(session["id"])
+
+        self.assertEqual({"deleted": True}, result)
+        self.assertEqual(
+            [str(self.grok), "sessions", "delete", "linked-grok-session"],
+            delete.call_args.args[0],
+        )
+        with self.assertRaises(NotFoundError):
+            self.store.get_session(session["id"])
+        self.assertFalse(attachment_path.exists())
+        with self.store._connect() as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM turns WHERE session_id = ?", (session["id"],)
+            ).fetchone()[0])
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session["id"],)
+            ).fetchone()[0])
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?", (session["id"],)
+            ).fetchone()[0])
+
+    def test_delete_session_rejects_active_turn(self):
+        session = self.store.create_session("grok", str(self.workspace))
+        turn = self.store.create_turn(session["id"], "still active")
+
+        with mock.patch("host.durable_jobs.manager.subprocess.run") as delete:
+            with self.assertRaises(ConflictError):
+                self.manager.delete_session(session["id"])
+            delete.assert_not_called()
+
+        self.store.finish_turn(turn["id"], "cancelled")
+
+    def test_backend_delete_failure_keeps_agentremote_session(self):
+        session = self.store.create_session("codex", str(self.workspace))
+        self.store.set_backend_session_id(session["id"], "linked-codex-session")
+
+        with mock.patch("host.durable_jobs.manager.subprocess.run") as delete:
+            delete.return_value.returncode = 1
+            with self.assertRaises(StoreError):
+                self.manager.delete_session(session["id"])
+
+        self.assertEqual(session["id"], self.store.get_session(session["id"])["id"])
+        self.assertEqual(
+            [str(self.codex), "delete", "--force", "linked-codex-session"],
+            delete.call_args.args[0],
+        )
+
     def test_session_metadata_pin_order_and_unread_lifecycle(self):
         older = self.store.create_session("codex", str(self.workspace))
         newer = self.store.create_session("codex", str(self.workspace))
@@ -728,6 +793,18 @@ class DurableJobsTest(unittest.TestCase):
             self.assertEqual("Phone task", metadata["session"]["title"])
             self.assertTrue(metadata["session"]["pinned"])
             self.assertFalse(metadata["session"]["unread"])
+
+            delete_target = self.manager.create_session("grok", str(self.workspace))
+            delete_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{delete_target['id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                method="DELETE",
+            )
+            with urllib.request.urlopen(delete_request, timeout=2) as response:
+                deleted = json.load(response)
+            self.assertTrue(deleted["deleted"])
+            with self.assertRaises(NotFoundError):
+                self.store.get_session(delete_target["id"])
 
             sandboxed_request = urllib.request.Request(
                 base + "/api/v1/sessions",

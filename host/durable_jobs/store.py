@@ -729,6 +729,24 @@ class JobStore:
             raise NotFoundError("Session not found")
         return self._session_dict(row)
 
+    def delete_session(self, session_id: str) -> list[str]:
+        """Delete one idle session and return its attachment filenames for cleanup."""
+        with self._connect() as connection:
+            session = connection.execute(
+                "SELECT status FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("Session not found")
+            if session["status"] in ACTIVE_STATUSES:
+                raise ConflictError("Stop the active turn before deleting this session")
+            attachment_rows = connection.execute(
+                "SELECT stored_name FROM attachments WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return [str(row["stored_name"]) for row in attachment_rows]
+
     def list_sessions(self, backend: str, cwd: str, limit: int = 50) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(

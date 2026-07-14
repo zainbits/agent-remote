@@ -117,6 +117,20 @@ class DurableAgentClient(
             ?: error("Durable host returned no session")
     }
 
+    suspend fun deleteSession(
+        baseUrl: String,
+        secret: String,
+        sessionId: String,
+    ) {
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "DELETE",
+            path = "/api/v1/sessions/${encodePath(sessionId)}",
+        )
+        check(root.optBoolean("deleted")) { "Durable host did not delete the session" }
+    }
+
     suspend fun fetchCodexStatus(): CodexStatusSnapshot {
         check(kind == BackendKind.CODEX) { "Status details are only available for Codex" }
         val id = sessionId ?: error("Not connected")
@@ -586,6 +600,7 @@ class DurableAgentClient(
                 (body ?: JSONObject()).toString()
                     .toRequestBody(JSON_MEDIA_TYPE),
             )
+            "DELETE" -> requestBuilder.delete()
             else -> error("Unsupported HTTP method: $method")
         }
         return executeJsonRequest(requestBuilder.build(), trackAsPoll)

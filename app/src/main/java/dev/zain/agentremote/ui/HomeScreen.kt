@@ -1,6 +1,12 @@
 package dev.zain.agentremote.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.AnchoredDraggableState
+import androidx.compose.foundation.gestures.DraggableAnchors
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.anchoredDraggable
+import androidx.compose.foundation.gestures.snapTo
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -8,10 +14,12 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -20,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Edit
@@ -50,6 +59,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,6 +69,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextAlign
@@ -69,6 +84,8 @@ import dev.zain.agentremote.agent.isActive
 import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.data.NetworkProfile
 import dev.zain.agentremote.data.displayName
+import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -79,12 +96,14 @@ fun HomeScreen(
     onRefresh: () -> Unit,
     onRenameSession: (SessionSummary, String) -> Unit,
     onToggleSessionPin: (SessionSummary) -> Unit,
+    onDeleteSession: (SessionSummary) -> Unit,
     onSelectBackend: (BackendKind) -> Unit,
     onOpenSettings: () -> Unit,
     interactionEnabled: Boolean = true,
 ) {
     var renameSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     var renameDraft by rememberSaveable { mutableStateOf("") }
+    var deleteSessionId by rememberSaveable { mutableStateOf<String?>(null) }
     val cwd = state.settings.workingDirectory
     val profile = when (state.settings.networkProfile) {
         NetworkProfile.LAN -> "LAN"
@@ -96,6 +115,7 @@ fun HomeScreen(
 
     LaunchedEffect(backend) {
         renameSessionId = null
+        deleteSessionId = null
     }
 
     Scaffold(
@@ -187,6 +207,7 @@ fun HomeScreen(
                             renameDraft = session.title
                         },
                         onTogglePin = { onToggleSessionPin(session) },
+                        onDeleteRequest = { deleteSessionId = session.sessionId },
                     )
                 }
             }
@@ -233,6 +254,7 @@ fun HomeScreen(
                         renameDraft = session.title
                     },
                     onTogglePin = { onToggleSessionPin(session) },
+                    onDeleteRequest = { deleteSessionId = session.sessionId },
                 )
             }
 
@@ -269,6 +291,36 @@ fun HomeScreen(
             },
             dismissButton = {
                 TextButton(onClick = { renameSessionId = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
+    val deleteTarget = state.sessions.firstOrNull { it.sessionId == deleteSessionId }
+    if (deleteTarget != null) {
+        AlertDialog(
+            onDismissRequest = { deleteSessionId = null },
+            title = { Text("Delete session?") },
+            text = {
+                Text(
+                    "This permanently deletes the AgentRemote session and its linked " +
+                        "${backend.displayName} CLI history. This cannot be undone.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDeleteSession(deleteTarget)
+                        deleteSessionId = null
+                    },
+                    enabled = state.sessionActionId == null && !deleteTarget.status.isActive,
+                ) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteSessionId = null }) {
                     Text("Cancel")
                 }
             },
@@ -440,136 +492,219 @@ private fun SessionRow(
     onClick: () -> Unit,
     onRename: () -> Unit,
     onTogglePin: () -> Unit,
+    onDeleteRequest: () -> Unit,
 ) {
-    Card(
-        onClick = onClick,
-        enabled = interactionEnabled,
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.extraLarge,
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-        ),
+    val revealWidth = 96.dp
+    val revealWidthPx = with(LocalDensity.current) { revealWidth.toPx() }
+    val layoutDirection = LocalLayoutDirection.current
+    val openOffset = if (layoutDirection == LayoutDirection.Ltr) {
+        -revealWidthPx
+    } else {
+        revealWidthPx
+    }
+    val anchors = remember(openOffset) {
+        DraggableAnchors {
+            SessionSlideState.Closed at 0f
+            SessionSlideState.Revealed at openOffset
+        }
+    }
+    val slideState = remember(session.sessionId, anchors) {
+        AnchoredDraggableState(
+            initialValue = SessionSlideState.Closed,
+            anchors = anchors,
+        )
+    }
+    val scope = rememberCoroutineScope()
+    val canDelete = interactionEnabled && !session.status.isActive
+
+    LaunchedEffect(canDelete) {
+        if (!canDelete) slideState.snapTo(SessionSlideState.Closed)
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.extraLarge),
     ) {
-        Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(MaterialTheme.colorScheme.errorContainer),
+            contentAlignment = Alignment.CenterEnd,
+        ) {
+            Column(
+                modifier = Modifier
+                    .width(revealWidth)
+                    .fillMaxHeight()
+                    .clickable(enabled = canDelete, onClick = onDeleteRequest),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
             ) {
-                if (session.unread) {
-                    Box(
-                        modifier = Modifier
-                            .padding(end = 9.dp)
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(UnreadBlue)
-                            .semantics { contentDescription = "Unread session" },
-                    )
-                }
-                Text(
-                    text = session.title,
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                if (actionInProgress) {
-                    CircularProgressIndicator(
-                        modifier = Modifier
-                            .padding(horizontal = 12.dp)
-                            .size(18.dp),
-                        strokeWidth = 2.dp,
-                    )
-                } else {
-                    IconButton(
-                        onClick = onTogglePin,
-                        enabled = interactionEnabled,
-                        modifier = Modifier.size(40.dp),
-                    ) {
-                        Icon(
-                            Icons.Default.PushPin,
-                            contentDescription = if (session.pinned) {
-                                "Unpin session"
-                            } else {
-                                "Pin session"
-                            },
-                            tint = if (session.pinned) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                        )
-                    }
-                    IconButton(
-                        onClick = onRename,
-                        enabled = interactionEnabled,
-                        modifier = Modifier.size(40.dp),
-                    ) {
-                        Icon(Icons.Default.Edit, contentDescription = "Rename session")
-                    }
-                }
-            }
-            Spacer(Modifier.height(4.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = formatWhen(session.updatedAt ?: session.createdAt),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    if (session.status.isActive) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(14.dp),
-                            color = MaterialTheme.colorScheme.primary,
-                            strokeWidth = 2.dp,
-                        )
-                    }
-                    Text(
-                        text = buildString {
-                            sessionStatusLabel(session.status)?.let {
-                                append(it)
-                                append(" · ")
-                            }
-                            append(
-                                session.messageCount?.let { count ->
-                                    buildString {
-                                        append(count)
-                                        append(if (count == 1) " msg" else " msgs")
-                                        append(" · ")
-                                        append(session.sessionId.take(8))
-                                        append('…')
-                                    }
-                                } ?: "${session.sessionId.take(8)}…",
-                            )
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
-            if (session.cwd.isNotBlank()) {
-                HorizontalDivider(
-                    modifier = Modifier.padding(top = 10.dp, bottom = 8.dp),
-                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = "Delete session",
+                    tint = MaterialTheme.colorScheme.onErrorContainer,
                 )
                 Text(
-                    text = session.cwd,
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontFamily = FontFamily.Monospace,
-                    ),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                    text = "Delete",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
                 )
             }
         }
+        Card(
+            onClick = {
+                if (slideState.settledValue == SessionSlideState.Revealed) {
+                    scope.launch { slideState.snapTo(SessionSlideState.Closed) }
+                } else {
+                    onClick()
+                }
+            },
+            enabled = interactionEnabled,
+            modifier = Modifier
+                .fillMaxWidth()
+                .offset {
+                    IntOffset(
+                        x = slideState.offset.takeUnless { it.isNaN() }?.roundToInt() ?: 0,
+                        y = 0,
+                    )
+                }
+                .anchoredDraggable(
+                    state = slideState,
+                    orientation = Orientation.Horizontal,
+                    enabled = canDelete,
+                ),
+            shape = MaterialTheme.shapes.extraLarge,
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            ),
+        ) {
+            Column(Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (session.unread) {
+                        Box(
+                            modifier = Modifier
+                                .padding(end = 9.dp)
+                                .size(10.dp)
+                                .clip(CircleShape)
+                                .background(UnreadBlue)
+                                .semantics { contentDescription = "Unread session" },
+                        )
+                    }
+                    Text(
+                        text = session.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (actionInProgress) {
+                        CircularProgressIndicator(
+                            modifier = Modifier
+                                .padding(horizontal = 12.dp)
+                                .size(18.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        IconButton(
+                            onClick = onTogglePin,
+                            enabled = interactionEnabled,
+                            modifier = Modifier.size(40.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.PushPin,
+                                contentDescription = if (session.pinned) {
+                                    "Unpin session"
+                                } else {
+                                    "Pin session"
+                                },
+                                tint = if (session.pinned) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                        IconButton(
+                            onClick = onRename,
+                            enabled = interactionEnabled,
+                            modifier = Modifier.size(40.dp),
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = "Rename session")
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = formatWhen(session.updatedAt ?: session.createdAt),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (session.status.isActive) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(14.dp),
+                                color = MaterialTheme.colorScheme.primary,
+                                strokeWidth = 2.dp,
+                            )
+                        }
+                        Text(
+                            text = buildString {
+                                sessionStatusLabel(session.status)?.let {
+                                    append(it)
+                                    append(" · ")
+                                }
+                                append(
+                                    session.messageCount?.let { count ->
+                                        buildString {
+                                            append(count)
+                                            append(if (count == 1) " msg" else " msgs")
+                                            append(" · ")
+                                            append(session.sessionId.take(8))
+                                            append('…')
+                                        }
+                                    } ?: "${session.sessionId.take(8)}…",
+                                )
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (session.cwd.isNotBlank()) {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(top = 10.dp, bottom = 8.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f),
+                    )
+                    Text(
+                        text = session.cwd,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                        ),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
     }
+}
+
+private enum class SessionSlideState {
+    Closed,
+    Revealed,
 }
 
 private val UnreadBlue = Color(0xFF4285F4)

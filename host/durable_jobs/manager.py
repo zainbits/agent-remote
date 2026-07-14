@@ -137,6 +137,7 @@ class JobManager:
         self._futures: dict[str, Future[None]] = {}
         self._conditions: dict[str, threading.Condition] = {}
         self._versions: dict[str, int] = {}
+        self._session_operation_locks: dict[str, threading.Lock] = {}
         self.catalog = LegacyCatalog(store, self.codex_bin)
         self.import_legacy = os.environ.get("AGENTREMOTE_IMPORT_LEGACY", "1") != "0"
         self._cleanup_stale_attachments()
@@ -145,6 +146,10 @@ class JobManager:
     def _condition(self, session_id: str) -> threading.Condition:
         with self._lock:
             return self._conditions.setdefault(session_id, threading.Condition())
+
+    def _session_operation_lock(self, session_id: str) -> threading.Lock:
+        with self._lock:
+            return self._session_operation_locks.setdefault(session_id, threading.Lock())
 
     def notify(self, session_id: str) -> None:
         condition = self._condition(session_id)
@@ -184,6 +189,49 @@ class JobManager:
         )
         self.notify(session_id)
         return session
+
+    def delete_session(self, session_id: str) -> dict[str, bool]:
+        operation_lock = self._session_operation_lock(session_id)
+        with operation_lock:
+            session = self.store.get_session(session_id)
+            if session["status"] in {"queued", "running", "cancelling"}:
+                raise ConflictError("Stop the active turn before deleting this session")
+            backend_id = str(session.get("backendSessionId") or "").strip()
+            if backend_id:
+                self._delete_backend_session(session["backend"], backend_id)
+            stored_names = self.store.delete_session(session_id)
+        for stored_name in stored_names:
+            try:
+                (self.store.attachment_directory / stored_name).unlink(missing_ok=True)
+            except OSError as error:
+                LOGGER.warning("Could not remove a deleted session attachment: %s", error)
+        self.notify(session_id)
+        return {"deleted": True}
+
+    def _delete_backend_session(self, backend: str, backend_id: str) -> None:
+        command = (
+            [self.grok_bin, "sessions", "delete", backend_id]
+            if backend == "grok"
+            else [self.codex_bin, "delete", "--force", backend_id]
+        )
+        try:
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+        except FileNotFoundError as error:
+            raise StoreError(f"{backend.title()} CLI is not available on the host") from error
+        except subprocess.TimeoutExpired as error:
+            raise StoreError(f"Timed out deleting the linked {backend.title()} session") from error
+        if result.returncode != 0:
+            raise StoreError(
+                f"Couldn't delete the linked {backend.title()} session; "
+                "the AgentRemote copy was kept"
+            )
 
     def session_bundle(self, session_id: str) -> dict[str, Any]:
         if self.import_legacy:
@@ -342,11 +390,13 @@ class JobManager:
         prompt: str,
         attachment_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        turn = self.store.create_turn(session_id, prompt, attachment_ids)
-        self.notify(session_id)
-        future = self.executor.submit(self._run_turn, turn["id"])
-        with self._lock:
-            self._futures[turn["id"]] = future
+        operation_lock = self._session_operation_lock(session_id)
+        with operation_lock:
+            turn = self.store.create_turn(session_id, prompt, attachment_ids)
+            self.notify(session_id)
+            future = self.executor.submit(self._run_turn, turn["id"])
+            with self._lock:
+                self._futures[turn["id"]] = future
         future.add_done_callback(lambda _: self._forget_future(turn["id"]))
         return {
             **turn,
