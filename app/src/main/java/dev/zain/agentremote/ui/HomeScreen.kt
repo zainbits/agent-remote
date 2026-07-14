@@ -1,7 +1,9 @@
 package dev.zain.agentremote.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.AnchoredDraggableState
 import androidx.compose.foundation.gestures.DraggableAnchors
 import androidx.compose.foundation.gestures.Orientation
@@ -21,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -36,10 +39,13 @@ import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.outlined.PushPin as OutlinedPushPin
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -66,6 +72,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -494,6 +501,7 @@ private fun SessionRow(
     onTogglePin: () -> Unit,
     onDeleteRequest: () -> Unit,
 ) {
+    var actionsExpanded by remember { mutableStateOf(false) }
     val revealWidth = 96.dp
     val revealWidthPx = with(LocalDensity.current) { revealWidth.toPx() }
     val layoutDirection = LocalLayoutDirection.current
@@ -519,6 +527,10 @@ private fun SessionRow(
 
     LaunchedEffect(canDelete) {
         if (!canDelete) slideState.snapTo(SessionSlideState.Closed)
+    }
+
+    LaunchedEffect(interactionEnabled) {
+        if (!interactionEnabled) actionsExpanded = false
     }
 
     Box(
@@ -553,14 +565,6 @@ private fun SessionRow(
             }
         }
         Card(
-            onClick = {
-                if (slideState.settledValue == SessionSlideState.Revealed) {
-                    scope.launch { slideState.snapTo(SessionSlideState.Closed) }
-                } else {
-                    onClick()
-                }
-            },
-            enabled = interactionEnabled,
             modifier = Modifier
                 .fillMaxWidth()
                 .offset {
@@ -573,6 +577,25 @@ private fun SessionRow(
                     state = slideState,
                     orientation = Orientation.Horizontal,
                     enabled = canDelete,
+                )
+                .combinedClickable(
+                    enabled = interactionEnabled,
+                    onClickLabel = "Open session",
+                    onLongClickLabel = "Show session actions",
+                    onClick = {
+                        if (slideState.settledValue == SessionSlideState.Revealed) {
+                            scope.launch { slideState.snapTo(SessionSlideState.Closed) }
+                        } else {
+                            onClick()
+                        }
+                    },
+                    onLongClick = {
+                        if (slideState.settledValue == SessionSlideState.Revealed) {
+                            scope.launch { slideState.snapTo(SessionSlideState.Closed) }
+                        } else {
+                            actionsExpanded = true
+                        }
+                    },
                 ),
             shape = MaterialTheme.shapes.extraLarge,
             colors = CardDefaults.cardColors(
@@ -608,33 +631,6 @@ private fun SessionRow(
                                 .size(18.dp),
                             strokeWidth = 2.dp,
                         )
-                    } else {
-                        IconButton(
-                            onClick = onTogglePin,
-                            enabled = interactionEnabled,
-                            modifier = Modifier.size(40.dp),
-                        ) {
-                            Icon(
-                                Icons.Default.PushPin,
-                                contentDescription = if (session.pinned) {
-                                    "Unpin session"
-                                } else {
-                                    "Pin session"
-                                },
-                                tint = if (session.pinned) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                            )
-                        }
-                        IconButton(
-                            onClick = onRename,
-                            enabled = interactionEnabled,
-                            modifier = Modifier.size(40.dp),
-                        ) {
-                            Icon(Icons.Default.Edit, contentDescription = "Rename session")
-                        }
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -699,6 +695,113 @@ private fun SessionRow(
                 }
             }
         }
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(end = 12.dp),
+        ) {
+            SessionActionsMenu(
+                expanded = actionsExpanded,
+                pinned = session.pinned,
+                onDismissRequest = { actionsExpanded = false },
+                onTogglePin = {
+                    actionsExpanded = false
+                    onTogglePin()
+                },
+                onRename = {
+                    actionsExpanded = false
+                    onRename()
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun SessionActionsMenu(
+    expanded: Boolean,
+    pinned: Boolean,
+    onDismissRequest: () -> Unit,
+    onTogglePin: () -> Unit,
+    onRename: () -> Unit,
+) {
+    DropdownMenu(
+        expanded = expanded,
+        onDismissRequest = onDismissRequest,
+        modifier = Modifier.widthIn(min = 216.dp),
+        shape = MaterialTheme.shapes.large,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        tonalElevation = 6.dp,
+        shadowElevation = 8.dp,
+        border = BorderStroke(
+            width = 1.dp,
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.65f),
+        ),
+    ) {
+        Text(
+            text = "Session actions",
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        DropdownMenuItem(
+            text = {
+                Text(if (pinned) "Unpin session" else "Pin session")
+            },
+            onClick = onTogglePin,
+            leadingIcon = {
+                Surface(
+                    modifier = Modifier.size(36.dp),
+                    shape = MaterialTheme.shapes.medium,
+                    color = if (pinned) {
+                        MaterialTheme.colorScheme.primaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceContainerHighest
+                    },
+                    contentColor = if (pinned) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = if (pinned) {
+                                Icons.Default.PushPin
+                            } else {
+                                Icons.Outlined.OutlinedPushPin
+                            },
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(20.dp)
+                                .then(if (pinned) Modifier else Modifier.rotate(-25f)),
+                        )
+                    }
+                }
+            },
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
+        )
+        DropdownMenuItem(
+            text = { Text("Rename session") },
+            onClick = onRename,
+            leadingIcon = {
+                Surface(
+                    modifier = Modifier.size(36.dp),
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+            },
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
+        )
     }
 }
 
