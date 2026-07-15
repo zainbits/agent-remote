@@ -202,6 +202,18 @@ class DurableAgentClient(
         return parseUsage(session)
     }
 
+    suspend fun selectReasoningEffort(reasoningEffort: String): AgentUsage {
+        val id = sessionId ?: error("Not connected")
+        val root = request(
+            method = "POST",
+            path = "/api/v1/sessions/${encodePath(id)}/reasoning-effort",
+            body = JSONObject().put("reasoningEffort", reasoningEffort),
+        )
+        val session = root.optJSONObject("session")
+            ?: error("Durable host returned no session")
+        return parseUsage(session)
+    }
+
     override suspend fun connectNew(
         baseUrl: String,
         secret: String,

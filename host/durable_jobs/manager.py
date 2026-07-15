@@ -24,9 +24,7 @@ MAX_DETAIL_CHARS = 16_000
 LOGGER = logging.getLogger("agentremote.host.manager")
 CODEX_SANDBOX_MODE = "workspace-write"
 CODEX_FULL_ACCESS_MODE = "danger-full-access"
-CODEX_FULL_ACCESS_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 CODEX_APPROVAL_POLICY = "never"
-CODEX_NETWORK_ACCESS_CONFIG = "sandbox_workspace_write.network_access=true"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_PENDING_ATTACHMENTS = 16
 DEFAULT_CLEANUP_DAYS = 30
@@ -136,6 +134,68 @@ class _StreamMessages:
         self.manager.notify(self.session_id)
 
 
+class _CodexTurnControl:
+    """Thread-safe writes and deferred interruption for one app-server turn."""
+
+    INTERRUPT_REQUEST_ID = 900_000_001
+
+    def __init__(self, process: subprocess.Popen[str]):
+        self.process = process
+        self._lock = threading.Lock()
+        self._thread_id: str | None = None
+        self._turn_id: str | None = None
+        self._interrupt_requested = False
+        self._interrupt_sent = False
+
+    def send(self, message: dict[str, Any]) -> None:
+        with self._lock:
+            self._send_locked(message)
+
+    def set_active_turn(self, thread_id: str, turn_id: str) -> None:
+        if not thread_id or not turn_id:
+            return
+        with self._lock:
+            self._thread_id = thread_id
+            self._turn_id = turn_id
+            if self._interrupt_requested and not self._interrupt_sent:
+                self._send_interrupt_locked()
+
+    def request_interrupt(self) -> bool:
+        with self._lock:
+            self._interrupt_requested = True
+            if self._interrupt_sent:
+                return True
+            if not self._thread_id or not self._turn_id:
+                return True
+            try:
+                self._send_interrupt_locked()
+            except (BrokenPipeError, OSError, ValueError):
+                return False
+            return True
+
+    def _send_interrupt_locked(self) -> None:
+        assert self._thread_id is not None
+        assert self._turn_id is not None
+        self._send_locked(
+            {
+                "id": self.INTERRUPT_REQUEST_ID,
+                "method": "turn/interrupt",
+                "params": {
+                    "threadId": self._thread_id,
+                    "turnId": self._turn_id,
+                },
+            }
+        )
+        self._interrupt_sent = True
+
+    def _send_locked(self, message: dict[str, Any]) -> None:
+        source = self.process.stdin
+        if source is None or source.closed:
+            raise BrokenPipeError("Codex app-server input is closed")
+        source.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+        source.flush()
+
+
 class JobManager:
     def __init__(
         self,
@@ -155,6 +215,7 @@ class JobManager:
         self.executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="agent-job")
         self._lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen[str]] = {}
+        self._codex_controls: dict[str, _CodexTurnControl] = {}
         self._futures: dict[str, Future[None]] = {}
         self._conditions: dict[str, threading.Condition] = {}
         self._versions: dict[str, int] = {}
@@ -387,6 +448,7 @@ class JobManager:
         if session.get("modelOverride"):
             status["modelId"] = session["modelId"]
             status["modelName"] = session["modelName"]
+        if session.get("reasoningEffort"):
             status["reasoningEffort"] = session["reasoningEffort"]
         # These values are host-owned worker policy, so report what the next turn
         # will actually use even when an older rollout predates this configuration.
@@ -440,6 +502,35 @@ class JobManager:
             model["id"],
             model["name"],
             reasoning_effort,
+            model.get("contextWindowTokens"),
+        )
+        self.notify(session_id)
+        return updated
+
+    def select_reasoning_effort(
+        self,
+        session_id: str,
+        reasoning_effort: str,
+    ) -> dict[str, Any]:
+        session = self.store.get_session(session_id)
+        models = self.metadata.models_for(session["backend"])
+        current_model_id = str(
+            session.get("modelOverride") or session.get("modelId") or ""
+        ).strip()
+        model = next(
+            (item for item in models if item["id"] == current_model_id),
+            None,
+        )
+        if model is None:
+            raise StoreError("Current model is not available for this backend")
+        requested = reasoning_effort.strip()
+        if requested not in (model.get("reasoningEfforts") or []):
+            raise StoreError("Reasoning effort is not available for the current model")
+        updated = self.store.set_model(
+            session_id,
+            model["id"],
+            model["name"],
+            requested,
             model.get("contextWindowTokens"),
         )
         self.notify(session_id)
@@ -553,8 +644,10 @@ class JobManager:
             return False
         with self._lock:
             process = self._processes.get(turn["id"])
+            codex_control = self._codex_controls.get(turn["id"])
         if process is not None and process.poll() is None:
-            self._signal_process(process, signal.SIGINT)
+            if codex_control is None or not codex_control.request_interrupt():
+                self._signal_process(process, signal.SIGINT)
             threading.Thread(
                 target=self._kill_later,
                 args=(process, 5.0),
@@ -610,58 +703,7 @@ class JobManager:
         backend_id = session.get("backendSessionId")
         attached_images = attachments or []
         if session["backend"] == "codex":
-            full_access = bool(session.get("codexFullAccess", True))
-            model_args: list[str] = []
-            if session.get("modelOverride"):
-                model_args.extend(["--model", session["modelOverride"]])
-                if session.get("reasoningEffort"):
-                    model_args.extend(
-                        ["-c", f'model_reasoning_effort="{session["reasoningEffort"]}"']
-                    )
-            permission_args = (
-                [CODEX_FULL_ACCESS_FLAG]
-                if full_access
-                else [
-                    "-c",
-                    f'sandbox_mode="{CODEX_SANDBOX_MODE}"',
-                    "-c",
-                    f'approval_policy="{CODEX_APPROVAL_POLICY}"',
-                    "-c",
-                    CODEX_NETWORK_ACCESS_CONFIG,
-                ]
-            )
-            image_args = [
-                argument
-                for attachment in attached_images
-                for argument in ("--image", attachment["path"])
-            ]
-            if backend_id:
-                return [
-                    self.codex_bin,
-                    "exec",
-                    "resume",
-                    "--json",
-                    "--skip-git-repo-check",
-                    *model_args,
-                    *permission_args,
-                    *image_args,
-                    backend_id,
-                    "-",
-                ]
-            return [
-                self.codex_bin,
-                "exec",
-                "--json",
-                "--color",
-                "never",
-                "--skip-git-repo-check",
-                "--cd",
-                cwd,
-                *model_args,
-                *permission_args,
-                *image_args,
-                "-",
-            ]
+            return [self.codex_bin, "app-server"]
         prompt_args = (
             ["--prompt-json", self._grok_prompt_json(prompt, attached_images)]
             if attached_images
@@ -724,6 +766,9 @@ class JobManager:
         if turn["status"] != "queued" or turn["cancellationRequested"]:
             return
         session = self.store.get_session(turn["sessionId"])
+        if session["backend"] == "codex":
+            self._run_codex_app_server_turn(turn, session)
+            return
         messages = _StreamMessages(self, session["id"], turn_id)
         process: subprocess.Popen[str] | None = None
         stderr_thread: threading.Thread | None = None
@@ -751,7 +796,7 @@ class JobManager:
             process = subprocess.Popen(
                 command,
                 cwd=session["cwd"],
-                stdin=subprocess.PIPE if session["backend"] == "codex" else subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -778,10 +823,6 @@ class JobManager:
             )
             stderr_thread.start()
 
-            if session["backend"] == "codex" and process.stdin is not None:
-                process.stdin.write(turn["prompt"])
-                process.stdin.close()
-
             assert process.stdout is not None
             for raw_line in process.stdout:
                 line = raw_line.strip()
@@ -792,10 +833,7 @@ class JobManager:
                 except json.JSONDecodeError:
                     stderr_parts.append(line)
                     continue
-                if session["backend"] == "codex":
-                    result = self._handle_codex_event(session, turn_id, event)
-                else:
-                    result = self._handle_grok_event(session, turn_id, messages, event)
+                result = self._handle_grok_event(session, turn_id, messages, event)
                 if result.get("stopReason") is not None:
                     stop_reason = result["stopReason"]
                 if result.get("error"):
@@ -805,8 +843,7 @@ class JobManager:
 
             return_code = process.wait()
             stderr_thread.join(timeout=1.0)
-            if session["backend"] == "grok":
-                messages.complete()
+            messages.complete()
             cancelled = self.store.cancellation_requested(turn_id)
             if cancelled:
                 self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
@@ -816,15 +853,12 @@ class JobManager:
                 error = self._stderr_message(stderr_parts, return_code)
                 self.store.finish_turn(turn_id, "failed", stop_reason="failed", error=error)
             else:
-                if session["backend"] == "grok":
-                    self._finalize_grok_command(
-                        session["id"],
-                        turn_id,
-                        turn["prompt"],
-                        compact_completed,
-                    )
-                else:
-                    self._refresh_codex_thread_metadata(session["id"])
+                self._finalize_grok_command(
+                    session["id"],
+                    turn_id,
+                    turn["prompt"],
+                    compact_completed,
+                )
                 self.store.finish_turn(turn_id, "completed", stop_reason=stop_reason or "completed")
             self.notify(session["id"])
         except FileNotFoundError as error:
@@ -836,8 +870,7 @@ class JobManager:
             )
             self.notify(session["id"])
         except Exception as error:  # Keep the daemon alive and persist every worker failure.
-            if session["backend"] == "grok":
-                messages.flush()
+            messages.flush()
             if self.store.cancellation_requested(turn_id):
                 self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
             else:
@@ -873,6 +906,572 @@ class JobManager:
                 except FileNotFoundError:
                     pass
 
+    def _run_codex_app_server_turn(
+        self,
+        turn: dict[str, Any],
+        session: dict[str, Any],
+    ) -> None:
+        turn_id = turn["id"]
+        process: subprocess.Popen[str] | None = None
+        control: _CodexTurnControl | None = None
+        stderr_thread: threading.Thread | None = None
+        stderr_parts: list[str] = []
+        state: dict[str, Any] = {
+            "threadId": str(session.get("backendSessionId") or ""),
+            "turnId": "",
+            "terminal": False,
+            "turnStatus": None,
+            "stopReason": None,
+            "error": None,
+            "tools": {},
+            "reasoningIndexes": {},
+        }
+        try:
+            process = subprocess.Popen(
+                [self.codex_bin, "app-server"],
+                cwd=session["cwd"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            control = _CodexTurnControl(process)
+            with self._lock:
+                self._processes[turn_id] = process
+                self._codex_controls[turn_id] = control
+            if not self.store.mark_turn_running(turn_id, process.pid):
+                return
+            self.notify(session["id"])
+
+            stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(process, stderr_parts),
+                name=f"stderr-{turn_id[:8]}",
+                daemon=True,
+            )
+            stderr_thread.start()
+
+            control.send(
+                {
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {
+                            "name": "agentremote_host",
+                            "title": "AgentRemote durable host",
+                            "version": "1",
+                        }
+                    },
+                }
+            )
+            self._wait_for_codex_response(
+                process, control, session, turn_id, state, 1, "initialize", stderr_parts
+            )
+            control.send({"method": "initialized", "params": {}})
+
+            thread_method = "thread/resume" if state["threadId"] else "thread/start"
+            thread_params = self._codex_thread_params(session)
+            if state["threadId"]:
+                thread_params["threadId"] = state["threadId"]
+            control.send(
+                {
+                    "id": 2,
+                    "method": thread_method,
+                    "params": thread_params,
+                }
+            )
+            thread_result = self._wait_for_codex_response(
+                process,
+                control,
+                session,
+                turn_id,
+                state,
+                2,
+                thread_method,
+                stderr_parts,
+            )
+            thread = thread_result.get("thread")
+            backend_thread_id = str(thread.get("id") if isinstance(thread, dict) else "").strip()
+            if not backend_thread_id:
+                raise StoreError(f"Codex app-server {thread_method} returned no thread id")
+            state["threadId"] = backend_thread_id
+            if backend_thread_id != session.get("backendSessionId"):
+                self.store.set_backend_session_id(session["id"], backend_thread_id)
+                self.notify(session["id"])
+            self._merge_codex_thread_result(session, thread_result)
+
+            control.send(
+                {
+                    "id": 3,
+                    "method": "turn/start",
+                    "params": self._codex_turn_params(session, turn, backend_thread_id),
+                }
+            )
+            turn_result = self._wait_for_codex_response(
+                process,
+                control,
+                session,
+                turn_id,
+                state,
+                3,
+                "turn/start",
+                stderr_parts,
+            )
+            backend_turn = turn_result.get("turn")
+            backend_turn_id = str(
+                backend_turn.get("id") if isinstance(backend_turn, dict) else ""
+            ).strip()
+            if not backend_turn_id:
+                raise StoreError("Codex app-server turn/start returned no turn id")
+            state["turnId"] = backend_turn_id
+            control.set_active_turn(backend_thread_id, backend_turn_id)
+
+            while not state["terminal"]:
+                message = self._read_codex_message(process, stderr_parts)
+                self._handle_codex_app_server_message(
+                    control, session, turn_id, state, message
+                )
+
+            cancelled = self.store.cancellation_requested(turn_id) or state["turnStatus"] in {
+                "interrupted",
+                "cancelled",
+            }
+            if cancelled:
+                self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
+            elif state["error"] or state["turnStatus"] == "failed":
+                error = str(state["error"] or "Codex turn failed.")
+                self.store.finish_turn(turn_id, "failed", stop_reason="failed", error=error)
+            else:
+                self._refresh_codex_thread_metadata(session["id"])
+                self.store.finish_turn(
+                    turn_id,
+                    "completed",
+                    stop_reason=str(state["stopReason"] or "completed"),
+                )
+            self.notify(session["id"])
+        except FileNotFoundError as error:
+            self.store.finish_turn(
+                turn_id,
+                "failed",
+                stop_reason="runner_missing",
+                error=f"Agent executable not found: {error.filename}",
+            )
+            self.notify(session["id"])
+        except Exception as error:  # Keep the daemon alive and preserve cancellation intent.
+            if self.store.cancellation_requested(turn_id):
+                self.store.finish_turn(turn_id, "cancelled", stop_reason="cancelled")
+            else:
+                self.store.finish_turn(
+                    turn_id,
+                    "failed",
+                    stop_reason="host_error",
+                    error=f"Host worker error: {error}",
+                )
+            self.notify(session["id"])
+        finally:
+            with self._lock:
+                self._codex_controls.pop(turn_id, None)
+                self._processes.pop(turn_id, None)
+            if process is not None:
+                if process.poll() is None:
+                    self._signal_process(process, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        self._signal_process(process, signal.SIGKILL)
+                        process.wait(timeout=2.0)
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=1.0)
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+    @staticmethod
+    def _codex_thread_params(session: dict[str, Any]) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "cwd": session["cwd"],
+            "approvalPolicy": CODEX_APPROVAL_POLICY,
+            "sandbox": (
+                CODEX_FULL_ACCESS_MODE
+                if session.get("codexFullAccess", True)
+                else CODEX_SANDBOX_MODE
+            ),
+        }
+        if session.get("modelOverride"):
+            params["model"] = session["modelOverride"]
+        return params
+
+    @staticmethod
+    def _codex_turn_params(
+        session: dict[str, Any],
+        turn: dict[str, Any],
+        backend_thread_id: str,
+    ) -> dict[str, Any]:
+        inputs: list[dict[str, Any]] = []
+        if turn["prompt"]:
+            inputs.append({"type": "text", "text": turn["prompt"]})
+        inputs.extend(
+            {"type": "localImage", "path": attachment["path"]}
+            for attachment in turn["attachments"]
+        )
+        full_access = bool(session.get("codexFullAccess", True))
+        sandbox_policy: dict[str, Any]
+        if full_access:
+            sandbox_policy = {"type": "dangerFullAccess"}
+        else:
+            sandbox_policy = {
+                "type": "workspaceWrite",
+                "writableRoots": [session["cwd"]],
+                "networkAccess": True,
+            }
+        params: dict[str, Any] = {
+            "threadId": backend_thread_id,
+            "input": inputs,
+            "cwd": session["cwd"],
+            "approvalPolicy": CODEX_APPROVAL_POLICY,
+            "sandboxPolicy": sandbox_policy,
+        }
+        if session.get("modelOverride"):
+            params["model"] = session["modelOverride"]
+            if session.get("reasoningEffort"):
+                params["effort"] = session["reasoningEffort"]
+        return params
+
+    def _wait_for_codex_response(
+        self,
+        process: subprocess.Popen[str],
+        control: _CodexTurnControl,
+        session: dict[str, Any],
+        turn_id: str,
+        state: dict[str, Any],
+        request_id: int,
+        method: str,
+        stderr_parts: list[str],
+    ) -> dict[str, Any]:
+        while True:
+            message = self._read_codex_message(process, stderr_parts)
+            if message.get("id") == request_id and "method" not in message:
+                error = message.get("error")
+                if error:
+                    detail = _text(error.get("message") if isinstance(error, dict) else error)
+                    raise StoreError(
+                        f"Codex app-server {method} failed: {detail or 'unknown error'}"
+                    )
+                result = message.get("result")
+                return result if isinstance(result, dict) else {}
+            self._handle_codex_app_server_message(control, session, turn_id, state, message)
+
+    @staticmethod
+    def _read_codex_message(
+        process: subprocess.Popen[str],
+        stderr_parts: list[str],
+    ) -> dict[str, Any]:
+        assert process.stdout is not None
+        while True:
+            raw_line = process.stdout.readline()
+            if raw_line == "":
+                return_code = process.poll()
+                detail = "\n".join(stderr_parts)[-MAX_DETAIL_CHARS:].strip()
+                suffix = f": {detail}" if detail else ""
+                raise StoreError(
+                    f"Codex app-server closed before the turn completed "
+                    f"(status {return_code if return_code is not None else 'unknown'}){suffix}"
+                )
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                stderr_parts.append(line)
+                continue
+            if isinstance(value, dict):
+                return value
+
+    def _handle_codex_app_server_message(
+        self,
+        control: _CodexTurnControl,
+        session: dict[str, Any],
+        turn_id: str,
+        state: dict[str, Any],
+        message: dict[str, Any],
+    ) -> None:
+        method = str(message.get("method") or "")
+        if not method:
+            return
+        params = message.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        if "id" in message:
+            self._respond_to_codex_server_request(
+                control, session, turn_id, method, message["id"], params
+            )
+            return
+
+        event_thread_id = str(params.get("threadId") or "")
+        if state["threadId"] and event_thread_id and event_thread_id != state["threadId"]:
+            return
+        if method == "thread/started":
+            thread = params.get("thread")
+            backend_id = str(thread.get("id") if isinstance(thread, dict) else "").strip()
+            if backend_id:
+                state["threadId"] = backend_id
+        elif method == "turn/started":
+            turn = params.get("turn")
+            backend_turn_id = str(turn.get("id") if isinstance(turn, dict) else "").strip()
+            if backend_turn_id:
+                state["turnId"] = backend_turn_id
+                control.set_active_turn(str(state["threadId"]), backend_turn_id)
+        elif method in {"item/started", "item/completed"}:
+            item = params.get("item")
+            if isinstance(item, dict):
+                self._handle_codex_app_item(
+                    session,
+                    turn_id,
+                    item,
+                    completed=method == "item/completed",
+                    state=state,
+                )
+        elif method == "item/agentMessage/delta":
+            self._append_codex_message_delta(session, turn_id, params, "assistant")
+        elif method == "item/reasoning/summaryTextDelta":
+            source_id = str(params.get("itemId") or "").strip()
+            delta = str(params.get("delta") or "")
+            summary_index = params.get("summaryIndex")
+            previous_index = state["reasoningIndexes"].get(source_id)
+            if source_id and previous_index is not None and previous_index != summary_index:
+                delta = "\n" + delta
+            if source_id:
+                state["reasoningIndexes"][source_id] = summary_index
+            self._append_codex_message_delta(
+                session, turn_id, {**params, "delta": delta}, "thought"
+            )
+        elif method == "item/plan/delta":
+            self._append_codex_message_delta(session, turn_id, params, "thought")
+        elif method in {
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+        }:
+            self._append_codex_tool_delta(session, turn_id, method, params, state)
+        elif method == "thread/tokenUsage/updated":
+            token_usage = params.get("tokenUsage")
+            if isinstance(token_usage, dict):
+                latest = token_usage.get("last")
+                usage = {
+                    "usedTokens": (
+                        latest.get("totalTokens") if isinstance(latest, dict) else None
+                    ),
+                    "contextWindowTokens": token_usage.get("modelContextWindow"),
+                }
+                if any(value is not None for value in usage.values()):
+                    self.store.update_usage(session["id"], usage)
+                    self.notify(session["id"])
+        elif method == "error":
+            error = params.get("error")
+            if not params.get("willRetry"):
+                state["error"] = (
+                    _text(error.get("message") if isinstance(error, dict) else error)
+                    or "Codex turn failed."
+                )
+        elif method == "turn/completed":
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                for item in turn.get("items") or []:
+                    if isinstance(item, dict):
+                        self._handle_codex_app_item(
+                            session, turn_id, item, completed=True, state=state
+                        )
+                status = str(turn.get("status") or "completed")
+                error = turn.get("error")
+                if status == "failed" and not state["error"]:
+                    state["error"] = (
+                        _text(error.get("message") if isinstance(error, dict) else error)
+                        or "Codex turn failed."
+                    )
+                state["turnStatus"] = status
+                state["stopReason"] = "cancelled" if status == "interrupted" else status
+            else:
+                state["turnStatus"] = "completed"
+                state["stopReason"] = "completed"
+            state["terminal"] = True
+
+    def _respond_to_codex_server_request(
+        self,
+        control: _CodexTurnControl,
+        session: dict[str, Any],
+        turn_id: str,
+        method: str,
+        request_id: Any,
+        params: dict[str, Any],
+    ) -> None:
+        if method in {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        }:
+            result: dict[str, Any] = {"decision": "decline"}
+        elif method in {"applyPatchApproval", "execCommandApproval"}:
+            result = {"decision": "denied"}
+        elif method == "item/permissions/requestApproval":
+            result = {"permissions": {}, "scope": "turn"}
+        elif method == "item/tool/requestUserInput":
+            source_id = str(params.get("itemId") or "").strip()
+            if source_id:
+                changed = self.store.upsert_tool(
+                    session["id"],
+                    turn_id,
+                    f"{turn_id}:{source_id}",
+                    "Interactive input requested",
+                    "declined",
+                    "userInput",
+                    "AgentRemote does not support interactive question forms yet.",
+                )
+                if changed:
+                    self.notify(session["id"])
+            result = {"answers": {}}
+        elif method == "mcpServer/elicitation/request":
+            result = {"action": "decline"}
+        elif method == "currentTime/read":
+            result = {"currentTimeAt": int(time.time())}
+        else:
+            control.send(
+                {
+                    "id": request_id,
+                    "error": {"code": -32601, "message": "Unsupported client request"},
+                }
+            )
+            return
+        control.send({"id": request_id, "result": result})
+
+    def _append_codex_message_delta(
+        self,
+        session: dict[str, Any],
+        turn_id: str,
+        params: dict[str, Any],
+        role: str,
+    ) -> None:
+        source_id = str(params.get("itemId") or "").strip()
+        delta = str(params.get("delta") or "")
+        if not source_id or not delta:
+            return
+        self.store.append_message_delta(
+            session["id"], turn_id, f"{turn_id}:{source_id}", role, delta
+        )
+        self.notify(session["id"])
+
+    def _append_codex_tool_delta(
+        self,
+        session: dict[str, Any],
+        turn_id: str,
+        method: str,
+        params: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        source_id = str(params.get("itemId") or "").strip()
+        delta = str(params.get("delta") or "")
+        if not source_id or not delta:
+            return
+        default_kind = "commandExecution" if "commandExecution" in method else "fileChange"
+        default_title = "Command" if default_kind == "commandExecution" else "Applying file changes"
+        tool = state["tools"].setdefault(
+            source_id,
+            {"title": default_title, "kind": default_kind, "detail": ""},
+        )
+        tool["detail"] = (str(tool.get("detail") or "") + delta)[-MAX_DETAIL_CHARS:]
+        changed = self.store.upsert_tool(
+            session["id"],
+            turn_id,
+            f"{turn_id}:{source_id}",
+            str(tool["title"]),
+            "in_progress",
+            str(tool["kind"]),
+            str(tool["detail"]),
+        )
+        if changed:
+            self.notify(session["id"])
+
+    def _handle_codex_app_item(
+        self,
+        session: dict[str, Any],
+        turn_id: str,
+        item: dict[str, Any],
+        completed: bool,
+        state: dict[str, Any],
+    ) -> None:
+        item_type = str(item.get("type") or "")
+        source_id = str(item.get("id") or "").strip()
+        if not item_type or not source_id or item_type in {"userMessage", "hookPrompt"}:
+            return
+        message_id = f"{turn_id}:{source_id}"
+        if item_type in {"agentMessage", "reasoning", "plan"}:
+            role = "assistant" if item_type == "agentMessage" else "thought"
+            if item_type == "agentMessage":
+                text = _text(item.get("text"))
+            elif item_type == "reasoning":
+                text = _text(item.get("summary"))
+            else:
+                text = _text(item.get("text"))
+            if text:
+                changed = self.store.upsert_message_snapshot(
+                    session["id"], turn_id, message_id, role, text, completed
+                )
+            elif completed:
+                changed = self.store.complete_message(message_id)
+            else:
+                changed = False
+            if changed:
+                self.notify(session["id"])
+            return
+
+        title, detail = self._codex_tool(item_type, item)
+        cached = state["tools"].get(source_id) or {}
+        if not detail:
+            detail = str(cached.get("detail") or "") or None
+        status = self._normalize_codex_status(
+            str(item.get("status") or ("completed" if completed else "inProgress"))
+        )
+        state["tools"][source_id] = {
+            "title": title,
+            "kind": item_type,
+            "detail": detail or "",
+        }
+        changed = self.store.upsert_tool(
+            session["id"],
+            turn_id,
+            message_id,
+            title,
+            status,
+            item_type,
+            detail,
+        )
+        if changed:
+            self.notify(session["id"])
+
+    def _merge_codex_thread_result(
+        self,
+        session: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        model_id = str(result.get("model") or "").strip() or None
+        effort = str(result.get("reasoningEffort") or "").strip() or None
+        usage: dict[str, Any] = {}
+        if model_id:
+            usage["modelId"] = model_id
+            usage["modelName"] = (
+                session.get("modelName")
+                if session.get("modelOverride") == model_id and session.get("modelName")
+                else model_id
+            )
+        if effort and not session.get("modelOverride"):
+            usage["reasoningEffort"] = effort
+        if usage:
+            self.store.update_usage(session["id"], usage)
+            self.notify(session["id"])
+
     @staticmethod
     def _drain_stderr(process: subprocess.Popen[str], target: list[str]) -> None:
         if process.stderr is None:
@@ -893,86 +1492,17 @@ class JobManager:
         detail = "\n".join(parts)[-MAX_DETAIL_CHARS:].strip()
         return detail or f"Agent process exited with status {return_code}."
 
-    def _handle_codex_event(
-        self,
-        session: dict[str, Any],
-        turn_id: str,
-        event: dict[str, Any],
-    ) -> dict[str, Any]:
-        event_type = event.get("type", "")
-        if event_type == "thread.started":
-            backend_id = str(event.get("thread_id") or "")
-            self.store.set_backend_session_id(session["id"], backend_id)
-            self.notify(session["id"])
-        elif event_type in {"item.started", "item.updated", "item.completed"}:
-            item = event.get("item") or {}
-            item_type = str(item.get("type") or "")
-            source_item_id = str(item.get("id") or "").strip()
-            completed = event_type == "item.completed"
-            # Codex defines each item as a distinct ordered unit. Keep its
-            # backend id all the way into durable storage so progress messages,
-            # tools, and the final answer replay in exactly the emitted order.
-            if item_type in {"agent_message", "reasoning", "plan"}:
-                if not source_item_id and not completed:
-                    return {"stopReason": None, "error": None}
-                item_id = f"{turn_id}:{source_item_id or uuid.uuid4()}"
-                role = "assistant" if item_type == "agent_message" else "thought"
-                text = _text(
-                    item.get("text")
-                    if item_type == "agent_message"
-                    else item.get("text") or item.get("summary")
-                )
-                if text:
-                    changed = self.store.upsert_message_snapshot(
-                        session["id"],
-                        turn_id,
-                        item_id,
-                        role,
-                        text,
-                        completed=completed,
-                    )
-                elif completed:
-                    changed = self.store.complete_message(item_id)
-                else:
-                    changed = False
-                if changed:
-                    self.notify(session["id"])
-            elif item_type:
-                item_id = f"{turn_id}:{source_item_id or uuid.uuid4()}"
-                title, detail = self._codex_tool(item_type, item)
-                changed = self.store.upsert_tool(
-                    session["id"],
-                    turn_id,
-                    item_id,
-                    title,
-                    str(item.get("status") or ("completed" if completed else "in_progress")),
-                    item_type,
-                    detail,
-                )
-                if changed:
-                    self.notify(session["id"])
-        elif event_type == "turn.completed":
-            usage = event.get("usage") or {}
-            if usage:
-                self.store.update_usage(session["id"], usage)
-                self.notify(session["id"])
-            return {"stopReason": "completed", "error": None}
-        elif event_type in {"turn.failed", "error"}:
-            message = _text(event.get("message") or event.get("error")) or "Codex turn failed."
-            return {"stopReason": "failed", "error": message}
-        return {"stopReason": None, "error": None}
-
     @staticmethod
     def _codex_tool(item_type: str, item: dict[str, Any]) -> tuple[str, str | None]:
-        if item_type == "command_execution":
+        if item_type == "commandExecution":
             command = _text(item.get("command")) or "Command"
-            output = _text(item.get("aggregated_output") or item.get("output"))
-            exit_code = item.get("exit_code")
+            output = _text(item.get("aggregatedOutput") or item.get("output"))
+            exit_code = item.get("exitCode")
             detail = output
             if exit_code is not None:
                 detail = (detail + f"\nexit code: {exit_code}").strip()
             return command[:300], detail[-MAX_DETAIL_CHARS:] or None
-        if item_type == "file_change":
+        if item_type == "fileChange":
             changes = item.get("changes") or []
             detail = "\n".join(
                 f"{change.get('kind', 'update')} · {change.get('path', '')}"
@@ -980,14 +1510,36 @@ class JobManager:
                 if isinstance(change, dict)
             )
             return "File changes", detail[-MAX_DETAIL_CHARS:] or None
-        if item_type in {"mcp_tool_call", "dynamic_tool_call"}:
-            title = _text(item.get("tool") or item.get("name")) or "Tool call"
-        elif item_type == "web_search":
+        if item_type == "mcpToolCall":
+            title = " · ".join(
+                part for part in (_text(item.get("server")), _text(item.get("tool"))) if part
+            ) or "MCP tool"
+        elif item_type == "dynamicToolCall":
+            title = _text(item.get("tool")) or "Tool call"
+        elif item_type == "collabAgentToolCall":
+            title = _text(item.get("tool")) or "Agent task"
+        elif item_type == "webSearch":
             title = f"Search · {_text(item.get('query'))}".rstrip(" ·")
+        elif item_type == "imageView":
+            title = "View image"
+        elif item_type == "imageGeneration":
+            title = "Image generation"
         else:
-            title = item_type.replace("_", " ").title()
+            title = re.sub(r"(?<!^)(?=[A-Z])", " ", item_type).title()
         detail = json.dumps(item, ensure_ascii=False, indent=2)[-MAX_DETAIL_CHARS:]
         return title[:300], detail
+
+    @staticmethod
+    def _normalize_codex_status(status: str) -> str:
+        return {
+            "inProgress": "in_progress",
+            "pending": "pending",
+            "completed": "completed",
+            "failed": "failed",
+            "declined": "declined",
+            "interrupted": "cancelled",
+            "cancelled": "cancelled",
+        }.get(status, status or "in_progress")
 
     def _handle_grok_event(
         self,

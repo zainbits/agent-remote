@@ -200,6 +200,18 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
                 )
                 self._send(HTTPStatus.OK, {"session": session})
                 return
+            if (
+                len(route) == 5
+                and route[:3] == ["api", "v1", "sessions"]
+                and route[4] == "reasoning-effort"
+            ):
+                body = self._json_body()
+                session = self.server.manager.select_reasoning_effort(
+                    route[3],
+                    str(body.get("reasoningEffort") or ""),
+                )
+                self._send(HTTPStatus.OK, {"session": session})
+                return
             if len(route) == 5 and route[:3] == ["api", "v1", "sessions"] and route[4] == "cancel":
                 self._json_body()
                 cancelled = self.server.manager.cancel_session(route[3])

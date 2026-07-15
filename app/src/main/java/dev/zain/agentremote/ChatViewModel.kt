@@ -1336,6 +1336,47 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun selectReasoningEffort(reasoningEffort: String) {
+        val state = _ui.value
+        val currentModel = state.modelOptions.firstOrNull { it.id == state.usage.modelId }
+        if (state.connection !is ConnectionState.Connected ||
+            state.busy ||
+            state.requestInFlight ||
+            state.modelSelectionBusy ||
+            reasoningEffort == state.usage.reasoningEffort ||
+            reasoningEffort !in currentModel?.reasoningEfforts.orEmpty()
+        ) {
+            return
+        }
+        val selectedBackend = activeBackendKind
+        _ui.update { it.copy(modelSelectionBusy = true) }
+        viewModelScope.launch {
+            runCatching {
+                durableBackend(selectedBackend).selectReasoningEffort(reasoningEffort)
+            }.onSuccess { usage ->
+                if (selectedBackend != activeBackendKind) return@onSuccess
+                _ui.update { current ->
+                    current.copy(
+                        modelSelectionBusy = false,
+                        usage = current.usage.copy(
+                            modelId = usage.modelId,
+                            modelName = usage.modelName,
+                            reasoningEffort = usage.reasoningEffort,
+                            contextWindowTokens = usage.contextWindowTokens,
+                        ),
+                    )
+                }
+            }.onFailure { error ->
+                if (selectedBackend != activeBackendKind) return@onFailure
+                _ui.update { it.copy(modelSelectionBusy = false) }
+                pushSystem(
+                    "Couldn't change reasoning effort: " +
+                        (error.message ?: error::class.java.simpleName),
+                )
+            }
+        }
+    }
+
     private fun refreshModelOptions() {
         val selectedBackend = activeBackendKind
         viewModelScope.launch {

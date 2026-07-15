@@ -48,13 +48,141 @@ if sys.argv[1:3] == ["debug", "models"]:
     raise SystemExit(0)
 
 if "app-server" in sys.argv:
+    active_turn = None
+    pending_approval = None
+
+    def emit(value):
+        print(json.dumps(value), flush=True)
+
+    def completed_turn(thread_id, turn_id, status="completed", error=None):
+        turn = {"id": turn_id, "items": [], "status": status}
+        if error is not None:
+            turn["error"] = {"message": error}
+        emit({"method": "turn/completed", "params": {"threadId": thread_id, "turn": turn}})
+
+    def finish_prompt(thread_id, turn_id, prompt):
+        if "INTERLEAVED" in prompt:
+            emit({"method": "item/completed", "params": {
+                "threadId": thread_id, "turnId": turn_id, "item": {
+                    "id": "commentary", "type": "agentMessage", "text": "checking first"
+                }
+            }})
+            emit({"method": "item/started", "params": {
+                "threadId": thread_id, "turnId": turn_id, "item": {
+                    "id": "tool", "type": "commandExecution", "command": "test command",
+                    "aggregatedOutput": "", "status": "inProgress"
+                }
+            }})
+            emit({"method": "item/commandExecution/outputDelta", "params": {
+                "threadId": thread_id, "turnId": turn_id, "itemId": "tool", "delta": "done"
+            }})
+            emit({"method": "item/completed", "params": {
+                "threadId": thread_id, "turnId": turn_id, "item": {
+                    "id": "tool", "type": "commandExecution", "command": "test command",
+                    "aggregatedOutput": "done", "exitCode": 0, "status": "completed"
+                }
+            }})
+            emit({"method": "item/started", "params": {
+                "threadId": thread_id, "turnId": turn_id,
+                "item": {"id": "final", "type": "agentMessage", "text": ""}
+            }})
+            for delta in ("final ", "answer"):
+                emit({"method": "item/agentMessage/delta", "params": {
+                    "threadId": thread_id, "turnId": turn_id,
+                    "itemId": "final", "delta": delta
+                }})
+            emit({"method": "item/completed", "params": {
+                "threadId": thread_id, "turnId": turn_id,
+                "item": {"id": "final", "type": "agentMessage", "text": "final answer"}
+            }})
+        else:
+            text = "approval-declined" if "REQUEST_APPROVAL" in prompt else "codex-result"
+            emit({"method": "item/started", "params": {
+                "threadId": thread_id, "turnId": turn_id,
+                "item": {"id": "agent", "type": "agentMessage", "text": ""}
+            }})
+            midpoint = max(1, len(text) // 2)
+            for delta in (text[:midpoint], text[midpoint:]):
+                if delta:
+                    emit({"method": "item/agentMessage/delta", "params": {
+                        "threadId": thread_id, "turnId": turn_id,
+                        "itemId": "agent", "delta": delta
+                    }})
+            emit({"method": "item/completed", "params": {
+                "threadId": thread_id, "turnId": turn_id,
+                "item": {"id": "agent", "type": "agentMessage", "text": text}
+            }})
+        emit({"method": "thread/tokenUsage/updated", "params": {
+            "threadId": thread_id, "turnId": turn_id,
+            "tokenUsage": {
+                "last": {"totalTokens": 14},
+                "total": {"totalTokens": 14},
+                "modelContextWindow": 4096
+            }
+        }})
+        completed_turn(thread_id, turn_id)
+
     for line in sys.stdin:
         request = json.loads(line)
         request_id = request.get("id")
+        method = request.get("method")
+        if method is None:
+            if pending_approval is not None and request_id == pending_approval[0]:
+                _, thread_id, turn_id, prompt = pending_approval
+                finish_prompt(thread_id, turn_id, prompt)
+                pending_approval = None
+            continue
         if request_id is None:
             continue
-        method = request.get("method")
-        if method == "thread/read":
+        if method == "initialize":
+            result = {"userAgent": "fake-codex"}
+        elif method == "thread/start":
+            result = {
+                "thread": {"id": "codex-thread-test", "cwd": os.getcwd(), "turns": []},
+                "model": request.get("params", {}).get("model") or "gpt-test",
+                "reasoningEffort": "high",
+            }
+        elif method == "thread/resume":
+            thread_id = request.get("params", {}).get("threadId")
+            result = {
+                "thread": {"id": thread_id, "cwd": os.getcwd(), "turns": []},
+                "model": request.get("params", {}).get("model") or "gpt-test",
+                "reasoningEffort": "high",
+            }
+        elif method == "turn/start":
+            params = request.get("params", {})
+            thread_id = params.get("threadId")
+            turn_id = "codex-turn-test"
+            prompt = "\n".join(
+                item.get("text", "") for item in params.get("input", [])
+                if item.get("type") == "text"
+            )
+            emit({"id": request_id, "result": {
+                "turn": {"id": turn_id, "items": [], "status": "inProgress"}
+            }})
+            emit({"method": "turn/started", "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "items": [], "status": "inProgress"}
+            }})
+            if "WAIT_FOR_CANCEL" in prompt:
+                active_turn = (thread_id, turn_id)
+            elif "REQUEST_APPROVAL" in prompt:
+                pending_approval = (700, thread_id, turn_id, prompt)
+                emit({"id": 700, "method": "item/commandExecution/requestApproval", "params": {
+                    "threadId": thread_id, "turnId": turn_id, "itemId": "approval"
+                }})
+            else:
+                if "SLOW" in prompt:
+                    time.sleep(0.4)
+                finish_prompt(thread_id, turn_id, prompt)
+            continue
+        elif method == "turn/interrupt":
+            emit({"id": request_id, "result": {}})
+            if active_turn is not None:
+                completed_turn(active_turn[0], active_turn[1], status="interrupted")
+                active_turn = None
+            continue
+        elif method == "thread/read":
             result = {"thread": {
                 "id": request.get("params", {}).get("threadId"),
                 "cliVersion": "0.test",
@@ -75,44 +203,8 @@ if "app-server" in sys.argv:
             }, "rateLimitResetCredits": {"availableCount": 2, "credits": []}}
         else:
             result = {}
-        print(json.dumps({"id": request_id, "result": result}), flush=True)
+        emit({"id": request_id, "result": result})
     raise SystemExit(0)
-
-prompt = sys.stdin.read()
-print(json.dumps({"type": "thread.started", "thread_id": "codex-thread-test"}), flush=True)
-print(json.dumps({"type": "turn.started"}), flush=True)
-if "WAIT_FOR_CANCEL" in prompt:
-    time.sleep(30)
-if "SLOW" in prompt:
-    time.sleep(0.4)
-if "INTERLEAVED" in prompt:
-    print(json.dumps({"type": "item.completed", "item": {
-        "id": "commentary", "type": "agent_message", "text": "checking first"
-    }}), flush=True)
-    print(json.dumps({"type": "item.started", "item": {
-        "id": "tool", "type": "command_execution", "command": "test command",
-        "status": "in_progress"
-    }}), flush=True)
-    print(json.dumps({"type": "item.completed", "item": {
-        "id": "tool", "type": "command_execution", "command": "test command",
-        "aggregated_output": "done", "exit_code": 0, "status": "completed"
-    }}), flush=True)
-    print(json.dumps({"type": "item.started", "item": {
-        "id": "final", "type": "agent_message", "text": "final "
-    }}), flush=True)
-    print(json.dumps({"type": "item.updated", "item": {
-        "id": "final", "type": "agent_message", "text": "final answer"
-    }}), flush=True)
-    print(json.dumps({"type": "item.completed", "item": {
-        "id": "final", "type": "agent_message", "text": "final answer"
-    }}), flush=True)
-else:
-    print(json.dumps({"type": "item.completed", "item": {
-        "id": "agent", "type": "agent_message", "text": "codex-result"
-    }}), flush=True)
-print(json.dumps({"type": "turn.completed", "usage": {
-    "input_tokens": 10, "output_tokens": 4
-}}), flush=True)
 '''
 
 
@@ -281,6 +373,7 @@ class DurableJobsTest(unittest.TestCase):
             [
                 ("message.delta", "checking first"),
                 ("tool.updated", "in_progress"),
+                ("tool.updated", "in_progress"),
                 ("tool.updated", "completed"),
                 ("message.delta", "final "),
                 ("message.delta", "answer"),
@@ -358,7 +451,7 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("grok-result", bundle["messages"][-1]["text"])
         self.assertEqual(["user", "thought", "assistant"], [m["role"] for m in bundle["messages"]])
 
-    def test_images_are_durable_and_mapped_to_backend_commands(self):
+    def test_images_are_durable_and_mapped_to_app_server_turn_input(self):
         session = self.manager.create_session("codex", str(self.workspace))
         image_bytes = b"\x89PNG\r\n\x1a\n" + b"test-image"
         attachment = self.manager.upload_attachment(
@@ -370,10 +463,8 @@ class DurableJobsTest(unittest.TestCase):
         )
 
         turn = self.store.create_turn(session["id"], "", [attachment["id"]])
-        command = self.manager._command(
-            session,
-            turn["prompt"],
-            attachments=turn["attachments"],
+        turn_params = self.manager._codex_turn_params(
+            session, turn, "codex-thread-test"
         )
         bundle = self.store.session_bundle(session["id"])
         event = next(
@@ -387,7 +478,7 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("screen.png", event["data"]["attachments"][0]["fileName"])
         self.assertEqual(
             turn["attachments"][0]["path"],
-            command[command.index("--image") + 1],
+            next(item["path"] for item in turn_params["input"] if item["type"] == "localImage"),
         )
         self.assertTrue(Path(turn["attachments"][0]["path"]).is_file())
 
@@ -474,14 +565,19 @@ class DurableJobsTest(unittest.TestCase):
     def test_codex_workers_default_to_full_access_for_new_and_resumed_turns(self):
         session = self.manager.create_session("codex", str(self.workspace))
         new_command = self.manager._command(session, "first")
+        thread_params = self.manager._codex_thread_params(session)
+        turn = {"prompt": "first", "attachments": []}
+        turn_params = self.manager._codex_turn_params(session, turn, "new-thread")
         self.assertTrue(session["codexFullAccess"])
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", new_command)
-        self.assertNotIn("sandbox_workspace_write.network_access=true", new_command)
+        self.assertEqual([str(self.codex), "app-server"], new_command)
+        self.assertEqual("danger-full-access", thread_params["sandbox"])
+        self.assertEqual("never", thread_params["approvalPolicy"])
+        self.assertEqual({"type": "dangerFullAccess"}, turn_params["sandboxPolicy"])
 
         self.store.set_backend_session_id(session["id"], "existing-thread")
-        resumed = self.manager._command(self.store.get_session(session["id"]), "next")
-        self.assertIn("resume", resumed)
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", resumed)
+        resumed_session = self.store.get_session(session["id"])
+        resumed = self.manager._codex_thread_params(resumed_session)
+        self.assertEqual("danger-full-access", resumed["sandbox"])
 
     def test_codex_workers_can_opt_out_to_networked_workspace_sandbox(self):
         session = self.manager.create_session(
@@ -489,17 +585,24 @@ class DurableJobsTest(unittest.TestCase):
             str(self.workspace),
             codex_full_access=False,
         )
-        new_command = self.manager._command(session, "first")
+        thread_params = self.manager._codex_thread_params(session)
+        turn_params = self.manager._codex_turn_params(
+            session, {"prompt": "first", "attachments": []}, "new-thread"
+        )
         self.assertFalse(session["codexFullAccess"])
-        self.assertIn("sandbox_workspace_write.network_access=true", new_command)
-        self.assertIn('sandbox_mode="workspace-write"', new_command)
-        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", new_command)
+        self.assertEqual("workspace-write", thread_params["sandbox"])
+        self.assertEqual("never", thread_params["approvalPolicy"])
+        self.assertEqual("workspaceWrite", turn_params["sandboxPolicy"]["type"])
+        self.assertTrue(turn_params["sandboxPolicy"]["networkAccess"])
+        self.assertEqual([str(self.workspace)], turn_params["sandboxPolicy"]["writableRoots"])
 
         self.store.set_backend_session_id(session["id"], "existing-thread")
-        resumed = self.manager._command(self.store.get_session(session["id"]), "next")
-        self.assertIn("resume", resumed)
-        self.assertIn("sandbox_workspace_write.network_access=true", resumed)
-        self.assertIn('sandbox_mode="workspace-write"', resumed)
+        resumed_session = self.store.get_session(session["id"])
+        resumed = self.manager._codex_turn_params(
+            resumed_session, {"prompt": "next", "attachments": []}, "existing-thread"
+        )
+        self.assertEqual("workspaceWrite", resumed["sandboxPolicy"]["type"])
+        self.assertTrue(resumed["sandboxPolicy"]["networkAccess"])
 
     def test_selected_model_is_persisted_and_applied_to_new_and_resumed_turns(self):
         session = self.manager.create_session("codex", str(self.workspace))
@@ -510,18 +613,67 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("GPT Fast", selected["modelName"])
         self.assertEqual("low", selected["reasoningEffort"])
         self.assertEqual(2048, selected["contextWindowTokens"])
-        new_command = self.manager._command(selected, "first")
-        self.assertEqual("gpt-fast", new_command[new_command.index("--model") + 1])
-        self.assertIn('model_reasoning_effort="low"', new_command)
+        new_thread = self.manager._codex_thread_params(selected)
+        new_turn = self.manager._codex_turn_params(
+            selected, {"prompt": "first", "attachments": []}, "new-thread"
+        )
+        self.assertEqual("gpt-fast", new_thread["model"])
+        self.assertEqual("gpt-fast", new_turn["model"])
+        self.assertEqual("low", new_turn["effort"])
 
         self.store.set_backend_session_id(session["id"], "existing-thread")
-        resumed = self.manager._command(self.store.get_session(session["id"]), "next")
-        self.assertIn("resume", resumed)
-        self.assertEqual("gpt-fast", resumed[resumed.index("--model") + 1])
+        resumed_session = self.store.get_session(session["id"])
+        resumed = self.manager._codex_thread_params(resumed_session)
+        self.assertEqual("gpt-fast", resumed["model"])
 
         bundle = self.manager.session_bundle(session["id"])
         self.assertEqual("gpt-fast", bundle["session"]["modelId"])
         self.assertEqual("GPT Fast", bundle["session"]["modelName"])
+
+        self.manager.start_turn(session["id"], "use the selected configuration")
+        terminal, _ = self._wait_terminal(session["id"])
+        self.assertEqual("low", terminal["reasoningEffort"])
+
+    def test_reasoning_effort_is_validated_and_applied_for_codex(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        self.manager.select_model(session["id"], "gpt-test")
+
+        selected = self.manager.select_reasoning_effort(session["id"], "low")
+        turn_params = self.manager._codex_turn_params(
+            selected, {"prompt": "first", "attachments": []}, "new-thread"
+        )
+
+        self.assertEqual("gpt-test", selected["modelOverride"])
+        self.assertEqual("low", selected["reasoningEffort"])
+        self.assertEqual("low", turn_params["effort"])
+        with self.assertRaises(StoreError):
+            self.manager.select_reasoning_effort(session["id"], "ultra")
+
+    def test_codex_app_server_resumes_the_durable_thread(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        self.manager.start_turn(session["id"], "first turn")
+        first, _ = self._wait_terminal(session["id"])
+
+        self.manager.start_turn(session["id"], "second turn")
+        second, _ = self._wait_terminal(session["id"])
+        bundle = self.store.session_bundle(session["id"])
+
+        self.assertEqual("codex-thread-test", first["backendSessionId"])
+        self.assertEqual(first["backendSessionId"], second["backendSessionId"])
+        self.assertEqual(
+            ["codex-result", "codex-result"],
+            [message["text"] for message in bundle["messages"] if message["role"] == "assistant"],
+        )
+
+    def test_codex_app_server_declines_unhandled_approval_requests(self):
+        session = self.manager.create_session("codex", str(self.workspace))
+        self.manager.start_turn(session["id"], "REQUEST_APPROVAL")
+
+        terminal, _ = self._wait_terminal(session["id"])
+        bundle = self.store.session_bundle(session["id"])
+
+        self.assertEqual("idle", terminal["status"])
+        self.assertEqual("approval-declined", bundle["messages"][-1]["text"])
 
     def test_grok_selected_model_is_applied_without_unsupported_effort(self):
         session = self.manager.create_session("grok", str(self.workspace))
@@ -534,12 +686,28 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("grok-fast", command[command.index("--model") + 1])
         self.assertNotIn("--reasoning-effort", command)
 
+    def test_reasoning_effort_is_validated_and_applied_for_grok(self):
+        session = self.manager.create_session("grok", str(self.workspace))
+
+        selected = self.manager.select_reasoning_effort(session["id"], "low")
+        command = self.manager._command(selected, "first", "/tmp/prompt")
+
+        self.assertEqual("grok-test", selected["modelOverride"])
+        self.assertEqual("low", selected["reasoningEffort"])
+        self.assertEqual("grok-test", command[command.index("--model") + 1])
+        self.assertEqual("low", command[command.index("--reasoning-effort") + 1])
+        with self.assertRaises(StoreError):
+            self.manager.select_reasoning_effort(session["id"], "medium")
+
     def test_model_change_is_rejected_while_turn_is_active(self):
         session = self.manager.create_session("codex", str(self.workspace))
+        self.manager.select_model(session["id"], "gpt-test")
         self.manager.start_turn(session["id"], "WAIT_FOR_CANCEL")
 
         with self.assertRaises(ConflictError):
             self.manager.select_model(session["id"], "gpt-fast")
+        with self.assertRaises(ConflictError):
+            self.manager.select_reasoning_effort(session["id"], "low")
 
         self.assertTrue(self.manager.cancel_session(session["id"]))
         self._wait_terminal(session["id"])
@@ -1013,6 +1181,16 @@ class DurableJobsTest(unittest.TestCase):
             with urllib.request.urlopen(select_request, timeout=2) as response:
                 selected = json.load(response)
             self.assertEqual("gpt-fast", selected["session"]["modelOverride"])
+
+            effort_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{created['session']['id']}/reasoning-effort",
+                data=json.dumps({"reasoningEffort": "low"}).encode(),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(effort_request, timeout=2) as response:
+                selected_effort = json.load(response)
+            self.assertEqual("low", selected_effort["session"]["reasoningEffort"])
 
             image_bytes = b"\x89PNG\r\n\x1a\n" + b"api-image"
             upload_request = urllib.request.Request(

@@ -441,7 +441,9 @@ class JobStore:
             if current is None:
                 raise NotFoundError("Session not found")
             if current["status"] in ACTIVE_STATUSES:
-                raise ConflictError("Cannot change model while a turn is active")
+                raise ConflictError(
+                    "Cannot change model or reasoning effort while a turn is active"
+                )
             connection.execute(
                 """
                 UPDATE sessions SET

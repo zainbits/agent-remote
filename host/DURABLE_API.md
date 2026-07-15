@@ -20,6 +20,7 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `POST` | `/api/v1/sessions/{id}/attachments` | Stream one image body with `Content-Type` and URL-encoded `X-File-Name`; returns durable attachment metadata |
 | `POST` | `/api/v1/sessions/{id}/turns` | Queue `{ prompt, attachmentIds? }`; returns `202` immediately |
 | `POST` | `/api/v1/sessions/{id}/model` | Select `{ modelId }` for future turns in an idle session |
+| `POST` | `/api/v1/sessions/{id}/reasoning-effort` | Select `{ reasoningEffort }` for future turns in an idle session |
 | `GET` | `/api/v1/sessions/{id}/events?after=N&wait=20` | Long-poll replayable events after cursor `N` |
 | `POST` | `/api/v1/sessions/{id}/cancel` | Request cancellation of the active turn |
 
@@ -47,7 +48,7 @@ Clients first fetch the session snapshot and its `latestEventId`, then poll stri
 
 Session snapshots and `usage.updated` events include the merged model name/ID, reasoning effort, used tokens, and context capacity when the backend reports them. Grok snapshots also include headless-compatible built-ins and installed skills. Informational slash reports are persisted as ordinary assistant output so they survive observer disconnects and replay.
 
-Model selection is session-scoped and stored as `modelOverride`. The host validates choices against Grok's ACP model state or Codex's documented `codex debug models` catalog, rejects changes while a turn is active, and passes the override to every new or resumed backend invocation. When the selected model does not support the session's prior reasoning effort, the host uses that model's advertised default effort.
+Model and reasoning-effort selection are session-scoped and stored with the session. The host validates choices against Grok's ACP model state or Codex's documented `codex debug models` catalog, rejects changes while a turn is active, and passes both overrides to every new or resumed backend invocation. Effort choices are model-specific; models that advertise no reasoning levels do not expose the picker. When a newly selected model does not support the session's prior effort, the host uses that model's advertised default.
 
 `codexFullAccess` defaults to `true` and is persisted with the session. Full-access Codex sessions pass `--dangerously-bypass-approvals-and-sandbox` on both new and resumed turns. When it is `false`, workers use `workspace-write`, `approval_policy=never`, and explicit command networking instead. The Codex status endpoint reports the stored worker policy, reads current account/rate-limit snapshots through app-server, and combines them with the thread rollout's last-token/context-window data; account details are returned transiently and are not persisted in the durable database.
 

@@ -112,6 +112,7 @@ fun ChatScreen(
     onCancel: () -> Unit,
     onSelectSlashCommand: (SlashCommand) -> Unit,
     onSelectModel: (AgentModelOption) -> Unit,
+    onSelectReasoningEffort: (String) -> Unit,
     onDismissCommandOutput: () -> Unit,
     onDisconnect: () -> Unit,
     onReconnect: () -> Unit,
@@ -286,6 +287,7 @@ fun ChatScreen(
                     !state.modelSelectionBusy &&
                     (!state.busy || canSendWhileBusy),
                 onSelectModel = onSelectModel,
+                onSelectReasoningEffort = onSelectReasoningEffort,
                 onDraftChange = onDraftChange,
                 onAttachImages = {
                     imagePicker.launch(PickVisualMediaRequest(PickVisualMedia.ImageOnly))
@@ -379,6 +381,7 @@ private fun MessageComposer(
     onAttachImages: () -> Unit,
     onRemoveImage: (String) -> Unit,
     onSelectModel: (AgentModelOption) -> Unit,
+    onSelectReasoningEffort: (String) -> Unit,
     onSend: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
@@ -485,6 +488,7 @@ private fun MessageComposer(
                     selectionEnabled = modelSelectionEnabled,
                     selectionBusy = modelSelectionBusy,
                     onSelectModel = onSelectModel,
+                    onSelectReasoningEffort = onSelectReasoningEffort,
                     modifier = Modifier.weight(1f),
                 )
 
@@ -593,138 +597,231 @@ private fun ComposerModelRail(
     selectionEnabled: Boolean,
     selectionBusy: Boolean,
     onSelectModel: (AgentModelOption) -> Unit,
+    onSelectReasoningEffort: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    val effortLabel = reasoningEffort
-        ?.let { effort ->
-            when (effort.lowercase()) {
-                "xhigh" -> "XHigh"
-                else -> effort.replaceFirstChar { it.uppercase() }
-            }
-        }
-        ?.let { "$it effort" }
-        ?: "Effort —"
+    var modelExpanded by rememberSaveable { mutableStateOf(false) }
+    var effortExpanded by rememberSaveable { mutableStateOf(false) }
+    val currentModel = remember(modelId, modelOptions) {
+        modelOptions.firstOrNull { it.id == modelId }
+            ?: modelOptions.firstOrNull { modelId == null && it.isDefault }
+    }
+    val effortOptions = currentModel?.reasoningEfforts.orEmpty()
+    val effortLabel = reasoningEffort?.let(::formatReasoningEffort) ?: "Effort —"
 
-    LaunchedEffect(selectionEnabled) {
-        if (!selectionEnabled) expanded = false
+    LaunchedEffect(selectionEnabled, effortOptions) {
+        if (!selectionEnabled) {
+            modelExpanded = false
+            effortExpanded = false
+        } else if (effortOptions.isEmpty()) {
+            effortExpanded = false
+        }
     }
 
-    Box(modifier = modifier) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable(
-                    enabled = selectionEnabled && modelOptions.isNotEmpty(),
-                    onClick = { expanded = true },
-                ),
-            color = MaterialTheme.colorScheme.surfaceContainerHighest,
-            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
-            shape = RoundedCornerShape(18.dp),
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Memory,
-                    contentDescription = null,
-                    modifier = Modifier.size(15.dp),
-                    tint = MaterialTheme.colorScheme.primary,
-                )
-                Text(
-                    text = modelName,
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(
+            Box(modifier = Modifier.weight(1f)) {
+                Row(
                     modifier = Modifier
-                        .size(width = 1.dp, height = 16.dp)
-                        .background(MaterialTheme.colorScheme.outlineVariant),
-                )
-                Icon(
-                    imageVector = Icons.Default.Psychology,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                    tint = MaterialTheme.colorScheme.tertiary,
-                )
-                Text(
-                    text = effortLabel,
-                    style = MaterialTheme.typography.labelMedium,
-                    maxLines = 1,
-                )
-                when {
-                    selectionBusy -> CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
+                        .fillMaxWidth()
+                        .clickable(
+                            enabled = selectionEnabled && modelOptions.isNotEmpty(),
+                            onClick = {
+                                effortExpanded = false
+                                modelExpanded = true
+                            },
+                        )
+                        .padding(start = 10.dp, top = 7.dp, end = 7.dp, bottom = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Memory,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp),
+                        tint = MaterialTheme.colorScheme.primary,
                     )
-                    modelOptions.isNotEmpty() -> Icon(
-                        imageVector = if (expanded) {
-                            Icons.Default.ExpandLess
-                        } else {
-                            Icons.Default.ExpandMore
-                        },
-                        contentDescription = "Choose model",
-                        modifier = Modifier.size(18.dp),
+                    Text(
+                        text = modelName,
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
+                    if (!selectionBusy && modelOptions.isNotEmpty()) {
+                        Icon(
+                            imageVector = if (modelExpanded) {
+                                Icons.Default.ExpandLess
+                            } else {
+                                Icons.Default.ExpandMore
+                            },
+                            contentDescription = "Choose model",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+
+                DropdownMenu(
+                    expanded = modelExpanded,
+                    onDismissRequest = { modelExpanded = false },
+                    modifier = Modifier.widthIn(min = 280.dp, max = 360.dp),
+                ) {
+                    modelOptions.forEach { model ->
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(
+                                        text = model.name,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (model.id == modelId) {
+                                            FontWeight.SemiBold
+                                        } else {
+                                            FontWeight.Normal
+                                        },
+                                    )
+                                    model.description?.let { description ->
+                                        Text(
+                                            text = if (model.isDefault) {
+                                                "Default · $description"
+                                            } else {
+                                                description
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            },
+                            trailingIcon = if (model.id == modelId) {
+                                {
+                                    Icon(Icons.Default.Check, contentDescription = "Selected")
+                                }
+                            } else {
+                                null
+                            },
+                            onClick = {
+                                modelExpanded = false
+                                onSelectModel(model)
+                            },
+                            enabled = selectionEnabled && model.id != modelId,
+                        )
+                    }
                 }
             }
-        }
 
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false },
-            modifier = Modifier.widthIn(min = 280.dp, max = 360.dp),
-        ) {
-            modelOptions.forEach { model ->
-                DropdownMenuItem(
-                    text = {
-                        Column {
-                            Text(
-                                text = model.name,
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = if (model.id == modelId) {
-                                    FontWeight.SemiBold
-                                } else {
-                                    FontWeight.Normal
-                                },
-                            )
-                            model.description?.let { description ->
-                                Text(
-                                    text = if (model.isDefault) {
-                                        "Default · $description"
-                                    } else {
-                                        description
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        }
-                    },
-                    trailingIcon = if (model.id == modelId) {
-                        {
-                            Icon(Icons.Default.Check, contentDescription = "Selected")
-                        }
-                    } else {
-                        null
-                    },
-                    onClick = {
-                        expanded = false
-                        onSelectModel(model)
-                    },
-                    enabled = selectionEnabled && model.id != modelId,
-                )
+            Spacer(
+                modifier = Modifier
+                    .size(width = 1.dp, height = 24.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant),
+            )
+
+            Box {
+                Row(
+                    modifier = Modifier
+                        .clickable(
+                            enabled = selectionEnabled && effortOptions.isNotEmpty(),
+                            onClick = {
+                                modelExpanded = false
+                                effortExpanded = true
+                            },
+                        )
+                        .padding(start = 8.dp, top = 7.dp, end = 8.dp, bottom = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Psychology,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.tertiary,
+                    )
+                    Text(
+                        text = effortLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        maxLines = 1,
+                    )
+                    when {
+                        selectionBusy -> CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        effortOptions.isNotEmpty() -> Icon(
+                            imageVector = if (effortExpanded) {
+                                Icons.Default.ExpandLess
+                            } else {
+                                Icons.Default.ExpandMore
+                            },
+                            contentDescription = "Choose reasoning effort",
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+
+                DropdownMenu(
+                    expanded = effortExpanded,
+                    onDismissRequest = { effortExpanded = false },
+                    modifier = Modifier.widthIn(min = 190.dp, max = 260.dp),
+                ) {
+                    effortOptions.forEach { effort ->
+                        val isDefault = effort == currentModel?.defaultReasoningEffort
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(
+                                        text = formatReasoningEffort(effort),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (effort == reasoningEffort) {
+                                            FontWeight.SemiBold
+                                        } else {
+                                            FontWeight.Normal
+                                        },
+                                    )
+                                    if (isDefault) {
+                                        Text(
+                                            text = "Default for ${currentModel.name}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            },
+                            trailingIcon = if (effort == reasoningEffort) {
+                                {
+                                    Icon(Icons.Default.Check, contentDescription = "Selected")
+                                }
+                            } else {
+                                null
+                            },
+                            onClick = {
+                                effortExpanded = false
+                                onSelectReasoningEffort(effort)
+                            },
+                            enabled = selectionEnabled && effort != reasoningEffort,
+                        )
+                    }
+                }
             }
         }
     }
 }
+
+private fun formatReasoningEffort(effort: String): String =
+    when (effort.lowercase()) {
+        "xhigh" -> "XHigh"
+        else -> effort.replaceFirstChar { it.uppercase() }
+    }
 
 @Composable
 private fun CommandOutputPanel(

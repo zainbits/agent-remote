@@ -158,6 +158,7 @@ class MainActivity : ComponentActivity() {
                                         onCancel = vm::cancelCurrentRequest,
                                         onSelectSlashCommand = vm::selectSlashCommand,
                                         onSelectModel = vm::selectModel,
+                                        onSelectReasoningEffort = vm::selectReasoningEffort,
                                         onDismissCommandOutput = vm::dismissCommandOutput,
                                         onDisconnect = vm::disconnect,
                                         onReconnect = vm::reconnect,

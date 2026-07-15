@@ -9,7 +9,7 @@ AgentRemote is only the controller and live viewer. The checked-in host service 
 - `host/agentremotesrv`: installs and manages the user-level host service.
 - `host/durable_jobs/`: authenticated HTTP API, worker pool, CLI event normalization, and legacy-session adoption.
 - SQLite in WAL mode stores durable sessions, turns, messages, image-attachment metadata, status, usage, and replay events.
-- Codex runs through documented `codex exec --json` sessions and resumes by Codex thread ID.
+- Codex runs through a host-owned `codex app-server` stdio worker, persists streamed item deltas, and resumes by Codex thread ID.
 - Grok runs through `grok --output-format streaming-json` and resumes by Grok session ID.
 - The Android client long-polls persisted events. Disconnecting only removes that observer.
 
@@ -81,7 +81,7 @@ Active turns are independent of the phone and continue with no connected Android
 
 If the Linux host or host service itself stops during a turn, that process cannot continue. On restart, AgentRemote marks the orphaned turn failed instead of pretending it completed; the session remains resumable with a new prompt.
 
-New Codex sessions use unrestricted full-host access by default, equivalent to `codex exec --dangerously-bypass-approvals-and-sandbox`. The Android Settings switch can make new Codex sessions use `workspace-write` with networking and `approval_policy=never` instead. The selected mode is stored on each durable session and reused for every resumed turn. Grok runs with `--always-approve`, matching the previous host behavior.
+New Codex sessions use app-server's unrestricted `dangerFullAccess` sandbox policy with approvals disabled by default. The Android Settings switch can make new Codex sessions use `workspaceWrite` with networking and `approvalPolicy=never` instead. The selected mode is stored on each durable session and reused for every resumed turn. Grok runs with `--always-approve`, matching the previous host behavior.
 
 ## Phone configuration
 
@@ -107,7 +107,7 @@ Existing Grok and Codex sessions are discovered and adopted automatically. Disco
 - Reopening a running session restores persisted history and resumes live observation.
 - **Stop**, `/stop`, and `/cancel` explicitly cancel only the open session's active turn.
 - `/new`, `/clear`, `/home`, and `/disconnect` detach without stopping host work.
-- The composer shows the backend's effective model and reasoning effort.
+- The composer has separate model and reasoning-effort pickers, using the choices advertised for the current model by each installed CLI.
 - The composer can pick, preview, remove, and send up to four images with a text prompt or as an image-only turn. Images stream to private durable host storage before the turn is queued, so host execution remains independent of the phone.
 - User and assistant messages have whole-message copy actions. Fenced code blocks have independent copy and line-wrap controls.
 - Grok built-ins and installed skills populate slash autocomplete; Codex exposes app-local commands only.
@@ -140,7 +140,7 @@ Only the newest three releases are retained by default.
 
 ## Legacy direct helpers
 
-`grokserve`, `host/codexserve`, the old WebSocket clients, and the Grok session-index API remain in the repository for compatibility and diagnostics. The Android v0.2 durable path does not require those foreground servers.
+`grokserve`, `host/codexserve`, the old direct WebSocket clients, and the Grok session-index API remain in the repository for compatibility and diagnostics. The durable path launches its own per-turn app-server stdio worker and does not require either foreground helper.
 
 ## Ports
 
@@ -149,4 +149,4 @@ Only the newest three releases are retained by default.
 | `2440` | Durable AgentRemote HTTP API (current Android path) |
 | `2419` | Legacy Grok ACP WebSocket |
 | `2420` | Legacy Grok session index |
-| `2430` | Legacy Codex app-server WebSocket |
+| `2430` | Legacy direct Codex app-server WebSocket helper |
