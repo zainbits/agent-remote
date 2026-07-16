@@ -41,8 +41,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.AddPhotoAlternate
@@ -313,6 +315,7 @@ private fun ChatHistory(
     val listState = rememberLazyListState()
     var followLatest by remember { mutableStateOf(true) }
     val latest = messages.lastOrNull()
+    val timeline = remember(messages) { groupChatTimeline(messages) }
 
     LaunchedEffect(listState) {
         snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
@@ -353,8 +356,11 @@ private fun ChatHistory(
                 )
             }
         }
-        items(messages.asReversed(), key = { it.id }) { message ->
-            MessageBlock(message, assistantName)
+        items(timeline.asReversed(), key = { it.key }) { item ->
+            when (item) {
+                is ChatTimelineItem.MessageItem -> MessageBlock(item.message, assistantName)
+                is ChatTimelineItem.ToolGroupItem -> ToolGroupCollapsible(item.messages)
+            }
         }
     }
 }
@@ -1231,6 +1237,82 @@ private fun ToolCollapsible(message: ChatMessage) {
                 .heightIn(max = 240.dp)
                 .verticalScroll(rememberScrollState()),
         )
+    }
+}
+
+@Composable
+private fun ToolGroupCollapsible(messages: List<ChatMessage>) {
+    val groupId = messages.first().id
+    var expanded by rememberSaveable(groupId) { mutableStateOf(false) }
+    val statuses = messages.map { it.toolStatus.orEmpty().lowercase() }
+    val failedCount = statuses.count { it == "failed" || it == "error" }
+    val cancelledCount = statuses.count { it == "cancelled" || it == "interrupted" }
+    val active = messages.any { message ->
+        message.streaming || message.toolStatus.orEmpty().lowercase() in setOf("in_progress", "pending")
+    }
+    val actionLabel = if (messages.size == 1) "1 action" else "${messages.size} actions"
+    val title = buildString {
+        append(if (active) "Working" else "Worked")
+        append(" · $actionLabel")
+        when {
+            failedCount > 0 -> {
+                append(" · $failedCount failed")
+            }
+            cancelledCount > 0 -> append(" · stopped")
+        }
+    }
+    val hasFailure = failedCount > 0
+    val containerColor = if (hasFailure) {
+        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.55f)
+    } else {
+        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f)
+    }
+    val contentColor = if (hasFailure) {
+        MaterialTheme.colorScheme.onErrorContainer
+    } else {
+        MaterialTheme.colorScheme.onSecondaryContainer
+    }
+
+    CollapsibleCard(
+        expanded = expanded,
+        onToggle = { expanded = !expanded },
+        icon = {
+            when {
+                hasFailure -> Icon(
+                    Icons.Default.ErrorOutline,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.error,
+                )
+                active -> CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.secondary,
+                )
+                cancelledCount > 0 -> Icon(
+                    Icons.Default.Close,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                else -> Icon(
+                    Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.secondary,
+                )
+            }
+        },
+        title = title,
+        subtitle = if (!expanded && hasFailure) "Tap to review failed actions" else null,
+        containerColor = containerColor,
+        contentColor = contentColor,
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            messages.forEach { message ->
+                ToolCollapsible(message)
+            }
+        }
     }
 }
 
