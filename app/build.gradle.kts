@@ -15,8 +15,8 @@ android {
         applicationId = "dev.zain.agentremote"
         minSdk = 36
         targetSdk = 36
-        versionCode = 24
-        versionName = "0.3.8"
+        versionCode = 25
+        versionName = "0.3.9"
     }
 
     buildTypes {

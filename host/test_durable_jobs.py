@@ -223,7 +223,11 @@ elif "--prompt-json" in sys.argv:
         if block.get("type") == "text"
     ).strip()
 print(json.dumps({"type": "thought", "data": "checking"}), flush=True)
-if prompt == "/session-info":
+if prompt == "INTERLEAVED_GROK":
+    print(json.dumps({"type": "text", "data": "progress update"}), flush=True)
+    print(json.dumps({"type": "thought", "data": "checking again"}), flush=True)
+    print(json.dumps({"type": "text", "data": "final answer"}), flush=True)
+elif prompt == "/session-info":
     print(json.dumps({"type": "text", "data": (
         "**Session ID:** grok-session-test\n\n"
         "**Working directory:** /tmp\n\n"
@@ -450,6 +454,41 @@ class DurableJobsTest(unittest.TestCase):
         self.assertEqual("grok-session-test", terminal["backendSessionId"])
         self.assertEqual("grok-result", bundle["messages"][-1]["text"])
         self.assertEqual(["user", "thought", "assistant"], [m["role"] for m in bundle["messages"]])
+
+    def test_grok_interleaved_stages_keep_live_and_replay_order(self):
+        session = self.manager.create_session("grok", str(self.workspace))
+        self.manager.start_turn(session["id"], "INTERLEAVED_GROK")
+
+        _, events = self._wait_terminal(session["id"])
+        messages = self.store.session_bundle(session["id"])["messages"]
+
+        self.assertEqual(
+            ["user", "thought", "assistant", "thought", "assistant"],
+            [message["role"] for message in messages],
+        )
+        self.assertEqual(
+            [
+                "INTERLEAVED_GROK",
+                "checking",
+                "progress update",
+                "checking again",
+                "final answer",
+            ],
+            [message["text"] for message in messages],
+        )
+        self.assertEqual(5, len({message["id"] for message in messages}))
+        self.assertEqual(list(range(5)), [message["ordinal"] for message in messages])
+        self.assertTrue(all(message["status"] == "completed" for message in messages[1:]))
+
+        streamed_roles = [
+            event["data"]["role"]
+            for event in events
+            if event["type"] == "message.delta"
+        ]
+        self.assertEqual(
+            ["thought", "assistant", "thought", "assistant"],
+            streamed_roles,
+        )
 
     def test_images_are_durable_and_mapped_to_app_server_turn_input(self):
         session = self.manager.create_session("codex", str(self.workspace))

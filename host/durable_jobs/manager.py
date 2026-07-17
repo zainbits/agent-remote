@@ -88,50 +88,57 @@ class _StreamMessages:
         self.manager = manager
         self.session_id = session_id
         self.turn_id = turn_id
-        self.ids = {
-            "assistant": f"{turn_id}:assistant",
-            "thought": f"{turn_id}:thought",
-        }
-        self.pending = {"assistant": "", "thought": ""}
+        self.pending = ""
         self.last_flush = time.monotonic()
-        self.last_role: str | None = None
+        self.active_role: str | None = None
+        self.active_message_id: str | None = None
+        self.stage_sequence = 0
 
     def append(self, role: str, delta: str) -> None:
         if not delta:
             return
-        if self.last_role is not None and self.last_role != role:
-            self.flush(self.last_role)
-        self.last_role = role
-        self.pending[role] += delta
+        if self.active_role is not None and self.active_role != role:
+            self.finish_stage()
+        if self.active_role is None:
+            self.stage_sequence += 1
+            self.active_role = role
+            self.active_message_id = f"{self.turn_id}:{role}:{self.stage_sequence}"
+        self.pending += delta
         now = time.monotonic()
-        if len(self.pending[role]) >= 96 or "\n" in delta or now - self.last_flush >= 0.15:
-            self.flush(role)
+        if len(self.pending) >= 96 or "\n" in delta or now - self.last_flush >= 0.15:
+            self.flush()
 
-    def flush(self, role: str | None = None) -> None:
-        roles = (role,) if role else tuple(self.pending)
-        wrote = False
-        for current in roles:
-            delta = self.pending[current]
-            if not delta:
-                continue
-            self.pending[current] = ""
-            self.manager.store.append_message_delta(
-                self.session_id,
-                self.turn_id,
-                self.ids[current],
-                current,
-                delta,
-            )
-            wrote = True
-        if wrote:
-            self.last_flush = time.monotonic()
+    def flush(self, *, notify: bool = True) -> bool:
+        if not self.pending:
+            return False
+        assert self.active_role is not None
+        assert self.active_message_id is not None
+        delta = self.pending
+        self.pending = ""
+        self.manager.store.append_message_delta(
+            self.session_id,
+            self.turn_id,
+            self.active_message_id,
+            self.active_role,
+            delta,
+        )
+        self.last_flush = time.monotonic()
+        if notify:
             self.manager.notify(self.session_id)
+        return True
+
+    def finish_stage(self) -> None:
+        if self.active_role is None or self.active_message_id is None:
+            return
+        wrote = self.flush(notify=False)
+        completed = self.manager.store.complete_message(self.active_message_id)
+        if wrote or completed:
+            self.manager.notify(self.session_id)
+        self.active_role = None
+        self.active_message_id = None
 
     def complete(self) -> None:
-        self.flush()
-        for message_id in self.ids.values():
-            self.manager.store.complete_message(message_id)
-        self.manager.notify(self.session_id)
+        self.finish_stage()
 
 
 class _CodexTurnControl:
@@ -1640,7 +1647,7 @@ class JobManager:
         self.store.append_complete_message(
             session_id,
             turn_id,
-            f"{turn_id}:assistant",
+            f"{turn_id}:assistant:fallback",
             "assistant",
             report,
         )
