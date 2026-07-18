@@ -10,6 +10,8 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `GET` | `/api/v1/models?backend=codex\|grok` | Read the backend's selectable model catalog |
 | `GET` | `/api/v1/session-cleanup?olderThanDays=30` | Count unpinned, idle Grok/Codex sessions older than the rolling cutoff across all workspaces |
 | `DELETE` | `/api/v1/session-cleanup?olderThanDays=30` | Permanently delete the currently eligible old sessions and return aggregate results |
+| `POST` | `/api/v1/session-cleanups` | Start asynchronous cleanup from `{ olderThanDays }` and return a cleanup-operation snapshot |
+| `GET` | `/api/v1/session-cleanups/{id}` | Read aggregate scanning/deletion progress for one cleanup operation |
 | `GET` | `/api/v1/sessions?backend=codex|grok&cwd=…&limit=50` | List and lazily adopt sessions |
 | `POST` | `/api/v1/sessions` | Create a durable session from `{ backend, cwd, codexFullAccess? }` |
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
@@ -33,6 +35,8 @@ Session status is one of `idle`, `queued`, `running`, `cancelling`, `failed`, or
 Session deletion is permanent and is rejected while a turn is queued, running, or cancelling. For a linked session, the host first invokes the backend's official permanent-delete command (`grok sessions delete` or `codex delete --force`); only after that succeeds does SQLite cascade-delete the durable turns, messages, events, and attachment metadata. Stored attachment files are then removed. An unlinked new-session placeholder has only its durable row removed.
 
 Age-based cleanup merges the complete Grok and Codex CLI catalogs with every durable row across all working directories and uses the newest known last-activity timestamp for each session. Preview and deletion both rescan the catalogs. Pinned and active durable sessions are preserved. Deletion continues after an individual backend failure and reports aggregate eligible, deleted, failed, pinned, and active counts without exposing session identifiers. Android Settings exposes direct rolling 3-day and 30-day choices through this parameterized endpoint.
+
+New Android clients start cleanup through the asynchronous operation endpoint and poll its opaque operation ID. An operation moves through `scanning`, `running`, and `completed` or `failed`; snapshots include `processed` and aggregate eligible/deleted/failed counts but never session identifiers. Only one synchronous or asynchronous cleanup can run at once. The original blocking `DELETE` remains available for older clients.
 
 Session summaries include durable `pinned` and `unread` booleans. Lists place pinned sessions first, then order each group by most recent activity. A terminal turn marks its session unread; starting a later turn or an explicit `{ "unread": false }` update clears it. Manual title updates are protected from the automatic first-prompt title generation.
 

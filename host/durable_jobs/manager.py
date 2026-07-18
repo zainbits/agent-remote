@@ -13,7 +13,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from .catalog import LegacyCatalog
 from .metadata import MetadataProvider
@@ -220,6 +220,7 @@ class JobManager:
             codex_bin=self.codex_bin,
         )
         self.executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="agent-job")
+        self.cleanup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="session-cleanup")
         self._lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._codex_controls: dict[str, _CodexTurnControl] = {}
@@ -228,6 +229,8 @@ class JobManager:
         self._versions: dict[str, int] = {}
         self._session_operation_locks: dict[str, threading.Lock] = {}
         self._cleanup_lock = threading.Lock()
+        self._cleanup_operation_lock = threading.RLock()
+        self._cleanup_operations: dict[str, dict[str, Any]] = {}
         self.catalog = LegacyCatalog(store, self.codex_bin)
         self.import_legacy = os.environ.get("AGENTREMOTE_IMPORT_LEGACY", "1") != "0"
         self._cleanup_stale_attachments()
@@ -301,45 +304,154 @@ class JobManager:
     def preview_session_cleanup(self, older_than_days: int = DEFAULT_CLEANUP_DAYS) -> dict[str, Any]:
         return self._cleanup_summary(self._session_cleanup_inventory(older_than_days))
 
+    def start_session_cleanup(self, older_than_days: int = DEFAULT_CLEANUP_DAYS) -> dict[str, Any]:
+        self._validate_cleanup_days(older_than_days)
+        if not self._cleanup_lock.acquire(blocking=False):
+            raise ConflictError("Session cleanup is already running")
+        operation_id = str(uuid.uuid4())
+        operation = {
+            "id": operation_id,
+            "status": "scanning",
+            "olderThanDays": older_than_days,
+            "cutoff": "",
+            "eligible": {"grok": 0, "codex": 0, "total": 0},
+            "processed": 0,
+            "skippedPinned": 0,
+            "skippedActive": 0,
+            "deleted": {"grok": 0, "codex": 0, "total": 0},
+            "failed": {"grok": 0, "codex": 0, "total": 0},
+            "error": None,
+        }
+        try:
+            with self._cleanup_operation_lock:
+                completed_ids = [
+                    item_id
+                    for item_id, item in self._cleanup_operations.items()
+                    if item["status"] in {"completed", "failed"}
+                ]
+                while len(self._cleanup_operations) >= 16 and completed_ids:
+                    self._cleanup_operations.pop(completed_ids.pop(0), None)
+                self._cleanup_operations[operation_id] = operation
+            self.cleanup_executor.submit(
+                self._run_session_cleanup_operation,
+                operation_id,
+                older_than_days,
+            )
+        except Exception:
+            with self._cleanup_operation_lock:
+                self._cleanup_operations.pop(operation_id, None)
+            self._cleanup_lock.release()
+            raise
+        return self.get_session_cleanup(operation_id)
+
+    def get_session_cleanup(self, operation_id: str) -> dict[str, Any]:
+        with self._cleanup_operation_lock:
+            operation = self._cleanup_operations.get(operation_id)
+            if operation is None:
+                raise NotFoundError("Session cleanup operation not found")
+            return self._cleanup_operation_snapshot(operation)
+
     def delete_old_sessions(self, older_than_days: int = DEFAULT_CLEANUP_DAYS) -> dict[str, Any]:
         if not self._cleanup_lock.acquire(blocking=False):
             raise ConflictError("Session cleanup is already running")
         try:
             inventory = self._session_cleanup_inventory(older_than_days)
-            summary = self._cleanup_summary(inventory)
-            deleted = {"grok": 0, "codex": 0, "total": 0}
-            failed = {"grok": 0, "codex": 0, "total": 0}
-            skipped_active = int(summary["skippedActive"])
-            for candidate in inventory["candidates"]:
-                backend = candidate["backend"]
-                try:
-                    local_session = candidate.get("localSession")
-                    if local_session is not None:
-                        self.delete_session(local_session["id"])
-                    else:
-                        self._delete_backend_session(backend, candidate["backendSessionId"])
-                except ConflictError:
-                    skipped_active += 1
-                except StoreError as error:
-                    LOGGER.warning("Could not delete one old %s session: %s", backend, error)
-                    failed[backend] += 1
-                    failed["total"] += 1
-                else:
-                    deleted[backend] += 1
-                    deleted["total"] += 1
-            self.catalog.invalidate()
-            return {
-                **summary,
-                "deleted": deleted,
-                "failed": failed,
-                "skippedActive": skipped_active,
-            }
+            return self._delete_cleanup_inventory(inventory)
         finally:
             self._cleanup_lock.release()
 
+    def _run_session_cleanup_operation(self, operation_id: str, older_than_days: int) -> None:
+        try:
+            inventory = self._session_cleanup_inventory(older_than_days)
+            summary = self._cleanup_summary(inventory)
+            self._update_cleanup_operation(
+                operation_id,
+                status="running",
+                **summary,
+            )
+            result = self._delete_cleanup_inventory(
+                inventory,
+                on_progress=lambda progress: self._update_cleanup_operation(
+                    operation_id,
+                    **progress,
+                ),
+            )
+            self._update_cleanup_operation(operation_id, status="completed", **result)
+        except Exception:
+            LOGGER.exception("Session cleanup operation failed")
+            self._update_cleanup_operation(
+                operation_id,
+                status="failed",
+                error="Couldn't complete session cleanup.",
+            )
+        finally:
+            self._cleanup_lock.release()
+
+    def _delete_cleanup_inventory(
+        self,
+        inventory: dict[str, Any],
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        summary = self._cleanup_summary(inventory)
+        deleted = {"grok": 0, "codex": 0, "total": 0}
+        failed = {"grok": 0, "codex": 0, "total": 0}
+        skipped_active = int(summary["skippedActive"])
+        processed = 0
+        for candidate in inventory["candidates"]:
+            backend = candidate["backend"]
+            try:
+                local_session = candidate.get("localSession")
+                if local_session is not None:
+                    self.delete_session(local_session["id"])
+                else:
+                    self._delete_backend_session(backend, candidate["backendSessionId"])
+            except ConflictError:
+                skipped_active += 1
+            except StoreError as error:
+                LOGGER.warning("Could not delete one old %s session: %s", backend, error)
+                failed[backend] += 1
+                failed["total"] += 1
+            else:
+                deleted[backend] += 1
+                deleted["total"] += 1
+            finally:
+                processed += 1
+                if on_progress is not None:
+                    on_progress(
+                        {
+                            **summary,
+                            "processed": processed,
+                            "deleted": dict(deleted),
+                            "failed": dict(failed),
+                            "skippedActive": skipped_active,
+                        }
+                    )
+        self.catalog.invalidate()
+        return {
+            **summary,
+            "processed": processed,
+            "deleted": deleted,
+            "failed": failed,
+            "skippedActive": skipped_active,
+        }
+
+    def _update_cleanup_operation(self, operation_id: str, **updates: Any) -> None:
+        with self._cleanup_operation_lock:
+            operation = self._cleanup_operations.get(operation_id)
+            if operation is not None:
+                operation.update(updates)
+
+    @staticmethod
+    def _cleanup_operation_snapshot(operation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **operation,
+            "eligible": dict(operation["eligible"]),
+            "deleted": dict(operation["deleted"]),
+            "failed": dict(operation["failed"]),
+        }
+
     def _session_cleanup_inventory(self, older_than_days: int) -> dict[str, Any]:
-        if not 1 <= older_than_days <= MAX_CLEANUP_DAYS:
-            raise StoreError(f"olderThanDays must be between 1 and {MAX_CLEANUP_DAYS}")
+        self._validate_cleanup_days(older_than_days)
         cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
         records: dict[tuple[str, str], dict[str, Any]] = {}
 
@@ -397,6 +509,15 @@ class JobManager:
             "skippedPinned": skipped_pinned,
             "skippedActive": skipped_active,
         }
+
+    @staticmethod
+    def _validate_cleanup_days(older_than_days: int) -> None:
+        if (
+            isinstance(older_than_days, bool)
+            or not isinstance(older_than_days, int)
+            or not 1 <= older_than_days <= MAX_CLEANUP_DAYS
+        ):
+            raise StoreError(f"olderThanDays must be between 1 and {MAX_CLEANUP_DAYS}")
 
     @staticmethod
     def _cleanup_summary(inventory: dict[str, Any]) -> dict[str, Any]:
@@ -1659,5 +1780,6 @@ class JobManager:
         for process in processes:
             if process.poll() is None:
                 self._signal_process(process, signal.SIGTERM)
+        self.cleanup_executor.shutdown(wait=True, cancel_futures=False)
         self.executor.shutdown(wait=True, cancel_futures=False)
         self.store.close()

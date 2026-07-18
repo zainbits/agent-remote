@@ -19,6 +19,7 @@ import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.DurableAgentClient
 import dev.zain.agentremote.agent.ImageAttachment
 import dev.zain.agentremote.agent.SessionSummary
+import dev.zain.agentremote.agent.SessionCleanupOperation
 import dev.zain.agentremote.agent.SessionCleanupReport
 import dev.zain.agentremote.agent.SlashCommand
 import dev.zain.agentremote.agent.SlashCommandSource
@@ -69,11 +70,19 @@ data class SessionCleanupUiState(
     val deleting: Boolean = false,
     val requestedDays: Int? = null,
     val preview: SessionCleanupReport? = null,
+    val cleanupStatus: String? = null,
+    val processed: Int = 0,
+    val total: Int? = null,
     val message: String? = null,
     val error: String? = null,
 ) {
     val busy: Boolean
         get() = checking || deleting
+
+    val progress: Float?
+        get() = total
+            ?.takeIf { it > 0 }
+            ?.let { (processed.toFloat() / it).coerceIn(0f, 1f) }
 }
 
 data class ChatUiState(
@@ -518,13 +527,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         viewModelScope.launch {
-            runCatching {
-                grokBackend.deleteOldSessions(
+            try {
+                var operation = grokBackend.startSessionCleanup(
                     baseUrl = normalizedBaseUrl,
                     secret = normalizedSecret,
                     olderThanDays = preview.olderThanDays,
                 )
-            }.onSuccess { report ->
+                while (true) {
+                    updateSessionCleanupProgress(operation)
+                    when (operation.status) {
+                        "completed" -> break
+                        "failed" -> error(
+                            operation.error ?: "Couldn't delete old sessions.",
+                        )
+                        "scanning", "running" -> {
+                            delay(CLEANUP_PROGRESS_POLL_INTERVAL_MILLIS)
+                            operation = grokBackend.getSessionCleanup(
+                                baseUrl = normalizedBaseUrl,
+                                secret = normalizedSecret,
+                                operationId = operation.id,
+                            )
+                        }
+                        else -> error("Durable host returned an invalid cleanup status")
+                    }
+                }
+                val report = operation.toReport()
                 sessionsByBackend.clear()
                 sessionErrorsByBackend.clear()
                 val deleted = report.deleted?.total ?: 0
@@ -552,7 +579,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 refreshSessions(_ui.value.settings.backendKind, showLoading = false)
-            }.onFailure { error ->
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
                 _ui.update {
                     it.copy(
                         sessionCleanup = SessionCleanupUiState(
@@ -563,6 +592,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
     }
+
+    private fun updateSessionCleanupProgress(operation: SessionCleanupOperation) {
+        _ui.update {
+            it.copy(
+                sessionCleanup = it.sessionCleanup.copy(
+                    cleanupStatus = operation.status,
+                    processed = operation.processed,
+                    total = if (operation.status == "scanning") {
+                        null
+                    } else {
+                        operation.eligible.total
+                    },
+                ),
+            )
+        }
+    }
+
+    private fun SessionCleanupOperation.toReport() = SessionCleanupReport(
+        olderThanDays = olderThanDays,
+        cutoff = cutoff,
+        eligible = eligible,
+        skippedPinned = skippedPinned,
+        skippedActive = skippedActive,
+        deleted = deleted,
+        failed = failed,
+    )
 
     fun dismissOldSessionCleanup() {
         if (_ui.value.sessionCleanup.deleting) return
@@ -2585,5 +2640,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         const val CODEX_CONTEXT_BASELINE_TOKENS = 12_000L
         const val RECONNECT_ATTEMPT_TIMEOUT_MILLIS = 25_000L
         const val SESSION_STATUS_POLL_INTERVAL_MILLIS = 2_000L
+        const val CLEANUP_PROGRESS_POLL_INTERVAL_MILLIS = 500L
     }
 }

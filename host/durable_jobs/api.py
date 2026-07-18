@@ -97,6 +97,12 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
                     {"cleanup": self.server.manager.preview_session_cleanup(days)},
                 )
                 return
+            if len(route) == 4 and route[:3] == ["api", "v1", "session-cleanups"]:
+                self._send(
+                    HTTPStatus.OK,
+                    {"cleanupOperation": self.server.manager.get_session_cleanup(route[3])},
+                )
+                return
             if route == ["api", "v1", "models"]:
                 backend = str(query.get("backend", [""])[0])
                 self._send(
@@ -152,6 +158,16 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             route = self._route(parsed.path)
+            if route == ["api", "v1", "session-cleanups"]:
+                body = self._json_body()
+                days = body.get("olderThanDays", 30)
+                if isinstance(days, bool) or not isinstance(days, int):
+                    raise StoreError("olderThanDays must be an integer")
+                self._send(
+                    HTTPStatus.ACCEPTED,
+                    {"cleanupOperation": self.server.manager.start_session_cleanup(days)},
+                )
+                return
             if route == ["api", "v1", "sessions"]:
                 body = self._json_body()
                 codex_full_access = body.get("codexFullAccess", True)

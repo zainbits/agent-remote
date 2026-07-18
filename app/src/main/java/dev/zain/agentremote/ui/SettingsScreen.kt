@@ -22,6 +22,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -311,6 +312,28 @@ fun SettingsScreen(
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    if (sessionCleanup.deleting) {
+                        Text(
+                            if (sessionCleanup.cleanupStatus == null ||
+                                sessionCleanup.cleanupStatus == "scanning"
+                            ) {
+                                "Preparing session cleanup…"
+                            } else {
+                                "Deleting ${sessionCleanup.processed} of " +
+                                    "${sessionCleanup.total ?: cleanupPreview.eligible.total} sessions…"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                        )
+                        val progress = sessionCleanup.progress
+                        if (progress == null) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        } else {
+                            LinearProgressIndicator(
+                                progress = { progress },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
                     Text("This cannot be undone.")
                 }
             },
@@ -324,20 +347,7 @@ fun SettingsScreen(
                         contentColor = MaterialTheme.colorScheme.error,
                     ),
                 ) {
-                    if (sessionCleanup.deleting) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                        )
-                    }
-                    Text(
-                        if (sessionCleanup.deleting) "Deleting…" else "Delete all",
-                        modifier = if (sessionCleanup.deleting) {
-                            Modifier.padding(start = 8.dp)
-                        } else {
-                            Modifier
-                        },
-                    )
+                    Text(if (sessionCleanup.deleting) "Deleting…" else "Delete all")
                 }
             },
             dismissButton = {

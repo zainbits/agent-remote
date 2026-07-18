@@ -169,6 +169,39 @@ class DurableAgentClient(
             ?: error("Durable host returned no cleanup result")
     }
 
+    suspend fun startSessionCleanup(
+        baseUrl: String,
+        secret: String,
+        olderThanDays: Int = 30,
+    ): SessionCleanupOperation {
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "POST",
+            path = "/api/v1/session-cleanups",
+            body = JSONObject().put("olderThanDays", olderThanDays),
+        )
+        return root.optJSONObject("cleanupOperation")
+            ?.let(::parseSessionCleanupOperation)
+            ?: error("Durable host returned no cleanup operation")
+    }
+
+    suspend fun getSessionCleanup(
+        baseUrl: String,
+        secret: String,
+        operationId: String,
+    ): SessionCleanupOperation {
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "GET",
+            path = "/api/v1/session-cleanups/${encodePath(operationId)}",
+        )
+        return root.optJSONObject("cleanupOperation")
+            ?.let(::parseSessionCleanupOperation)
+            ?: error("Durable host returned no cleanup operation")
+    }
+
     suspend fun fetchCodexStatus(): CodexStatusSnapshot {
         check(kind == BackendKind.CODEX) { "Status details are only available for Codex" }
         val id = sessionId ?: error("Not connected")
@@ -732,22 +765,44 @@ class DurableAgentClient(
     }
 
     private fun parseSessionCleanup(item: JSONObject): SessionCleanupReport {
-        fun counts(name: String): SessionCleanupCounts? {
-            val value = item.optJSONObject(name) ?: return null
-            return SessionCleanupCounts(
-                grok = value.optInt("grok"),
-                codex = value.optInt("codex"),
-                total = value.optInt("total"),
-            )
-        }
         return SessionCleanupReport(
             olderThanDays = item.optInt("olderThanDays", 30),
             cutoff = item.optString("cutoff"),
-            eligible = counts("eligible") ?: SessionCleanupCounts(),
+            eligible = parseSessionCleanupCounts(item, "eligible") ?: SessionCleanupCounts(),
             skippedPinned = item.optInt("skippedPinned"),
             skippedActive = item.optInt("skippedActive"),
-            deleted = counts("deleted"),
-            failed = counts("failed"),
+            deleted = parseSessionCleanupCounts(item, "deleted"),
+            failed = parseSessionCleanupCounts(item, "failed"),
+        )
+    }
+
+    private fun parseSessionCleanupOperation(item: JSONObject): SessionCleanupOperation {
+        val id = item.optString("id")
+        check(id.isNotBlank()) { "Durable host returned an invalid cleanup operation" }
+        return SessionCleanupOperation(
+            id = id,
+            status = item.optString("status"),
+            olderThanDays = item.optInt("olderThanDays", 30),
+            cutoff = item.optString("cutoff"),
+            eligible = parseSessionCleanupCounts(item, "eligible") ?: SessionCleanupCounts(),
+            processed = item.optInt("processed"),
+            skippedPinned = item.optInt("skippedPinned"),
+            skippedActive = item.optInt("skippedActive"),
+            deleted = parseSessionCleanupCounts(item, "deleted") ?: SessionCleanupCounts(),
+            failed = parseSessionCleanupCounts(item, "failed") ?: SessionCleanupCounts(),
+            error = item.optNullableString("error"),
+        )
+    }
+
+    private fun parseSessionCleanupCounts(
+        item: JSONObject,
+        name: String,
+    ): SessionCleanupCounts? {
+        val value = item.optJSONObject(name) ?: return null
+        return SessionCleanupCounts(
+            grok = value.optInt("grok"),
+            codex = value.optInt("codex"),
+            total = value.optInt("total"),
         )
     }
 

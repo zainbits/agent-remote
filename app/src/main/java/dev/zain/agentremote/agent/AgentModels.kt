@@ -168,6 +168,20 @@ data class SessionCleanupReport(
     val failed: SessionCleanupCounts? = null,
 )
 
+data class SessionCleanupOperation(
+    val id: String,
+    val status: String,
+    val olderThanDays: Int,
+    val cutoff: String,
+    val eligible: SessionCleanupCounts,
+    val processed: Int,
+    val skippedPinned: Int,
+    val skippedActive: Int,
+    val deleted: SessionCleanupCounts,
+    val failed: SessionCleanupCounts,
+    val error: String? = null,
+)
+
 enum class SessionStatus {
     IDLE,
     QUEUED,

@@ -317,6 +317,15 @@ class DurableJobsTest(unittest.TestCase):
                 return session, observed
         self.fail("durable turn did not reach a terminal state")
 
+    def _wait_cleanup_terminal(self, operation_id: str, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            operation = self.manager.get_session_cleanup(operation_id)
+            if operation["status"] in {"completed", "failed"}:
+                return operation
+            time.sleep(0.01)
+        self.fail("session cleanup did not reach a terminal state")
+
     def test_codex_turn_completes_without_an_observer(self):
         session = self.manager.create_session("codex", str(self.workspace))
         self.manager.start_turn(session["id"], "do the durable task")
@@ -1011,6 +1020,70 @@ class DurableJobsTest(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.manager.preview_session_cleanup(0)
 
+    def test_async_session_cleanup_reports_aggregate_progress_and_partial_failures(self):
+        old_timestamp = "2020-01-01T00:00:00.000Z"
+        catalog = [
+            {
+                "backend": "grok",
+                "backendSessionId": "first-old-session",
+                "updatedAt": old_timestamp,
+            },
+            {
+                "backend": "codex",
+                "backendSessionId": "second-old-session",
+                "updatedAt": old_timestamp,
+            },
+        ]
+        second_started = threading.Event()
+        release_second = threading.Event()
+
+        def delete_backend(_backend, backend_id):
+            if backend_id == "first-old-session":
+                raise StoreError("simulated backend failure")
+            second_started.set()
+            if not release_second.wait(2):
+                raise StoreError("test did not release the second deletion")
+
+        with (
+            mock.patch.object(self.manager.catalog, "cleanup_sessions", return_value=catalog),
+            mock.patch.object(self.manager, "_delete_backend_session", side_effect=delete_backend),
+        ):
+            operation = self.manager.start_session_cleanup(30)
+            try:
+                self.assertTrue(second_started.wait(2))
+                progress = self.manager.get_session_cleanup(operation["id"])
+                self.assertEqual("running", progress["status"])
+                self.assertEqual(1, progress["processed"])
+                self.assertEqual({"grok": 1, "codex": 1, "total": 2}, progress["eligible"])
+                self.assertEqual({"grok": 1, "codex": 0, "total": 1}, progress["failed"])
+                self.assertNotIn("first-old-session", json.dumps(progress))
+                self.assertNotIn("second-old-session", json.dumps(progress))
+                with self.assertRaises(ConflictError):
+                    self.manager.start_session_cleanup(3)
+                with self.assertRaises(ConflictError):
+                    self.manager.delete_old_sessions(3)
+            finally:
+                release_second.set()
+            terminal = self._wait_cleanup_terminal(operation["id"])
+
+        self.assertEqual("completed", terminal["status"])
+        self.assertEqual(2, terminal["processed"])
+        self.assertEqual({"grok": 0, "codex": 1, "total": 1}, terminal["deleted"])
+        self.assertEqual({"grok": 1, "codex": 0, "total": 1}, terminal["failed"])
+
+    def test_async_session_cleanup_reports_terminal_scan_failure_without_details(self):
+        with mock.patch.object(
+            self.manager.catalog,
+            "cleanup_sessions",
+            side_effect=StoreError("private catalog detail"),
+        ):
+            operation = self.manager.start_session_cleanup(30)
+            terminal = self._wait_cleanup_terminal(operation["id"])
+
+        self.assertEqual("failed", terminal["status"])
+        self.assertEqual("Couldn't complete session cleanup.", terminal["error"])
+        self.assertNotIn("private catalog detail", terminal["error"])
+
     def test_cleanup_catalog_includes_grok_and_paginated_codex_archives(self):
         catalog = LegacyCatalog(self.store, str(self.codex))
         old_timestamp = "2020-01-01T00:00:00Z"
@@ -1180,6 +1253,56 @@ class DurableJobsTest(unittest.TestCase):
                     cleanup_result = json.load(response)
             self.assertEqual(3, cleanup_result["cleanup"]["deleted"]["total"])
             delete_cleanup.assert_called_once_with(30)
+
+            operation_payload = {
+                "id": "cleanup-operation-test",
+                "status": "running",
+                "olderThanDays": 30,
+                "cutoff": "2020-01-01T00:00:00.000Z",
+                "eligible": {"grok": 1, "codex": 2, "total": 3},
+                "processed": 1,
+                "skippedPinned": 1,
+                "skippedActive": 0,
+                "deleted": {"grok": 1, "codex": 0, "total": 1},
+                "failed": {"grok": 0, "codex": 0, "total": 0},
+                "error": None,
+            }
+            with mock.patch.object(
+                self.manager,
+                "start_session_cleanup",
+                return_value=operation_payload,
+            ) as start_cleanup:
+                cleanup_start_request = urllib.request.Request(
+                    base + "/api/v1/session-cleanups",
+                    data=json.dumps({"olderThanDays": 30}).encode(),
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(cleanup_start_request, timeout=2) as response:
+                    self.assertEqual(202, response.status)
+                    cleanup_started = json.load(response)
+            self.assertEqual(
+                "cleanup-operation-test",
+                cleanup_started["cleanupOperation"]["id"],
+            )
+            start_cleanup.assert_called_once_with(30)
+
+            with mock.patch.object(
+                self.manager,
+                "get_session_cleanup",
+                return_value=operation_payload,
+            ) as get_cleanup:
+                cleanup_status_request = urllib.request.Request(
+                    base + "/api/v1/session-cleanups/cleanup-operation-test",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                with urllib.request.urlopen(cleanup_status_request, timeout=2) as response:
+                    cleanup_status = json.load(response)
+            self.assertEqual(1, cleanup_status["cleanupOperation"]["processed"])
+            get_cleanup.assert_called_once_with("cleanup-operation-test")
 
             sandboxed_request = urllib.request.Request(
                 base + "/api/v1/sessions",
