@@ -161,6 +161,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var sessionStatusPollingJob: Job? = null
     private var activeSessionIdForReconnect: String? = null
     private var activeSessionCwdForReconnect: String = AppSettings.DEFAULT_CWD
+    private var activeSessionIsDraft: Boolean = false
     private var latestCodexStatus: CodexStatusSnapshot? = null
     /**
      * After a local [send], the agent echoes the prompt as `user_message_chunk`.
@@ -402,6 +403,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         updateSessionMetadata(session, title = normalized)
     }
 
+    fun renameActiveSession(title: String) {
+        val sessionId = activeSessionIdForReconnect ?: return
+        val normalized = title.trim()
+        if (normalized.isBlank() || normalized == _ui.value.activeSessionTitle) return
+        updateSessionMetadata(sessionId, title = normalized)
+    }
+
     fun toggleSessionPin(session: SessionSummary) {
         updateSessionMetadata(session, pinned = !session.pinned)
     }
@@ -628,26 +636,45 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         session: SessionSummary,
         title: String? = null,
         pinned: Boolean? = null,
+    ) = updateSessionMetadata(
+        sessionId = session.sessionId,
+        title = title,
+        pinned = pinned,
+    )
+
+    private fun updateSessionMetadata(
+        sessionId: String,
+        title: String? = null,
+        pinned: Boolean? = null,
     ) {
         val state = _ui.value
         val kind = state.settings.backendKind
         val settings = state.settings
         if (state.sessionActionId != null || settings.durableHostToken.isBlank()) return
-        _ui.update { it.copy(sessionActionId = session.sessionId, sessionsError = null) }
+        _ui.update { it.copy(sessionActionId = sessionId, sessionsError = null) }
         viewModelScope.launch {
             runCatching {
                 durableBackend(kind).updateSessionMetadata(
                     baseUrl = settings.activeDurableBaseUrl,
                     secret = settings.durableHostToken,
-                    sessionId = session.sessionId,
+                    sessionId = sessionId,
                     title = title,
                     pinned = pinned,
                 )
             }.onSuccess { updated ->
                 mergeSessionSummary(kind, updated)
                 _ui.update { current ->
-                    if (current.sessionActionId == session.sessionId) {
-                        current.copy(sessionActionId = null)
+                    if (current.sessionActionId == sessionId) {
+                        current.copy(
+                            sessionActionId = null,
+                            activeSessionTitle = if (
+                                activeSessionIdForReconnect == sessionId && title != null
+                            ) {
+                                updated.title
+                            } else {
+                                current.activeSessionTitle
+                            },
+                        )
                     } else {
                         current
                     }
@@ -863,7 +890,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val cwd = s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
-        val connectionAction = beginConnectionAction(sessionId = null, cwd = cwd)
+        val connectionAction = beginConnectionAction(sessionId = null, cwd = cwd, isDraft = true)
         viewModelScope.launch {
             clearChatLocal()
             _ui.update {
@@ -932,7 +959,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val cwd = session.cwd.ifBlank {
             s.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
         }
-        val connectionAction = beginConnectionAction(sessionId = session.sessionId, cwd = cwd)
+        val connectionAction = beginConnectionAction(
+            sessionId = session.sessionId,
+            cwd = cwd,
+            isDraft = false,
+        )
         markSessionRead(session.sessionId, activeBackendKind)
         viewModelScope.launch {
             clearChatLocal()
@@ -990,12 +1021,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun goHome() {
         val departingBackend = backend
+        val departingBackendKind = activeBackendKind
+        val draftSessionId = activeSessionIdForReconnect.takeIf { activeSessionIsDraft }
+        val departingSettings = _ui.value.settings
         stopConnectionIntent(clearSession = true)
         clearChatLocal()
         // Commit navigation immediately; transport cleanup continues off-screen.
         _ui.update { it.copy(screen = AppScreen.HOME, busy = true) }
         viewModelScope.launch {
             runCatching { departingBackend.disconnect() }
+            discardDraftSession(
+                backendKind = departingBackendKind,
+                settings = departingSettings,
+                sessionId = draftSessionId,
+            )
             _ui.update {
                 it.copy(
                     screen = AppScreen.HOME,
@@ -1446,7 +1485,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun beginConnectionAction(sessionId: String?, cwd: String): Long {
+    private fun beginConnectionAction(
+        sessionId: String?,
+        cwd: String,
+        isDraft: Boolean,
+    ): Long {
         stopSessionStatusPolling()
         reconnectJob?.cancel()
         reconnectJob = null
@@ -1454,6 +1497,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         hasConnectedSession = false
         activeSessionIdForReconnect = sessionId
         activeSessionCwdForReconnect = cwd
+        activeSessionIsDraft = isDraft
         return ++connectionActionGeneration
     }
 
@@ -1466,6 +1510,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             hasConnectedSession = false
             activeSessionIdForReconnect = null
             activeSessionCwdForReconnect = AppSettings.DEFAULT_CWD
+            activeSessionIsDraft = false
+        }
+    }
+
+    private suspend fun discardDraftSession(
+        backendKind: BackendKind,
+        settings: AppSettings,
+        sessionId: String?,
+    ) {
+        if (sessionId == null || settings.durableHostToken.isBlank()) return
+        runCatching {
+            durableBackend(backendKind).discardDraftSession(
+                baseUrl = settings.activeDurableBaseUrl,
+                secret = settings.durableHostToken,
+                sessionId = sessionId,
+            )
         }
     }
 
@@ -1622,6 +1682,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun startNewSessionFromCommand() {
         val departingBackend = backend
+        val departingBackendKind = activeBackendKind
+        val draftSessionId = activeSessionIdForReconnect.takeIf { activeSessionIsDraft }
+        val departingSettings = _ui.value.settings
         stopConnectionIntent(clearSession = true)
         clearChatLocal()
         _ui.update {
@@ -1635,6 +1698,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             // Detach from the old durable turn; the host keeps owning it.
             runCatching { departingBackend.disconnect() }
+            discardDraftSession(
+                backendKind = departingBackendKind,
+                settings = departingSettings,
+                sessionId = draftSessionId,
+            )
             openNewSession()
         }
     }
@@ -2238,6 +2306,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             is AgentEvent.UsageChanged -> mergeUsage(event.usage)
 
             AgentEvent.TurnStarted -> {
+                activeSessionIsDraft = false
                 _ui.update {
                     it.copy(
                         busy = true,

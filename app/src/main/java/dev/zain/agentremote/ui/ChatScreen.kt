@@ -45,16 +45,16 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.Link
-import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -66,9 +66,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -116,10 +118,9 @@ fun ChatScreen(
     onSelectModel: (AgentModelOption) -> Unit,
     onSelectReasoningEffort: (String) -> Unit,
     onDismissCommandOutput: () -> Unit,
-    onDisconnect: () -> Unit,
     onReconnect: () -> Unit,
+    onRenameSession: (String) -> Unit,
     onBack: () -> Unit,
-    onOpenSettings: () -> Unit,
 ) {
     val imagePicker = rememberLauncherForActivityResult(
         contract = PickMultipleVisualMedia(4),
@@ -131,6 +132,8 @@ fun ChatScreen(
         else -> state.settings.workingDirectory
     }
     val title = state.activeSessionTitle?.takeIf { it.isNotBlank() } ?: "Chat"
+    var renameDialogVisible by rememberSaveable { mutableStateOf(false) }
+    var renameDraft by rememberSaveable { mutableStateOf("") }
 
     Scaffold(
         topBar = {
@@ -178,11 +181,16 @@ fun ChatScreen(
                     }
                 },
                 actions = {
-                    if (connected) {
-                        IconButton(onClick = onDisconnect) {
-                            Icon(Icons.Default.LinkOff, contentDescription = "Disconnect")
-                        }
-                    } else if (state.canReconnect) {
+                    IconButton(
+                        onClick = {
+                            renameDraft = title
+                            renameDialogVisible = true
+                        },
+                        enabled = state.canReconnect && state.sessionActionId == null,
+                    ) {
+                        Icon(Icons.Default.Edit, contentDescription = "Rename session")
+                    }
+                    if (!connected && state.canReconnect) {
                         IconButton(
                             onClick = onReconnect,
                             enabled = !state.reconnecting,
@@ -196,9 +204,6 @@ fun ChatScreen(
                                 },
                             )
                         }
-                    }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
                 },
             )
@@ -302,6 +307,40 @@ fun ChatScreen(
                     .padding(start = 10.dp, top = 6.dp, end = 10.dp, bottom = 10.dp),
             )
         }
+    }
+
+    if (renameDialogVisible) {
+        AlertDialog(
+            onDismissRequest = { renameDialogVisible = false },
+            title = { Text("Rename session") },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it.take(200) },
+                    label = { Text("Session name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onRenameSession(renameDraft)
+                        renameDialogVisible = false
+                    },
+                    enabled = renameDraft.trim().isNotEmpty() &&
+                        renameDraft.trim() != title &&
+                        state.sessionActionId == null,
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameDialogVisible = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 

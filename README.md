@@ -101,6 +101,7 @@ Existing Grok and Codex sessions are discovered and adopted automatically. Disco
 
 - Back/Home detaches from the session without cancelling its active turn.
 - **New session** can start while other sessions remain queued or running.
+- Leaving a new composer before sending anything discards its draft placeholder; untouched drafts never appear in the session list.
 - Session cards show `Queued`, `Running`, `Stopping`, `Failed`, or `Stopped` when applicable.
 - Sessions can be renamed and pinned; pinned sessions appear in a dedicated section above the unpinned recent-session list.
 - A blue dot marks a session whose background turn finished and has not been opened yet.

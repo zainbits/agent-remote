@@ -135,6 +135,20 @@ class DurableAgentClient(
         check(root.optBoolean("deleted")) { "Durable host did not delete the session" }
     }
 
+    suspend fun discardDraftSession(
+        baseUrl: String,
+        secret: String,
+        sessionId: String,
+    ): Boolean {
+        val root = request(
+            baseUrl = normalizeBaseUrl(baseUrl),
+            secret = secret,
+            method = "DELETE",
+            path = "/api/v1/sessions/${encodePath(sessionId)}/draft",
+        )
+        return root.optBoolean("discarded", false)
+    }
+
     suspend fun previewSessionCleanup(
         baseUrl: String,
         secret: String,

@@ -160,10 +160,9 @@ class MainActivity : ComponentActivity() {
                                         onSelectModel = vm::selectModel,
                                         onSelectReasoningEffort = vm::selectReasoningEffort,
                                         onDismissCommandOutput = vm::dismissCommandOutput,
-                                        onDisconnect = vm::disconnect,
                                         onReconnect = vm::reconnect,
+                                        onRenameSession = vm::renameActiveSession,
                                         onBack = vm::goHome,
-                                        onOpenSettings = { nav.navigate("settings") },
                                     )
                                 }
                             }

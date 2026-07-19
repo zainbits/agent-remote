@@ -301,6 +301,19 @@ class JobManager:
         self.notify(session_id)
         return {"deleted": True}
 
+    def discard_draft_session(self, session_id: str) -> dict[str, bool]:
+        operation_lock = self._session_operation_lock(session_id)
+        with operation_lock:
+            discarded, stored_names = self.store.discard_draft_session(session_id)
+        for stored_name in stored_names:
+            try:
+                (self.store.attachment_directory / stored_name).unlink(missing_ok=True)
+            except OSError as error:
+                LOGGER.warning("Could not remove a discarded draft attachment: %s", error)
+        if discarded:
+            self.notify(session_id)
+        return {"discarded": discarded}
+
     def preview_session_cleanup(self, older_than_days: int = DEFAULT_CLEANUP_DAYS) -> dict[str, Any]:
         return self._cleanup_summary(self._session_cleanup_inventory(older_than_days))
 

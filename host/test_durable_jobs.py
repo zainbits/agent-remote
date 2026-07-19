@@ -1235,6 +1235,67 @@ class DurableJobsTest(unittest.TestCase):
         self.assertFalse(read["unread"])
         self.assertFalse(newer["pinned"])
 
+    def test_session_list_hides_untouched_drafts(self):
+        draft = self.store.create_session("codex", str(self.workspace))
+        started = self.store.create_session("codex", str(self.workspace))
+        linked = self.store.create_session("codex", str(self.workspace))
+        renamed = self.store.create_session("codex", str(self.workspace))
+
+        turn = self.store.create_turn(started["id"], "started conversation")
+        self.store.finish_turn(turn["id"], "completed")
+        self.store.set_backend_session_id(linked["id"], "existing-codex-thread")
+        self.store.update_session_metadata(renamed["id"], title="Saved draft")
+
+        listed_ids = {
+            session["id"]
+            for session in self.store.list_sessions("codex", str(self.workspace))
+        }
+        self.assertNotIn(draft["id"], listed_ids)
+        self.assertEqual({started["id"], linked["id"], renamed["id"]}, listed_ids)
+
+    def test_discard_draft_deletes_only_untouched_placeholder(self):
+        draft = self.manager.create_session("grok", str(self.workspace))
+        image_bytes = b"\x89PNG\r\n\x1a\n" + b"draft-image"
+        attachment = self.manager.upload_attachment(
+            draft["id"],
+            "draft.png",
+            "image/png",
+            len(image_bytes),
+            io.BytesIO(image_bytes),
+        )
+        attachment_path = Path(self.store.attachment_directory, f"{attachment['id']}.png")
+
+        self.assertEqual(
+            {"discarded": True},
+            self.manager.discard_draft_session(draft["id"]),
+        )
+        with self.assertRaises(NotFoundError):
+            self.store.get_session(draft["id"])
+        self.assertFalse(attachment_path.exists())
+
+        started = self.store.create_session("grok", str(self.workspace))
+        turn = self.store.create_turn(started["id"], "keep this conversation")
+        self.store.finish_turn(turn["id"], "completed")
+        self.assertEqual(
+            {"discarded": False},
+            self.manager.discard_draft_session(started["id"]),
+        )
+        self.assertEqual(started["id"], self.store.get_session(started["id"])["id"])
+
+        linked = self.store.create_session("grok", str(self.workspace))
+        self.store.set_backend_session_id(linked["id"], "existing-grok-session")
+        renamed = self.store.create_session("grok", str(self.workspace))
+        self.store.update_session_metadata(renamed["id"], title="Keep this draft")
+        for protected in (linked, renamed):
+            self.assertEqual(
+                {"discarded": False},
+                self.manager.discard_draft_session(protected["id"]),
+            )
+            self.assertEqual(
+                protected["id"],
+                self.store.get_session(protected["id"])["id"],
+            )
+
     def test_different_sessions_run_concurrently(self):
         first = self.manager.create_session("codex", str(self.workspace))
         second = self.manager.create_session("codex", str(self.workspace))
@@ -1401,6 +1462,17 @@ class DurableJobsTest(unittest.TestCase):
             with urllib.request.urlopen(sandboxed_request, timeout=2) as response:
                 sandboxed = json.load(response)
             self.assertFalse(sandboxed["session"]["codexFullAccess"])
+
+            discard_draft_request = urllib.request.Request(
+                base + f"/api/v1/sessions/{sandboxed['session']['id']}/draft",
+                headers={"Authorization": f"Bearer {token}"},
+                method="DELETE",
+            )
+            with urllib.request.urlopen(discard_draft_request, timeout=2) as response:
+                discarded_draft = json.load(response)
+            self.assertTrue(discarded_draft["discarded"])
+            with self.assertRaises(NotFoundError):
+                self.store.get_session(sandboxed["session"]["id"])
 
             commands_request = urllib.request.Request(
                 base + f"/api/v1/sessions/{created['session']['id']}/commands",

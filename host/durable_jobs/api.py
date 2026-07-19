@@ -286,6 +286,14 @@ class DurableRequestHandler(BaseHTTPRequestHandler):
                     {"cleanup": self.server.manager.delete_old_sessions(days)},
                 )
                 return
+            if (
+                len(route) == 5
+                and route[:3] == ["api", "v1", "sessions"]
+                and route[4] == "draft"
+            ):
+                result = self.server.manager.discard_draft_session(route[3])
+                self._send(HTTPStatus.OK, result)
+                return
             if len(route) == 4 and route[:3] == ["api", "v1", "sessions"]:
                 result = self.server.manager.delete_session(route[3])
                 self._send(HTTPStatus.OK, result)

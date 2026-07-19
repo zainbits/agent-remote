@@ -749,6 +749,34 @@ class JobStore:
             connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         return [str(row["stored_name"]) for row in attachment_rows]
 
+    def discard_draft_session(self, session_id: str) -> tuple[bool, list[str]]:
+        """Delete an untouched local placeholder without risking conversation history."""
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT s.*,
+                       EXISTS(SELECT 1 FROM turns t WHERE t.session_id = s.id) AS has_turns
+                FROM sessions s WHERE s.id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise NotFoundError("Session not found")
+            if (
+                session["status"] != "idle"
+                or session["backend_session_id"]
+                or bool(session["has_turns"])
+                or bool(session["title_is_manual"])
+                or bool(session["pinned"])
+            ):
+                return False, []
+            attachment_rows = connection.execute(
+                "SELECT stored_name FROM attachments WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            connection.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        return True, [str(row["stored_name"]) for row in attachment_rows]
+
     def cleanup_sessions(self) -> list[dict[str, Any]]:
         """Return all durable sessions for host-wide age-based maintenance."""
         with self._connect() as connection:
@@ -764,6 +792,12 @@ class JobStore:
                         WHERE m.session_id = s.id AND m.role IN ('user', 'assistant')) AS message_count
                 FROM sessions s
                 WHERE s.backend = ? AND s.cwd = ?
+                  AND (
+                      s.backend_session_id IS NOT NULL
+                      OR s.title_is_manual = 1
+                      OR s.pinned = 1
+                      OR EXISTS(SELECT 1 FROM turns t WHERE t.session_id = s.id)
+                  )
                 ORDER BY s.pinned DESC, s.updated_at DESC
                 LIMIT ?
                 """,

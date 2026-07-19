@@ -17,6 +17,7 @@ The Android app uses this versioned HTTP API on the configured durable host URL.
 | `GET` | `/api/v1/sessions/{id}` | Read one session, normalized messages, backend commands, and the latest event cursor |
 | `PATCH` | `/api/v1/sessions/{id}` | Update one or more of `{ title, pinned, unread }` |
 | `DELETE` | `/api/v1/sessions/{id}` | Permanently delete an idle durable session and its linked Grok/Codex CLI history |
+| `DELETE` | `/api/v1/sessions/{id}/draft` | Discard an untouched local placeholder; refuses sessions with a turn, backend history, pin, or manual title |
 | `GET` | `/api/v1/sessions/{id}/commands` | Refresh the backend-specific slash-command catalog |
 | `GET` | `/api/v1/sessions/{id}/status` | Read live Codex account limits plus native thread configuration/context status |
 | `POST` | `/api/v1/sessions/{id}/attachments` | Stream one image body with `Content-Type` and URL-encoded `X-File-Name`; returns durable attachment metadata |
@@ -38,7 +39,7 @@ Age-based cleanup merges the complete Grok and Codex CLI catalogs with every dur
 
 New Android clients start cleanup through the asynchronous operation endpoint and poll its opaque operation ID. An operation moves through `scanning`, `running`, and `completed` or `failed`; snapshots include `processed` and aggregate eligible/deleted/failed counts but never session identifiers. Only one synchronous or asynchronous cleanup can run at once. The original blocking `DELETE` remains available for older clients.
 
-Session summaries include durable `pinned` and `unread` booleans. Lists place pinned sessions first, then order each group by most recent activity. A terminal turn marks its session unread; starting a later turn or an explicit `{ "unread": false }` update clears it. Manual title updates are protected from the automatic first-prompt title generation.
+Session summaries include durable `pinned` and `unread` booleans. Untouched local placeholders are omitted from lists, so opening and abandoning a new composer does not create conversation history. A placeholder becomes list-visible after its first turn, backend-session linkage, manual rename, or pin. Lists place pinned sessions first, then order each group by most recent activity. A terminal turn marks its session unread; starting a later turn or an explicit `{ "unread": false }` update clears it. Manual title updates are protected from the automatic first-prompt title generation.
 
 The server writes the user message and `turn.queued` event transactionally before acknowledging a new turn. Workers then persist `turn.started`, normalized message/tool/usage events, and exactly one terminal event:
 
