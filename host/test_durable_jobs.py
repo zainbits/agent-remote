@@ -245,6 +245,91 @@ print(json.dumps({
 '''
 
 
+class MetadataProviderTest(unittest.TestCase):
+    @staticmethod
+    def _grok_initialize(model_id: str) -> dict:
+        return {
+            "_meta": {
+                "modelState": {
+                    "currentModelId": model_id,
+                    "availableModels": [
+                        {
+                            "modelId": model_id,
+                            "name": model_id,
+                            "_meta": {},
+                        }
+                    ],
+                },
+                "availableCommands": [],
+            }
+        }
+
+    def test_grok_catalog_refreshes_after_cache_expiry(self):
+        provider = MetadataProvider(home=tempfile.gettempdir())
+        responses = [
+            self._grok_initialize("grok-build"),
+            self._grok_initialize("grok-4.5"),
+        ]
+
+        with mock.patch.object(
+            provider,
+            "_probe_grok_initialize",
+            side_effect=responses,
+        ) as probe, mock.patch(
+            "host.durable_jobs.metadata.time.monotonic",
+            side_effect=[100.0, 200.0, 401.0],
+        ):
+            first = provider.models_for("grok")
+            cached = provider.models_for("grok")
+            refreshed = provider.models_for("grok")
+
+        self.assertEqual(["grok-build"], [model["id"] for model in first])
+        self.assertEqual(["grok-build"], [model["id"] for model in cached])
+        self.assertEqual(["grok-4.5"], [model["id"] for model in refreshed])
+        self.assertEqual(2, probe.call_count)
+
+    def test_failed_grok_catalog_probe_is_retried_immediately(self):
+        provider = MetadataProvider(home=tempfile.gettempdir())
+
+        with mock.patch.object(
+            provider,
+            "_probe_grok_initialize",
+            side_effect=[
+                RuntimeError("temporarily unavailable"),
+                self._grok_initialize("grok-4.5"),
+            ],
+        ) as probe, mock.patch(
+            "host.durable_jobs.metadata.time.monotonic",
+            side_effect=[100.0, 101.0],
+        ):
+            failed = provider.models_for("grok")
+            recovered = provider.models_for("grok")
+
+        self.assertEqual([], failed)
+        self.assertEqual(["grok-4.5"], [model["id"] for model in recovered])
+        self.assertEqual(2, probe.call_count)
+
+    def test_failed_refresh_keeps_last_good_grok_catalog(self):
+        provider = MetadataProvider(home=tempfile.gettempdir())
+
+        with mock.patch.object(
+            provider,
+            "_probe_grok_initialize",
+            side_effect=[
+                self._grok_initialize("grok-build"),
+                RuntimeError("temporarily unavailable"),
+            ],
+        ), mock.patch(
+            "host.durable_jobs.metadata.time.monotonic",
+            side_effect=[100.0, 401.0],
+        ):
+            initial = provider.models_for("grok")
+            stale_fallback = provider.models_for("grok")
+
+        self.assertEqual(["grok-build"], [model["id"] for model in initial])
+        self.assertEqual(["grok-build"], [model["id"] for model in stale_fallback])
+
+
 class DurableJobsTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -260,7 +345,6 @@ class DurableJobsTest(unittest.TestCase):
             home=root,
             probe_grok=False,
         )
-        self.metadata._grok_probe_attempted = True
         self.metadata._grok_model_state = {
             "currentModelId": "grok-test",
             "availableModels": [

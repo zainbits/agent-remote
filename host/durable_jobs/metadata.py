@@ -147,7 +147,7 @@ class MetadataProvider:
         self.codex_bin = codex_bin
         self.probe_grok = probe_grok
         self._probe_lock = threading.Lock()
-        self._grok_probe_attempted = False
+        self._grok_models_at = 0.0
         self._grok_model_state: dict[str, Any] = {}
         self._grok_initial_commands: list[dict[str, Any]] = []
         self._codex_models_at = 0.0
@@ -424,20 +424,25 @@ class MetadataProvider:
 
     def _grok_discovery(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         with self._probe_lock:
-            if self._grok_probe_attempted:
+            now = time.monotonic()
+            if self._grok_models_at and now - self._grok_models_at < MODEL_CACHE_SECONDS:
                 return self._grok_model_state, self._grok_initial_commands
-            self._grok_probe_attempted = True
             if not self.probe_grok:
-                return {}, []
+                return self._grok_model_state, self._grok_initial_commands
             try:
                 result = self._probe_grok_initialize()
                 meta = result.get("_meta") if isinstance(result.get("_meta"), dict) else {}
                 state = meta.get("modelState")
                 commands = meta.get("availableCommands")
-                self._grok_model_state = state if isinstance(state, dict) else {}
+                if not isinstance(state, dict) or not isinstance(
+                    state.get("availableModels"), list
+                ):
+                    raise RuntimeError("Grok ACP initialize did not return a model catalog")
+                self._grok_model_state = state
                 self._grok_initial_commands = [
                     command for command in commands or [] if isinstance(command, dict)
                 ]
+                self._grok_models_at = now
             except Exception as error:
                 LOGGER.warning("Could not read Grok model/command metadata: %s", error)
             return self._grok_model_state, self._grok_initial_commands
