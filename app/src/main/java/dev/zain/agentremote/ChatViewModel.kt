@@ -18,6 +18,7 @@ import dev.zain.agentremote.agent.CodexStatusSnapshot
 import dev.zain.agentremote.agent.ConnectionState
 import dev.zain.agentremote.agent.DurableAgentClient
 import dev.zain.agentremote.agent.ImageAttachment
+import dev.zain.agentremote.agent.SessionStatus
 import dev.zain.agentremote.agent.SessionSummary
 import dev.zain.agentremote.agent.SessionCleanupOperation
 import dev.zain.agentremote.agent.SessionCleanupReport
@@ -115,6 +116,7 @@ data class ChatUiState(
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
+    private val appContext = application.applicationContext
     private val settingsRepo = SettingsRepository(application)
     private val grokBackend = DurableAgentClient(
         BackendKind.GROK_BUILD,
@@ -124,9 +126,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         BackendKind.CODEX,
         application.contentResolver,
     )
+    private val completionWatch = CompletionWatchCoordinator(
+        scope = viewModelScope,
+        onTerminal = ::onWatchedTurnTerminal,
+    )
     private val sessionsByBackend = mutableMapOf<BackendKind, List<SessionSummary>>()
     private val sessionErrorsByBackend = mutableMapOf<BackendKind, String?>()
     private var activeBackendKind: BackendKind = BackendKind.GROK_BUILD
+    /** Dedupes UI-path and watch-path notifications for the same finish. */
+    private val notifiedFinishKeys = mutableSetOf<String>()
+    /**
+     * When true, keep a completion long-poll for the active session even if the
+     * UI client is still connected (detach / disconnect mid-turn).
+     */
+    private var preferCompletionWatchForActiveSession: Boolean = false
 
     private val backend
         get() = when (activeBackendKind) {
@@ -242,9 +255,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
     init {
+        AgentFinishNotifier.ensureChannels(appContext)
         _ui.update { it.copy(slashCommands = localSlashCommandsFor()) }
         viewModelScope.launch {
             settingsRepo.settings.collect { s ->
+                completionWatch.setEnabled(s.notifyWhenAgentFinished)
                 if (_ui.value.screen == AppScreen.HOME) {
                     activeBackendKind = s.backendKind
                     _ui.update {
@@ -255,6 +270,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } else {
                     _ui.update { it.copy(settings = s) }
+                }
+                if (s.notifyWhenAgentFinished) {
+                    BackendKind.entries.forEach { kind ->
+                        syncCompletionWatches(kind)
+                    }
                 }
             }
         }
@@ -773,6 +793,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 updateSessionStatusPolling(kind, list)
+                syncCompletionWatches(kind, list)
             }.onFailure { e ->
                 val message = e.message ?: "Failed to load ${kind.displayName} sessions"
                 if (showLoading) {
@@ -786,8 +807,202 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 updateSessionStatusPolling(kind, sessionsByBackend[kind].orEmpty())
+                syncCompletionWatches(kind, sessionsByBackend[kind].orEmpty())
             }
         }
+    }
+
+    /**
+     * Arms long-poll completion watches only for active durable sessions.
+     * The currently UI-connected session is excluded so we do not double-poll;
+     * its finish path goes through [handleEvent]. Idle backends yield zero watches.
+     */
+    private fun syncCompletionWatches(
+        kind: BackendKind,
+        sessions: List<SessionSummary> = sessionsByBackend[kind].orEmpty(),
+    ) {
+        val settings = _ui.value.settings
+        if (!settings.notifyWhenAgentFinished || settings.durableHostToken.isBlank()) {
+            completionWatch.syncBackend(kind, emptyList())
+            return
+        }
+        // Skip only the session the UI client is already long-polling, unless we
+        // explicitly armed a detach watch (Back/Disconnect while a turn is active).
+        val exclude = if (
+            backend.isConnected() &&
+            activeBackendKind == kind &&
+            _ui.value.screen == AppScreen.CHAT &&
+            !preferCompletionWatchForActiveSession &&
+            activeSessionIdForReconnect != null
+        ) {
+            activeSessionIdForReconnect
+        } else {
+            null
+        }
+        val targets = sessions
+            .filter { it.status.isActive }
+            .map { session ->
+                CompletionWatchCoordinator.WatchTarget(
+                    backend = kind,
+                    sessionId = session.sessionId,
+                    title = session.title,
+                    baseUrl = settings.activeDurableBaseUrl,
+                    secret = settings.durableHostToken,
+                )
+            }
+        completionWatch.syncBackend(
+            backend = kind,
+            targets = targets,
+            excludeSessionId = exclude,
+        )
+    }
+
+    private fun armCompletionWatchForActiveSession(
+        notifyIfAlreadyTerminal: Boolean = false,
+    ) {
+        val settings = _ui.value.settings
+        if (!settings.notifyWhenAgentFinished || settings.durableHostToken.isBlank()) return
+        val sessionId = activeSessionIdForReconnect ?: return
+        preferCompletionWatchForActiveSession = true
+        completionWatch.watch(
+            CompletionWatchCoordinator.WatchTarget(
+                backend = activeBackendKind,
+                sessionId = sessionId,
+                title = _ui.value.activeSessionTitle.orEmpty(),
+                baseUrl = settings.activeDurableBaseUrl,
+                secret = settings.durableHostToken,
+                notifyIfAlreadyTerminal = notifyIfAlreadyTerminal,
+            ),
+        )
+    }
+
+    private fun onWatchedTurnTerminal(terminal: CompletionWatchCoordinator.WatchedTurnTerminal) {
+        postAgentFinishedNotification(
+            backend = terminal.backend,
+            sessionId = terminal.sessionId,
+            title = terminal.title,
+            outcome = terminal.outcome,
+            errorMessage = terminal.errorMessage,
+        )
+        // Refresh home list status when a background turn settles.
+        if (_ui.value.screen == AppScreen.HOME &&
+            _ui.value.settings.backendKind == terminal.backend &&
+            appInForeground
+        ) {
+            refreshSessions(terminal.backend, showLoading = false)
+        } else {
+            sessionsByBackend[terminal.backend]
+                ?.map { session ->
+                    if (session.sessionId == terminal.sessionId) {
+                        session.copy(
+                            status = when (terminal.outcome) {
+                                AgentFinishOutcome.FAILED -> SessionStatus.FAILED
+                                AgentFinishOutcome.CANCELLED -> SessionStatus.CANCELLED
+                                AgentFinishOutcome.COMPLETED -> SessionStatus.IDLE
+                            },
+                            unread = true,
+                        )
+                    } else {
+                        session
+                    }
+                }
+                ?.let { updated ->
+                    sessionsByBackend[terminal.backend] = updated
+                    if (_ui.value.settings.backendKind == terminal.backend &&
+                        _ui.value.screen == AppScreen.HOME
+                    ) {
+                        _ui.update { it.copy(sessions = updated) }
+                    }
+                }
+        }
+    }
+
+    private fun maybeNotifyUiTurnFinished(
+        outcome: AgentFinishOutcome,
+        errorMessage: String? = null,
+    ) {
+        val sessionId = activeSessionIdForReconnect ?: return
+        postAgentFinishedNotification(
+            backend = activeBackendKind,
+            sessionId = sessionId,
+            title = _ui.value.activeSessionTitle.orEmpty(),
+            outcome = outcome,
+            errorMessage = errorMessage,
+        )
+    }
+
+    private fun postAgentFinishedNotification(
+        backend: BackendKind,
+        sessionId: String,
+        title: String,
+        outcome: AgentFinishOutcome,
+        errorMessage: String? = null,
+    ) {
+        val settings = _ui.value.settings
+        if (!CompletionWatchCoordinator.shouldNotify(
+                notifyEnabled = settings.notifyWhenAgentFinished,
+                appInForeground = appInForeground,
+                screenIsChat = _ui.value.screen == AppScreen.CHAT,
+                viewingSessionId = activeSessionIdForReconnect,
+                viewingBackend = activeBackendKind,
+                finishedBackend = backend,
+                finishedSessionId = sessionId,
+            )
+        ) {
+            return
+        }
+        val dedupeKey = "$backend:$sessionId:$outcome"
+        synchronized(notifiedFinishKeys) {
+            if (!notifiedFinishKeys.add(dedupeKey)) return
+            // Bound memory for long-lived process; only recent finishes matter.
+            if (notifiedFinishKeys.size > 64) {
+                val trim = notifiedFinishKeys.toList().take(notifiedFinishKeys.size - 32)
+                notifiedFinishKeys.removeAll(trim.toSet())
+            }
+        }
+        AgentFinishNotifier.notifyFinished(
+            context = appContext,
+            backend = backend,
+            sessionId = sessionId,
+            title = title,
+            outcome = outcome,
+            errorMessage = errorMessage,
+        )
+    }
+
+    fun openSessionFromNotification(sessionId: String, backend: BackendKind) {
+        val settings = _ui.value.settings
+        if (settings.durableHostToken.isBlank()) return
+        AgentFinishNotifier.cancel(appContext, backend, sessionId)
+        if (_ui.value.screen == AppScreen.CHAT &&
+            activeSessionIdForReconnect == sessionId &&
+            activeBackendKind == backend
+        ) {
+            return
+        }
+        if (settings.backendKind != backend || activeBackendKind != backend) {
+            activeBackendKind = backend
+            viewModelScope.launch {
+                settingsRepo.update { it.copy(backendKind = backend) }
+            }
+            _ui.update {
+                it.copy(
+                    settings = it.settings.copy(backendKind = backend),
+                    sessions = sessionsByBackend[backend].orEmpty(),
+                    sessionsError = sessionErrorsByBackend[backend],
+                    slashCommands = localSlashCommandsFor(backend),
+                )
+            }
+        }
+        val known = sessionsByBackend[backend]
+            ?.firstOrNull { it.sessionId == sessionId }
+        openSession(
+            known ?: SessionSummary(
+                sessionId = sessionId,
+                title = "Session",
+                cwd = settings.workingDirectory.ifBlank { AppSettings.DEFAULT_CWD },
+            ),
+        )
     }
 
     private fun updateSessionStatusPolling(
@@ -1024,6 +1239,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val departingBackendKind = activeBackendKind
         val draftSessionId = activeSessionIdForReconnect.takeIf { activeSessionIsDraft }
         val departingSettings = _ui.value.settings
+        val leavingInFlight = _ui.value.requestInFlight || _ui.value.cancellationRequested
+        // Arm a completion watch before detaching so we keep observing after the UI poll ends.
+        if (leavingInFlight && !activeSessionIsDraft) {
+            armCompletionWatchForActiveSession(notifyIfAlreadyTerminal = true)
+        }
         stopConnectionIntent(clearSession = true)
         clearChatLocal()
         // Commit navigation immediately; transport cleanup continues off-screen.
@@ -1064,6 +1284,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() {
+        val leavingInFlight = _ui.value.requestInFlight || _ui.value.cancellationRequested
+        if (leavingInFlight && !activeSessionIsDraft) {
+            armCompletionWatchForActiveSession(notifyIfAlreadyTerminal = true)
+        }
         stopConnectionIntent(clearSession = false)
         val canReconnect = activeSessionIdForReconnect != null
         clearChatLocal()
@@ -1137,6 +1361,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // an interrupted recovery from a new socket generation.
         reconnectJob?.cancel()
         reconnectJob = null
+        // Arm watches for other active sessions only. The open chat keeps its
+        // existing UI long-poll (no second connection). Idle backends stay quiet.
+        if (_ui.value.settings.notifyWhenAgentFinished) {
+            BackendKind.entries.forEach { kind ->
+                syncCompletionWatches(kind)
+            }
+        }
     }
 
     fun onSessionListVisibilityChanged(visible: Boolean) {
@@ -1366,6 +1597,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         durableHostToken: String,
         workingDirectory: String,
         codexFullAccess: Boolean,
+        notifyWhenAgentFinished: Boolean,
     ) {
         viewModelScope.launch {
             settingsRepo.update {
@@ -1377,6 +1609,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     workingDirectory = workingDirectory.trim()
                         .ifBlank { AppSettings.DEFAULT_CWD },
                     codexFullAccess = codexFullAccess,
+                    notifyWhenAgentFinished = notifyWhenAgentFinished,
                 )
             }
             // Refresh list with new cwd/secret/url
@@ -1495,6 +1728,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         reconnectJob = null
         connectionDesired = true
         hasConnectedSession = false
+        preferCompletionWatchForActiveSession = false
         activeSessionIdForReconnect = sessionId
         activeSessionCwdForReconnect = cwd
         activeSessionIsDraft = isDraft
@@ -2315,6 +2549,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         historyLoading = false,
                     )
                 }
+                // Clear prior finish dedupe for this session so the next terminal can notify.
+                activeSessionIdForReconnect?.let { sessionId ->
+                    synchronized(notifiedFinishKeys) {
+                        notifiedFinishKeys.removeAll { key ->
+                            key.startsWith("${activeBackendKind}:$sessionId:")
+                        }
+                    }
+                }
             }
 
             is AgentEvent.UserDelta -> {
@@ -2448,11 +2690,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         reportRequestOutcome(message, useStopPanel = true)
                     }
                 }
+                // Real durable terminals only — skip history load and synthetic complete.
+                if (hadActiveRequest &&
+                    stopReason != "loaded" &&
+                    stopReason != "history"
+                ) {
+                    val outcome = when {
+                        completedBeforeStop -> AgentFinishOutcome.COMPLETED
+                        wasCancelling || stopReason == "cancelled" ->
+                            AgentFinishOutcome.CANCELLED
+                        else -> AgentFinishOutcome.COMPLETED
+                    }
+                    maybeNotifyUiTurnFinished(outcome)
+                    activeSessionIdForReconnect?.let {
+                        completionWatch.unwatch(activeBackendKind, it)
+                    }
+                }
             }
 
             is AgentEvent.Error -> {
                 val command = activeSlashCommand
                 val wasCancelling = _ui.value.cancellationRequested
+                val hadActiveRequest = _ui.value.requestInFlight
                 finishActiveRequest()
                 _ui.update { it.copy(historyLoading = false) }
                 suppressLoadedSlashTurn = false
@@ -2470,6 +2729,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         isError = true,
                         useStopPanel = wasCancelling,
                     )
+                }
+                if (hadActiveRequest) {
+                    maybeNotifyUiTurnFinished(
+                        outcome = AgentFinishOutcome.FAILED,
+                        errorMessage = event.message,
+                    )
+                    activeSessionIdForReconnect?.let {
+                        completionWatch.unwatch(activeBackendKind, it)
+                    }
                 }
             }
         }
@@ -2691,6 +2959,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         stopSessionStatusPolling()
+        completionWatch.shutdown()
         eventsJobs.forEach(Job::cancel)
         grokBackend.shutdown()
         codexBackend.shutdown()

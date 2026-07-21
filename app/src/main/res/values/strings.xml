@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">AgentsRemote</string>
+    <string name="notification_channel_agent_finished">Agent finished</string>
+    <string name="notification_channel_agent_finished_desc">Alerts when a durable host agent turn completes, fails, or stops while you are not viewing that chat</string>
+    <string name="notification_agent_finished_body">Agent finished</string>
+    <string name="notification_agent_failed_body">Agent failed</string>
+    <string name="notification_agent_stopped_body">Agent stopped</string>
+    <string name="notification_agent_default_title">%1$s session</string>
 </resources>

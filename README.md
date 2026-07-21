@@ -12,6 +12,7 @@ AgentRemote is only the controller and live viewer. The checked-in host service 
 - Codex runs through a host-owned `codex app-server` stdio worker, persists streamed item deltas, and resumes by Codex thread ID.
 - Grok runs through `grok --output-format streaming-json` and resumes by Grok session ID.
 - The Android client long-polls persisted events. Disconnecting only removes that observer.
+- Optional local notifications fire when a durable turn completes, fails, or stops while you are not viewing that chat. Completion watches use the same long-poll API and arm only while sessions are active; idle backends do no background polling.
 
 All implementation, schema, tests, and service configuration live in this repository. Runtime databases, tokens, logs, and agent-owned files are deliberately not committed.
 

@@ -25,6 +25,11 @@ data class AppSettings(
     val workingDirectory: String = DEFAULT_CWD,
     /** Default permission mode for newly created Codex sessions. */
     val codexFullAccess: Boolean = true,
+    /**
+     * Post a local notification when a durable turn finishes and the user is not
+     * already viewing that chat. Watchers arm only while sessions are active.
+     */
+    val notifyWhenAgentFinished: Boolean = true,
     val backendKind: BackendKind = BackendKind.GROK_BUILD,
 ) {
     val activeDurableBaseUrl: String

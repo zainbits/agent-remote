@@ -1,11 +1,16 @@
 package dev.zain.agentremote
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.PredictiveBackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
@@ -29,6 +34,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import dev.zain.agentremote.agent.isActive
+import dev.zain.agentremote.data.BackendKind
 import dev.zain.agentremote.ui.ChatScreen
 import dev.zain.agentremote.ui.HomeScreen
 import dev.zain.agentremote.ui.SettingsScreen
@@ -39,15 +46,21 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
+    private var chatViewModel: ChatViewModel? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             AgentRemoteTheme {
                 val vm: ChatViewModel = viewModel()
+                chatViewModel = vm
                 val state by vm.ui.collectAsState()
                 val nav = rememberNavController()
                 val navEntry by nav.currentBackStackEntryAsState()
+                val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.RequestPermission(),
+                ) { /* posting checks permission again at notify time */ }
 
                 LaunchedEffect(navEntry?.destination?.route, state.screen) {
                     vm.onSessionListVisibilityChanged(
@@ -55,7 +68,23 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
+                val hasActiveSessions = state.sessions.any { it.status.isActive }
+                LaunchedEffect(
+                    state.settings.notifyWhenAgentFinished,
+                    state.requestInFlight,
+                    hasActiveSessions,
+                ) {
+                    if (!state.settings.notifyWhenAgentFinished) return@LaunchedEffect
+                    if (!state.requestInFlight && !hasActiveSessions) return@LaunchedEffect
+                    if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+
                 LifecycleStartEffect(vm) {
+                    handleOpenIntent(intent, vm)
                     vm.onAppForegrounded()
                     onStopOrDispose { vm.onAppBackgrounded() }
                 }
@@ -182,5 +211,23 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        chatViewModel?.let { handleOpenIntent(intent, it) }
+    }
+
+    private fun handleOpenIntent(intent: Intent?, vm: ChatViewModel) {
+        val sessionId = intent?.getStringExtra(AgentFinishNotifier.EXTRA_SESSION_ID)
+            ?.takeIf { it.isNotBlank() }
+            ?: return
+        val backend = intent.getStringExtra(AgentFinishNotifier.EXTRA_BACKEND)
+            ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
+            ?: return
+        intent.removeExtra(AgentFinishNotifier.EXTRA_SESSION_ID)
+        intent.removeExtra(AgentFinishNotifier.EXTRA_BACKEND)
+        vm.openSessionFromNotification(sessionId, backend)
     }
 }

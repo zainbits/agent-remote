@@ -60,6 +60,7 @@ fun SettingsScreen(
         durableHostToken: String,
         workingDirectory: String,
         codexFullAccess: Boolean,
+        notifyWhenAgentFinished: Boolean,
     ) -> Unit,
     onPreviewOldSessions: (baseUrl: String, token: String, olderThanDays: Int) -> Unit,
     onDeleteOldSessions: (baseUrl: String, token: String) -> Unit,
@@ -82,6 +83,9 @@ fun SettingsScreen(
     }
     var codexFullAccess by remember(settings.codexFullAccess) {
         mutableStateOf(settings.codexFullAccess)
+    }
+    var notifyWhenAgentFinished by remember(settings.notifyWhenAgentFinished) {
+        mutableStateOf(settings.notifyWhenAgentFinished)
     }
     var showToken by remember { mutableStateOf(false) }
     val cleanupBaseUrl = when (networkProfile) {
@@ -216,6 +220,34 @@ fun SettingsScreen(
                 )
             }
 
+            Text("Notifications", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text("Notify when agent finishes", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Uses a long-poll only while a turn is active. No background polling " +
+                            "when every session is idle. Alerts are skipped while you are " +
+                            "viewing that chat.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = notifyWhenAgentFinished,
+                    onCheckedChange = { notifyWhenAgentFinished = it },
+                    modifier = Modifier.semantics {
+                        contentDescription = "Notify when agent finishes"
+                    },
+                )
+            }
+
             Text("Session cleanup", style = MaterialTheme.typography.titleMedium)
             Text(
                 "Permanently delete unpinned, idle Grok and Codex sessions whose latest " +
@@ -264,6 +296,7 @@ fun SettingsScreen(
                         durableHostToken,
                         workingDirectory,
                         codexFullAccess,
+                        notifyWhenAgentFinished,
                     )
                     onBack()
                 },

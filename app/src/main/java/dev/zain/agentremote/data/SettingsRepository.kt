@@ -26,6 +26,7 @@ class SettingsRepository(private val context: Context) {
         val legacyCodexAgentSecret = stringPreferencesKey("codex_agent_secret")
         val workingDirectory = stringPreferencesKey("working_directory")
         val codexFullAccess = booleanPreferencesKey("codex_full_access")
+        val notifyWhenAgentFinished = booleanPreferencesKey("notify_when_agent_finished")
         val backendKind = stringPreferencesKey("backend_kind")
     }
 
@@ -40,6 +41,7 @@ class SettingsRepository(private val context: Context) {
             durableHostToken = prefs[Keys.durableHostToken] ?: "",
             workingDirectory = prefs[Keys.workingDirectory] ?: AppSettings().workingDirectory,
             codexFullAccess = prefs[Keys.codexFullAccess] ?: true,
+            notifyWhenAgentFinished = prefs[Keys.notifyWhenAgentFinished] ?: true,
             backendKind = prefs[Keys.backendKind]
                 ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
                 ?: BackendKind.GROK_BUILD,
@@ -59,6 +61,7 @@ class SettingsRepository(private val context: Context) {
                 durableHostToken = prefs[Keys.durableHostToken] ?: "",
                 workingDirectory = prefs[Keys.workingDirectory] ?: AppSettings().workingDirectory,
                 codexFullAccess = prefs[Keys.codexFullAccess] ?: true,
+                notifyWhenAgentFinished = prefs[Keys.notifyWhenAgentFinished] ?: true,
                 backendKind = prefs[Keys.backendKind]
                     ?.let { runCatching { BackendKind.valueOf(it) }.getOrNull() }
                     ?: BackendKind.GROK_BUILD,
@@ -70,6 +73,7 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.durableHostToken] = next.durableHostToken
             prefs[Keys.workingDirectory] = next.workingDirectory
             prefs[Keys.codexFullAccess] = next.codexFullAccess
+            prefs[Keys.notifyWhenAgentFinished] = next.notifyWhenAgentFinished
             prefs[Keys.backendKind] = next.backendKind.name
             prefs.remove(Keys.legacyLanBaseUrl)
             prefs.remove(Keys.legacyTailnetBaseUrl)
