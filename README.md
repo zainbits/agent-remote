@@ -4,6 +4,8 @@ Android frontend for durable, concurrent **Grok** and **Codex** jobs running on 
 
 AgentRemote is only the controller and live viewer. The checked-in host service owns agent processes, so pressing Back, starting another session, losing the phone connection, or quitting Android does not cancel active work. Reopen the app later to replay persisted progress and results.
 
+<p align="center"><img src="docs/screenshot-chat.png" width="300" alt="AgentRemote running a Codex session on a Linux host from an Android phone"></p>
+
 ## Architecture
 
 - `host/agentremotesrv`: installs and manages the user-level host service.
