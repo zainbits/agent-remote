@@ -954,7 +954,7 @@ class DurableAgentClient(
 
         fun normalizeBaseUrl(value: String): String {
             val trimmed = value.trim().trimEnd('/')
-            require(trimmed.isNotBlank()) { "Durable host URL is empty" }
+            require(trimmed.isNotBlank()) { "Set the host URL in Settings first." }
             return when {
                 trimmed.startsWith("ws://", ignoreCase = true) -> "http://${trimmed.drop(5)}"
                 trimmed.startsWith("wss://", ignoreCase = true) -> "https://${trimmed.drop(6)}"

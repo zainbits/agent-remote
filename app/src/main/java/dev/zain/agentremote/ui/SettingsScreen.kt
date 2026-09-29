@@ -143,7 +143,7 @@ fun SettingsScreen(
                 onValueChange = { durableLanBaseUrl = it },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Host LAN URL") },
-                supportingText = { Text("Example: http://192.168.1.50:2440") },
+                supportingText = { Text("Example: http://<host-lan-ip>:2440") },
                 singleLine = true,
             )
 
@@ -152,7 +152,7 @@ fun SettingsScreen(
                 onValueChange = { durableTailnetBaseUrl = it },
                 modifier = Modifier.fillMaxWidth(),
                 label = { Text("Host Tailnet URL") },
-                supportingText = { Text("Example: http://100.64.0.1:2440") },
+                supportingText = { Text("Example: http://<host-tailscale-ip>:2440") },
                 singleLine = true,
             )
 
@@ -186,8 +186,8 @@ fun SettingsScreen(
                 label = { Text("Host project directory (cwd)") },
                 supportingText = {
                     Text(
-                        "Absolute path on the Linux host. Default is host \$HOME " +
-                            "(/home/user). Sessions and tools use this directory.",
+                        "Path on the Linux host. Default ~ is the host user's home " +
+                            "directory. Sessions and tools use this directory.",
                     )
                 },
                 singleLine = true,

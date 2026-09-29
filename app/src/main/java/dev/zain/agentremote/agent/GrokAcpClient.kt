@@ -1,5 +1,6 @@
 package dev.zain.agentremote.agent
 
+import dev.zain.agentremote.data.AppSettings
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -57,7 +58,7 @@ class GrokAcpClient : AgentBackend {
     private var sessionId: String? = null
 
     private var opening: CompletableDeferred<Unit>? = null
-    private var workingDirectory: String = "/home/user"
+    private var workingDirectory: String = AppSettings.DEFAULT_CWD
 
     private val pending = ConcurrentHashMap<Long, CompletableDeferred<JSONObject>>()
 
@@ -139,7 +140,7 @@ class GrokAcpClient : AgentBackend {
         secret: String,
         workingDirectory: String,
     ): Long {
-        this.workingDirectory = workingDirectory.ifBlank { "/home/user" }
+        this.workingDirectory = workingDirectory.ifBlank { AppSettings.DEFAULT_CWD }
 
         val url = buildWebSocketUrl(baseUrl, secret)
         val request = Request.Builder().url(url).build()

@@ -262,6 +262,8 @@ class JobManager:
         return self.store.get_session(session["id"])
 
     def list_sessions(self, backend: str, cwd: str, limit: int = 50) -> list[dict[str, Any]]:
+        # Clients may send "~"; legacy discovery compares absolute paths.
+        cwd = str(Path(cwd).expanduser().resolve())
         if self.import_legacy:
             self.catalog.sync(backend, cwd, limit)
         return self.store.list_sessions(backend, cwd, limit)

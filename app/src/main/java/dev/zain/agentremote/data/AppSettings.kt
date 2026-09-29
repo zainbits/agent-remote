@@ -18,10 +18,10 @@ val BackendKind.displayName: String
 
 data class AppSettings(
     val networkProfile: NetworkProfile = NetworkProfile.LAN,
-    val durableLanBaseUrl: String = "http://192.168.1.50:2440",
-    val durableTailnetBaseUrl: String = "http://100.64.0.1:2440",
+    val durableLanBaseUrl: String = "",
+    val durableTailnetBaseUrl: String = "",
     val durableHostToken: String = "",
-    /** Absolute path on the Linux host — default is the host $HOME. */
+    /** Path on the Linux host; ~ expands to the host user's home directory. */
     val workingDirectory: String = DEFAULT_CWD,
     /** Default permission mode for newly created Codex sessions. */
     val codexFullAccess: Boolean = true,
@@ -39,7 +39,7 @@ data class AppSettings(
         }
 
     companion object {
-        /** Host home directory used as the default project/cwd. */
-        const val DEFAULT_CWD: String = "/home/user"
+        /** Host home directory (expanded on the host) used as the default project/cwd. */
+        const val DEFAULT_CWD: String = "~"
     }
 }

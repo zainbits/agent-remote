@@ -1,5 +1,6 @@
 package dev.zain.agentremote.agent
 
+import dev.zain.agentremote.data.AppSettings
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -198,7 +199,7 @@ class CodexAppServerClient : AgentBackend {
     }
 
     private fun threadParams(cwd: String): JSONObject = JSONObject()
-        .put("cwd", cwd.ifBlank { "/home/user" })
+        .put("cwd", cwd.ifBlank { AppSettings.DEFAULT_CWD })
         // AgentRemote has no approval-dialog surface yet. Keep Codex useful while
         // containing writes to the selected workspace and rejecting escalations.
         .put("approvalPolicy", "never")
