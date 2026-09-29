@@ -82,7 +82,7 @@ Active turns are independent of the phone and continue with no connected Android
 
 If the Linux host or host service itself stops during a turn, that process cannot continue. On restart, AgentRemote marks the orphaned turn failed instead of pretending it completed; the session remains resumable with a new prompt.
 
-New Codex sessions use app-server's unrestricted `dangerFullAccess` sandbox policy with approvals disabled by default. The Android Settings switch can make new Codex sessions use `workspaceWrite` with networking and `approvalPolicy=never` instead. The selected mode is stored on each durable session and reused for every resumed turn. Grok runs with `--always-approve`, matching the previous host behavior.
+Security note: the host runs coding agents that can read and change files on that machine, so only run it on a host you own and keep port `2440` on a private network. New Codex sessions use app-server's unrestricted `dangerFullAccess` sandbox policy with approvals disabled by default. The Android Settings switch can make new Codex sessions use `workspaceWrite` with networking and `approvalPolicy=never` instead. The selected mode is stored on each durable session and reused for every resumed turn. Grok runs with `--always-approve`, matching the previous host behavior.
 
 ## Phone configuration
 
@@ -91,7 +91,7 @@ In **Settings** configure:
 1. Host LAN URL, normally `http://<LAN-host>:2440`.
 2. Host Tailnet URL, normally `http://<Tailscale-host>:2440`.
 3. The token printed by `host/agentremotesrv --show-token`.
-4. The absolute Linux workspace path used by both agents.
+4. The Linux workspace path used by both agents. The default `~` means the host user's home directory.
 5. Whether newly created Codex sessions receive full host access (enabled by default).
 
 The LAN/Tailnet chips select the saved URL. Tailscale encrypts Tailnet traffic; use HTTPS or another trusted encrypted tunnel if exposing the API by another route. Never expose port `2440` directly to the public internet.
@@ -132,13 +132,7 @@ Android checks:
 ./gradlew :app:assembleDebug :app:lintDebug
 ```
 
-Publish a sideloadable GitHub APK release:
-
-```zsh
-androidrun --publish
-```
-
-Only the newest three releases are retained by default.
+Releases are published as sideloadable APKs on the GitHub Releases page.
 
 ## Legacy direct helpers
 
@@ -152,3 +146,7 @@ Only the newest three releases are retained by default.
 | `2419` | Legacy Grok ACP WebSocket |
 | `2420` | Legacy Grok session index |
 | `2430` | Legacy direct Codex app-server WebSocket helper |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
